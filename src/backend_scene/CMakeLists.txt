@@ -105,6 +105,8 @@ if(BUILD_QML)
         qml_helper/SceneTimerBridge.h
         qml_helper/MediaThumbnailCrossfade.cpp
         qml_helper/glExtra.cpp
+        # we-manager clone patch: another window's scene frame (ShareRenderer).
+        qml_helper/SceneMirror.cpp
     )
     target_link_libraries(${PROJECT_NAME}-qml
     PUBLIC

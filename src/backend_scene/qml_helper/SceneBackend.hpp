@@ -37,6 +37,7 @@ namespace scenebackend
 
 class SceneTimerBridge;
 class SceneScriptBridge;
+class SharedFrame;
 
 class SceneObject : public QQuickItem {
     Q_OBJECT
@@ -106,6 +107,12 @@ class SceneObject : public QQuickItem {
     // frame (textures, render targets, buffers), in MiB; 0 before.  The KDE
     // plugin hands it to VramSampler as the footprint's estimate.
     Q_PROPERTY(int vramMiB READ vramMiB NOTIFY vramMiBChanged)
+    // Clone (the KDE plugin's ShareRenderer, we-manager clone patch): with a
+    // key set, the frame this item draws is also published under it
+    // (SharedFrame.hpp), for SceneMirror items in the process's other windows
+    // that are given the same key.  Empty, the default: nothing is published
+    // and nothing of the sharing exists.
+    Q_PROPERTY(QString shareKey READ shareKey WRITE setShareKey NOTIFY shareKeyChanged)
     // Fraction of the display's native resolution to render at, 1.0 = native.
     // Almost everything the renderer does is per-pixel and per-pass, so
     // rendering below native and letting Qt upscale is the largest single
@@ -165,6 +172,11 @@ public:
     bool    pixelArt() const;
     QVariantMap sceneQuality() const { return m_sceneQuality; }
     int         vramMiB() const { return m_vramMiB; }
+    QString     shareKey() const { return m_shareKey; }
+    void        setShareKey(const QString&);
+    // How long rendered frames have waited for this item's window to draw
+    // one, in ms (SharedFrame::stalledMs); 0 without a share key.
+    Q_INVOKABLE int sharedFrameStalledMs() const;
     qreal   nativeAspectRatio() const;
 
     void setFps(int);
@@ -402,6 +414,7 @@ signals:
     void firstFrame();
     void sceneQualityChanged();
     void vramMiBChanged();
+    void shareKeyChanged();
     // saveFrame's outcome: ok, or why not (the path in both).
     void frameSaved(const QString& path, bool ok, const QString& error);
     // Emitted when SceneScript calls engine.openUserShortcut(name).  The main
@@ -461,6 +474,9 @@ private:
     int         m_targetWidth { 0 };
     int         m_targetHeight { 0 };
     int         m_vramMiB { 0 };
+    // Clone: the frame this item publishes, while shareKey is set.
+    QString                                    m_shareKey;
+    std::shared_ptr<scenebackend::SharedFrame> m_shareFrame;
     void        sendSceneQuality();
     void        setVramMiB(int);
     qreal       m_renderScale { 1.0 };

@@ -132,6 +132,46 @@ Rectangle {
     // media-blocklist patch): MprisMonitor's ignoredPlayers in Scene.qml and
     // QtWebView.qml, live.  we-manager writes it; the settings page does not.
     property string mediaBlocklist: wallpaper.configuration.MediaBlocklist ?? ""
+    // One renderer for screens that show the same scene (we-manager clone
+    // patch, main.xml ShareRenderer: 0 off, 1 on, 2 on and this screen
+    // renders when it can).  Off, cloneLink stays null and nothing of it
+    // exists: every screen renders its own scene.  On, CloneLink.qml decides
+    // in loadBackend() whether this screen loads the scene (and publishes its
+    // frame) or shows another screen's frame (backend/SceneMirror.qml).  Made
+    // with Qt.createComponent, like VramWatch.qml: a plugin library older
+    // than this QML has no CloneGroup, and naming it here would fail this
+    // whole file.
+    readonly property int shareRenderer: Math.max(0, Math.min(2, Number(wallpaper.configuration.ShareRenderer ?? 0) || 0))
+    property var    cloneLink: null
+    // `live`: the setting changed while a wallpaper is loaded, which is then
+    // loaded again (a cut), as a change of render resolution is.
+    function updateCloneLink(live) {
+        const on = background.shareRenderer > 0;
+        if (on === (background.cloneLink !== null)) return;
+        if (on) {
+            const comp = Qt.createComponent("CloneLink.qml");
+            if (comp.status !== Component.Ready) {
+                console.warn("[WEK] clone: CloneLink.qml did not load (" + comp.errorString().trim() + "): the plugin "
+                             + "library plasmashell runs has no CloneGroup (it is older than this QML; log out and "
+                             + "in again), so ShareRenderer does nothing");
+                return;
+            }
+            background.cloneLink = comp.createObject(background, { host: background, loader: backendLoader,
+                                                                   pyext: pyext });
+        } else {
+            const link = background.cloneLink;
+            background.cloneLink = null;
+            link.destroy();
+        }
+        if (live && !background.stopped && background.nowBackend === "scene") {
+            background._transitionCause = "reload";
+            try {
+                background.loadBackend();
+            } finally {
+                background._transitionCause = "";
+            }
+        }
+    }
 
     
     property var curOpt: ({})
@@ -1770,6 +1810,13 @@ Rectangle {
                 if(background.hasLib) {
                     qmlsource = "backend/Scene.qml";
                     properties = {"assets": Common.getAssetsPath(steamlibrary)};
+                    // ShareRenderer: another screen renders this scene, and
+                    // this one shows its frame.  It holds no video memory.
+                    if (background.cloneLink !== null && background.cloneLink.claim()) {
+                        qmlsource = "backend/SceneMirror.qml";
+                        properties = background.cloneLink.mirrorProperties();
+                        background.vramEstimateMiB = 0;
+                    }
                 } else {
                     backendLoader.loadInfoShow(i18nc("@info:status recovery copy scene plugin lib missing",
                         "Plugin lib not found. To support scene, please compile and install it."));
@@ -1815,6 +1862,12 @@ Rectangle {
     }
    
     function autoPause() {
+        // ShareRenderer: the screen that renders plays on while another
+        // screen shows its frame and wants it playing.
+        if (background.cloneLink !== null && ! background.ok && background.cloneLink.keepsPlaying()) {
+            if (backendLoader.item) backendLoader.item.play();
+            return;
+        }
         if (! background.ok) backendLoader.holdOutgoing(false);
         if (! backendLoader.item) return;
         if (background.ok) backendLoader.item.play();
@@ -1869,6 +1922,8 @@ Rectangle {
 
         // VramStop on from the start.
         if (vramStopOn) makeVramWatch();
+        // ShareRenderer on from the start.
+        if (shareRenderer > 0) updateCloneLink(false);
         // Safe start: a wallpaper that stopped Plasma just now is held back.
         checkSafeStart();
         // load first backend
@@ -1883,6 +1938,7 @@ Rectangle {
         background.renderScaleChanged.connect(loadBackend);
         background.okChanged.connect(autoPause);
         background.sourceChanged.connect(applySource);
+        background.shareRendererChanged.connect(function() { background.updateCloneLink(true); });
 
         lauchPauseTimer.start();
     }

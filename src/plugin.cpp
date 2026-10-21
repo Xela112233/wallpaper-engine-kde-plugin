@@ -11,6 +11,8 @@
 #include <KCrash>
 #include "MpvBackend.hpp"
 #include "SceneBackend.hpp"
+#include "SceneMirror.hpp"
+#include "CloneGroup.hpp"
 #include "KeyGrabber.hpp"
 #include "MouseGrabber.hpp"
 #include "TTYSwitchMonitor.hpp"
@@ -149,6 +151,12 @@ public:
         // (Qt.createComponent), so a WindowModel.qml newer than the library
         // still loads.
         qmlRegisterType<wekde::EffectsWatcher>(uri, WPVer[0], WPVer[1], "EffectsWatcher");
+        // we-manager clone patch (ShareRenderer): made from CloneLink.qml and
+        // backend/SceneMirror.qml only, which main.qml loads with
+        // Qt.createComponent while the setting is on, so a main.qml newer
+        // than the library still loads.
+        qmlRegisterType<wekde::CloneGroup>(uri, WPVer[0], WPVer[1], "CloneGroup");
+        qmlRegisterType<scenebackend::SceneMirror>(uri, WPVer[0], WPVer[1], "SceneMirror");
     }
 
     void initializeEngine(QQmlEngine* engine, const char* uri) override {

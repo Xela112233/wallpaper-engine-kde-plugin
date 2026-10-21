@@ -157,6 +157,9 @@ Item{
             // sound device at all.
             Common.setIfSupported(player, "SceneViewer", "audioOutput",
                                   Qt.binding(function() { return background.audioOutput !== false; }));
+            // ShareRenderer (clone patch): when this screen renders for
+            // others too, its CloneLink names the frame this viewer publishes.
+            if (background.cloneLink) background.cloneLink.sourceCreated(player);
         }
 
         Connections {

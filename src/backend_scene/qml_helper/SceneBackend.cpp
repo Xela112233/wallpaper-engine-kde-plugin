@@ -26,6 +26,7 @@
 #include "TextScriptResult.hpp"
 #include "WPMediaSystemTexture.hpp"
 #include "SceneQuality.hpp"
+#include "SharedFrame.hpp"
 
 #include <QJSValueIterator>
 #include <QtGlobal>
@@ -175,6 +176,8 @@ public:
         // Must run before any other member teardown, which is why it's the
         // first statement in the body rather than left to member order.
         m_guard->invalidate();
+        // Clone: the readers of this frame drop its texture before it goes.
+        if (m_share) m_share->withdraw();
 
         for (auto& item : texs_map) {
             auto& exh = item.second;
@@ -216,6 +219,8 @@ public:
         info.redraw_callback = [guard]() {
             guard->invoke([](TextureNode* self) {
                 Q_EMIT self->redraw();
+                // Clone: a frame waits for this window to take it.
+                if (self->m_share) self->m_share->noteRendered();
             });
         };
 
@@ -278,6 +283,29 @@ public:
     }
 
     void emitSceneFirstFrame() { Q_EMIT sceneFirstFrame(); }
+
+    // Clone (we-manager clone patch): the frame this node also publishes for
+    // the process's other windows, or none.  On the scene graph thread, in
+    // sync; the wallpaper's render thread reads m_share under the guard.
+    bool shared() const { return m_share != nullptr; }
+    void setShare(const std::shared_ptr<SharedFrame>& share, QSizeF itemSize) {
+        if (share != m_share) {
+            std::shared_ptr<SharedFrame> old = m_share;
+            m_guard->invoke([&share](TextureNode* self) {
+                self->m_share = share;
+            });
+            if (old) old->withdraw();
+            // The frame on screen now, so a reader need not wait for the next.
+            if (m_share && m_texture != m_init_texture) {
+                for (const auto& item : texs_map) {
+                    if (item.second.qsg != m_texture) continue;
+                    publishShared(item.second.gltex, m_texture->textureSize());
+                    break;
+                }
+            }
+        }
+        if (m_share) m_share->setItemSize(itemSize);
+    }
 signals:
     void textureInUse();
     void nodeDestroyed();
@@ -324,6 +352,10 @@ public slots:
             setTexture(m_texture);
             markDirty(DirtyMaterial);
             Q_EMIT textureInUse();
+            // Clone: the same texture for the windows that mirror this one.
+            if (m_share)
+                publishShared(newtex.qsg != nullptr ? newtex.gltex : 0,
+                              QSize(exh->width, exh->height));
 
             bool expected = true;
             if (m_first_frame.compare_exchange_strong(expected, false)) {
@@ -334,8 +366,15 @@ public slots:
     }
 
 private:
+    void publishShared(uint gltex, QSize size) {
+        const QOpenGLContext* ctx = QOpenGLContext::currentContext();
+        m_share->publish(gltex, size, ctx != nullptr ? ctx->shareGroup() : nullptr);
+    }
+
     sp_scene_t m_scene;
     bool       m_enable_valid;
+    // Clone: see setShare().
+    std::shared_ptr<SharedFrame> m_share;
 
     QSGTexture*       m_init_texture;
     QSGTexture*       m_texture;
@@ -438,6 +477,8 @@ SceneObject::~SceneObject() {
     // switching): the same cooperative abort as the screen-removal path, so
     // the old load stops competing with the new one for the looper threads.
     if (m_scene) m_scene->abortLoad();
+    // Clone: the mirrors of this item have nowhere to send the pointer now.
+    if (m_shareFrame && m_shareFrame->sourceItem() == this) m_shareFrame->setSourceItem(nullptr);
     _Q_INFO("Destroy sceneobject");
 }
 
@@ -539,6 +580,10 @@ QSGNode* SceneObject::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
                 Qt::QueuedConnection);
         }
     }
+
+    // Clone: with a share key, the node publishes its frame; without one
+    // (and none before) nothing is touched.
+    if (m_shareFrame || node->shared()) node->setShare(m_shareFrame, QSizeF(width(), height()));
 
     node->setRect(boundingRect());
     // Pixel art: Qt scales the finished frame to the item nearest-neighbour,
@@ -782,6 +827,18 @@ void SceneObject::setVramMiB(int mib) {
     m_vramMiB = mib;
     Q_EMIT vramMiBChanged();
 }
+
+void SceneObject::setShareKey(const QString& key) {
+    if (key == m_shareKey) return;
+    m_shareKey = key;
+    if (m_shareFrame && m_shareFrame->sourceItem() == this) m_shareFrame->setSourceItem(nullptr);
+    m_shareFrame = key.isEmpty() ? nullptr : SharedFrameRegistry::instance().acquire(key);
+    if (m_shareFrame) m_shareFrame->setSourceItem(this);
+    update(); // updatePaintNode hands the frame to the node
+    Q_EMIT shareKeyChanged();
+}
+
+int SceneObject::sharedFrameStalledMs() const { return m_shareFrame ? m_shareFrame->stalledMs() : 0; }
 
 void SceneObject::setPixelArt(bool value) {
     if (m_pixelArt == value) return;

@@ -467,6 +467,30 @@ Flickable {
                 }
             }
             OptionItem {
+                text: i18nc("@label settings option", "One renderer for the same wallpaper")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: ComboBox {
+                    id: cbShareRenderer
+                    model: [
+                        { text: i18nc("@item:inlistbox one renderer for the same wallpaper", "Off (every screen renders its own)"), value: 0 },
+                        { text: i18nc("@item:inlistbox one renderer for the same wallpaper", "On"),                               value: 1 },
+                        { text: i18nc("@item:inlistbox one renderer for the same wallpaper", "On, and this screen renders"),      value: 2 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_ShareRenderer = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_ShareRenderer))
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info one renderer for the same wallpaper help text", "Screens that have this on and show the same scene with the same properties share one renderer: one screen renders, and the others show its picture, cropped or fitted to their own shape, so the scene's video memory is used once. The frame rate, quality, sound and volume are the rendering screen's. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
                 text: i18nc("@label settings option", "Anti-aliasing")
                 text_color: Kirigami.Theme.textColor
                 icon: '../../images/window.svg'

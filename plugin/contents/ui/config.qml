@@ -119,6 +119,7 @@ ColumnLayout {
     // writes it unqualified, like cfg_RenderScale.
     property int    cfg_TextureQuality
     property int    cfg_ProcessPriority
+    property int    cfg_ShareRenderer
     // The Wallpaper language combo on SettingPage reads and writes it
     // unqualified, as the two above (we-manager's language patch).
     property string cfg_WallpaperLanguage

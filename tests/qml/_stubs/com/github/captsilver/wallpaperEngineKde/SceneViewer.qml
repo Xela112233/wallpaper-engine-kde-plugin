@@ -1,6 +1,6 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: src/plugin.cpp registers scenebackend::SceneObject (src/backend_scene/qml_helper/)
-// Last contract review: 2026-11-11
+// Last contract review: 2026-11-12
 
 // Stub for the Vulkan-backed SceneViewer plugin type. Quick3D / Vulkan can't
 // run in qmltestrunner offscreen; we just provide the QML API surface that
@@ -36,6 +36,9 @@ Item {
     property int    presentMode:    0    // Swapchain present-mode policy (Auto=0)
     property int    outputRefreshMillihertz: 0      // 0 = no screen rate yet; C++ fills it from QScreen
     property real   nativeAspectRatio:  0  // 0 = scene not loaded yet (real type's sentinel)
+    property string shareKey:       ""   // clone patch: the frame this viewer publishes ("" none)
+    property int    stalledMs:      0    // test-only: what sharedFrameStalledMs() answers
+    function sharedFrameStalledMs() { return stalledMs; }
 
     signal firstFrame()
     signal frameSaved(string path, bool ok, string error)

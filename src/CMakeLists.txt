@@ -43,6 +43,7 @@ add_library(${PROJECT_NAME}
 	ActivityHelper.cpp
 	VramSampler.cpp
 	EffectsWatcher.cpp
+	CloneGroup.cpp
 	qmldir
 	qwebchannel.qrc
 )

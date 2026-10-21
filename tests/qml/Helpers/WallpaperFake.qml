@@ -94,6 +94,7 @@ Item {
         "MsaaMode":            0,
         "TextureQuality":      0,
         "ReloadAfterSleep":    true,
-        "ProcessPriority":     0
+        "ProcessPriority":     0,
+        "ShareRenderer":       0         // matches main.xml default (we-manager clone patch)
     })
 }

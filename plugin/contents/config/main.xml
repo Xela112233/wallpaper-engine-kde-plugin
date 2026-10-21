@@ -210,6 +210,12 @@
       <label>CPU priority of the scene renderer's threads: 0 = normal, 1 = below normal (nice 5), 2 = low (nice 10); low also asks the GPU for a low-priority queue where the driver offers one</label>
       <default>0</default>
     </entry>
+    <entry name="ShareRenderer" type="Int">
+      <label>One scene renderer for the screens of this Plasma that show the same scene with the same properties: 0 = off (every screen renders its own), 1 = on (one screen renders, the others show its frame), 2 = on, and this screen renders when it can</label>
+      <default>0</default>
+      <min>0</min>
+      <max>2</max>
+    </entry>
     <entry name="PresentMode" type="Int">
       <label>Swapchain present mode policy (0=Auto, 1=Fifo, 2=FifoRelaxed, 3=Mailbox, 4=Immediate)</label>
       <default>0</default>

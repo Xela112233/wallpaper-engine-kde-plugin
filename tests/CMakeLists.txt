@@ -133,6 +133,30 @@ target_include_directories(tst_vramsampler PRIVATE ${WEKDE_SRC_DIR})
 target_link_libraries(tst_vramsampler PRIVATE Qt6::Core Qt6::Test ${CMAKE_DL_LIBS})
 add_test(NAME tst_vramsampler COMMAND tst_vramsampler -v2)
 
+# ── Clone (ShareRenderer, we-manager clone patch) ────────────────────────────
+# tst_clonegroup: the table the screens of a process write their entries to.
+# tst_sharedframe: the shared frame's registry and lifetime, the cursor
+# mapping, and the real SceneMirror between two windows, with a plain GL
+# texture standing in for the renderer's.  Its window cases need Qt Quick on
+# OpenGL (xvfb-run with Mesa's software GL does) and skip elsewhere; run it a
+# second time with WEK_TEST_NO_SHARE=1 for contexts that do not share.
+add_executable(tst_clonegroup tst_clonegroup.cpp ${WEKDE_SRC_DIR}/CloneGroup.cpp)
+target_include_directories(tst_clonegroup PRIVATE ${WEKDE_SRC_DIR})
+target_link_libraries(tst_clonegroup PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME tst_clonegroup COMMAND tst_clonegroup -v2)
+find_package(Qt6 QUIET COMPONENTS Gui Qml Quick)
+if(TARGET Qt6::Quick AND TARGET Qt6::Qml)
+    add_executable(tst_sharedframe tst_sharedframe.cpp
+        ${WEKDE_SRC_DIR}/backend_scene/qml_helper/SceneMirror.cpp)
+    target_include_directories(tst_sharedframe PRIVATE ${WEKDE_SRC_DIR}/backend_scene/qml_helper)
+    target_link_libraries(tst_sharedframe PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::Test)
+    add_test(NAME tst_sharedframe COMMAND tst_sharedframe -v2)
+    add_test(NAME tst_sharedframe_no_share COMMAND tst_sharedframe -v2)
+    set_tests_properties(tst_sharedframe_no_share PROPERTIES ENVIRONMENT "WEK_TEST_NO_SHARE=1")
+else()
+    message(STATUS "Qt6Quick not found — skipping tst_sharedframe")
+endif()
+
 # ── SceneQuality (texture resolution, we-manager texture-quality patch) ──────
 # Header-only, in the scene renderer's source; no Vulkan.
 add_executable(tst_scenequality tst_scenequality.cpp)

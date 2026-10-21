@@ -20,3 +20,5 @@ WekNotifier 1.2 WekNotifier.qml
 WekDiagnostics 1.2 WekDiagnostics.qml
 VramSampler 1.2 VramSampler.qml
 EffectsWatcher 1.2 EffectsWatcher.qml
+CloneGroup 1.2 CloneGroup.qml
+SceneMirror 1.2 SceneMirror.qml
