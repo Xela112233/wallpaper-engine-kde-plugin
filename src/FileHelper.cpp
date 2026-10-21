@@ -1,5 +1,6 @@
 #include "FileHelper.hpp"
 #include "CachePaths.hpp"
+#include "LoadGuard.hpp"
 #include <QFile>
 #include <QDir>
 #include <QDirIterator>
@@ -198,6 +199,21 @@ FileHelper::~FileHelper() {
     // out of scope. This is the dlopen'd plugin .so — a UAF here crashes
     // plasmashell.
     m_pool.waitForDone();
+}
+
+bool FileHelper::markLoading(const QString& workshopId, const QString& source) {
+    if (! m_loadGuard)
+        m_loadGuard = std::make_unique<LoadGuard>(configDir() + QStringLiteral("/loading"), LoadGuard::nextName());
+    return m_loadGuard->mark(workshopId, source, QDateTime::currentMSecsSinceEpoch());
+}
+
+void FileHelper::clearLoading() {
+    if (m_loadGuard) m_loadGuard->clear();
+}
+
+QVariantMap FileHelper::stoppedLoading(const QString& source, int withinMs) const {
+    return LoadGuard::stopped(configDir() + QStringLiteral("/loading"), source, withinMs,
+                              QDateTime::currentMSecsSinceEpoch());
 }
 
 QString FileHelper::configDir() const {

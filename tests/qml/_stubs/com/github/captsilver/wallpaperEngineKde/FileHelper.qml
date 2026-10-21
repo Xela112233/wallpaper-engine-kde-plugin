@@ -1,10 +1,11 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: src/FileHelper.hpp + src/FileHelper.cpp
-// Last contract review: 2026-10-12
+// Last contract review: 2026-11-10
 
 // Test stub for the C++ FileHelper QML type. Methods return canned values
 // or empty objects so production code can run through happy paths in tests.
 import QtQuick
+import "LoadGuardData.js" as LoadGuards
 QtObject {
     id: stub
     property var _readReturns: ""
@@ -196,6 +197,16 @@ QtObject {
             quotaBytes: quotaBytes
         };
     }
+
+    // ── safe start after a crash (we-manager load-guard patch) ───────────
+    // One store per engine (LoadGuardData.js), as the real guards are files
+    // every FileHelper of the process sees; LoadGuards.crash() is a process
+    // that ended without removing its guards.
+    readonly property string _guardOwner: LoadGuards.nextOwner()
+    function markLoading(workshopId, source) { return LoadGuards.mark(_guardOwner, workshopId, source); }
+    function clearLoading()                  { LoadGuards.clear(_guardOwner); }
+    function stoppedLoading(source, withinMs) { return LoadGuards.stopped(source, withinMs); }
+    function _ownGuards()                    { return LoadGuards.owned(_guardOwner); }
 
     // Last GC bytes-freed status — exposed to the SettingPage Text binding
     // under the "Run cache GC now" button so the user sees the freed

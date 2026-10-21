@@ -24,6 +24,7 @@ Flickable {
     property alias cfg_MpvHwdec: ckbox_mpvHwdec.checked
     property alias cfg_MpvLoadInMemory: ckbox_mpvLoadInMemory.checked
     property alias cfg_VerboseLogging: ckbox_verboseLogging.checked
+    property alias cfg_SafeStartAfterCrash: ckbox_safeStartAfterCrash.checked
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
     property alias cfg_MouseInput: ckbox_mouseInput.checked
@@ -754,6 +755,24 @@ Flickable {
                     id: ckbox_verboseLogging
                     ToolTip.visible: hovered
                     ToolTip.text: i18nc("@info:tooltip", "Write detailed renderer messages, and web wallpapers' console info lines, to the system journal. Turn it on when reporting a bug, then off again.")
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Safe start after a crash")
+                text_color: Kirigami.Theme.textColor
+                actor: Switch {
+                    id: ckbox_safeStartAfterCrash
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        text: i18nc("@info safe start help text", "When Plasma stops (crashes or is killed) while a wallpaper is loading and starts again within two minutes, that wallpaper is not loaded again: the screen says so and offers Load anyway. A wallpaper that has drawn for 30 seconds counts as loaded. A login after a reboot loads it as always.")
+                        color: Kirigami.Theme.disabledTextColor
+                        wrapMode: Text.WordWrap
+                        font.italic: true
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    }
                 }
             }
        }

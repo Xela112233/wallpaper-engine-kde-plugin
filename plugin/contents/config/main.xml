@@ -130,6 +130,10 @@
       <label>Verbose logging</label>
       <default>false</default>
     </entry>
+    <entry name="SafeStartAfterCrash" type="Bool">
+      <label>Safe start after a crash: a wallpaper that was loading when Plasma stopped (crashed or was killed) less than two minutes earlier is not loaded again at the restart; the screen offers Load anyway</label>
+      <default>true</default>
+    </entry>
     <entry name="MouseInput" type="Bool">
       <label>Mouse Input</label>
       <default>true</default>

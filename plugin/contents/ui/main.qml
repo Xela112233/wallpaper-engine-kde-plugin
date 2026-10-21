@@ -224,6 +224,7 @@ Rectangle {
         stopped = true;
         console.log("[WEK] stop: unloading the wallpaper until the reason ends");
         diagnostics.logPauseTransition("stop", false);
+        clearLoadGuard();
         backendLoader.unload();
     }
     function startBackend() {
@@ -247,6 +248,66 @@ Rectangle {
         background._ignoreRemoteStop = playlistController.stoppedElsewhere;
         background._stopDue = false;
         if (background.stopRequested) stopGrace.restart();
+    }
+
+    // Safe start after a crash (we-manager load-guard patch).  Before a
+    // backend loads, FileHelper writes this screen's guard, naming the
+    // wallpaper and this process (~/.config/wekde/loading/, src/LoadGuard.hpp).
+    // It goes once the wallpaper has drawn for safeStartClearMs, on a load
+    // failure, a stop, and when this item goes away; a plasmashell that
+    // crashes, or is killed, leaves it.  At start, a wallpaper that such a
+    // guard names, written less than safeStartWindowMs ago, is not loaded: the
+    // screen says why and offers Load anyway (loadSafeStart).  An older guard
+    // does not count, so a login after a reboot loads as always; another
+    // wallpaper, picked by hand or the playlist's next, loads as always too.
+    readonly property bool safeStart: wallpaper.configuration.SafeStartAfterCrash ?? true
+    property int    safeStartWindowMs: 120000
+    property int    safeStartClearMs: 30000
+    // This screen's guard is written (FileHelper holds it).
+    property bool   _loadGuarded: false
+    // The source held back at start; "" once it loads or another one is set.
+    property string _heldSource: ""
+    onSafeStartChanged: if (!safeStart) clearLoadGuard()
+    Timer {
+        id: loadGuardClear
+        interval: background.safeStartClearMs
+        repeat: false
+        onTriggered: background.clearLoadGuard()
+    }
+    function markLoadGuard() {
+        loadGuardClear.stop();
+        if (!background.safeStart) return;
+        background._loadGuarded = pyext.mark_loading(wallpaper.configuration.WallpaperWorkShopId || "",
+                                                     background.source);
+    }
+    function clearLoadGuard() {
+        loadGuardClear.stop();
+        if (!background._loadGuarded) return;
+        background._loadGuarded = false;
+        pyext.clear_loading();
+    }
+    // At start: hold the configured wallpaper back when a plasmashell that
+    // ended while loading it left its guard behind.
+    function checkSafeStart() {
+        if (!background.safeStart || !background.source) return;
+        if (!pyext.load_guard_available()) {
+            console.warn("[WEK] safe start: the plugin library plasmashell runs has no FileHelper.markLoading or "
+                         + "stoppedLoading (it is older than this QML; log out and in again), so a wallpaper that "
+                         + "stops Plasma is loaded again at its restart");
+            return;
+        }
+        const g = pyext.stopped_loading(background.source, background.safeStartWindowMs);
+        if (!g || !g.source) return;
+        background._heldSource = background.source;
+        console.warn("[WEK] safe start: " + (g.app || "plasmashell") + " (pid " + g.pid + ") stopped while "
+                     + "loading " + g.source + " at " + new Date(Number(g.time)).toISOString() + " (" + g.file
+                     + "); not loading it again on " + (background.Screen.name || "this screen") + " until Load anyway or another "
+                     + "wallpaper (Safe start after a crash, in the plugin's settings)");
+    }
+    function loadAnyway() {
+        console.log("[WEK] safe start: Load anyway: " + background.source);
+        background._heldSource = "";
+        background.loadBackend();
     }
 
     // detect TTY switch and pause wallpaper(s)
@@ -485,6 +546,8 @@ Rectangle {
     onSig_backendFirstFrame: (backname) => {
         console.log(`backend ${backname} first frame`);
         background._notifiedFail = "";
+        // Safe start: the guard goes once the wallpaper has drawn for a while.
+        if (background._loadGuarded) loadGuardClear.restart();
         // Plasma samples the wallpaper when this fires; with an outgoing layer
         // still on top it would read the old one, so wait for it to go.
         if (backendLoader._outgoing || outgoingFade.running)
@@ -504,6 +567,8 @@ Rectangle {
     }
 
     Component.onDestruction: {
+        // A screen that goes away (or a clean exit) is no crash.
+        clearLoadGuard();
         if(mouseHooker) {
             mouseHooker.destroy();
         }
@@ -1072,7 +1137,9 @@ Rectangle {
                 this.loadInfoShow(com.errorString());
             }
         }
-        function loadInfoShow(info) {
+        function loadInfoShow(info, extra) {
+            // A load failure: the wallpaper did not take Plasma down.
+            background.clearLoadGuard();
             // Per-monitor dedup — only the primary screen fires notifications.
             // On multi-monitor the wallpaper plasmoid is per-screen; without
             // dedup the user sees 1+N popups for the same failure. `!== false`
@@ -1085,11 +1152,13 @@ Rectangle {
                 background._notifiedFail = failure;
                 notifier.wallpaperLoadFailed(background.workshopid || "", info);
             }
-            this.load("backend/InfoShow.qml", {
+            const props = {
                 wid: background.workshopid,
                 type: background.wallpaperType,
                 info: info
-            });
+            };
+            for (const k in (extra || {})) props[k] = extra[k];
+            this.load("backend/InfoShow.qml", props);
             // The four-button recovery pane emits pickAnotherRequested when
             // the user clicks "Pick another wallpaper". We don't have a
             // direct opener for the Plasma wallpaper-config dialog from
@@ -1104,6 +1173,20 @@ Rectangle {
                         + "Wallpaper… → Wallpapers tab.");
                 });
             }
+        }
+        // Safe start: the pane for a wallpaper held back after a crash.
+        function loadSafeStart() {
+            this.loadInfoShow(
+                i18nc("@info:status safe start, the wallpaper was not loaded after a crash",
+                      "It was not loaded again, so that the desktop could start; it may not be what made "
+                      + "Plasma stop, as every screen that was still loading is held back. Load it anyway, or "
+                      + "choose another wallpaper (right-click the desktop → Configure Desktop and Wallpaper…, "
+                      + "or in we-manager). Safe start after a crash can be switched off in the wallpaper "
+                      + "settings."),
+                { heading: i18nc("@info safe start heading", "Plasma stopped while this wallpaper was loading"),
+                  loadAnyway: true });
+            if (this.item && typeof this.item.loadAnywayRequested !== "undefined")
+                this.item.loadAnywayRequested.connect(background.loadAnyway);
         }
         function changeMouseTarget() {
            if(backendLoader.item && background.mouseHooker) {
@@ -1141,6 +1224,14 @@ Rectangle {
                           + "and pick one from the Wallpapers or Videos tab."));
             }
             return;
+        }
+        // Safe start: held back after a crash until Load anyway or another wallpaper.
+        if (background._heldSource !== "") {
+            if (background._heldSource === background.source) {
+                backendLoader.loadSafeStart();
+                return;
+            }
+            background._heldSource = "";
         }
         // choose backend
         switch (background.wallpaperType) {
@@ -1209,6 +1300,7 @@ Rectangle {
         // Demoted from console.error — a successful backend load shouldn't
         // present as an error in journalctl filtering.
         console.log("load backend: "+qmlsource);
+        markLoadGuard();
         backendLoader.load(qmlsource, properties);
         // Options (display mode, user props, speed) for the new wallpaper go
         // in after load() froze the outgoing backend, and before the source,
@@ -1270,6 +1362,8 @@ Rectangle {
 
         runCacheGc();
 
+        // Safe start: a wallpaper that stopped Plasma just now is held back.
+        checkSafeStart();
         // load first backend
         applySource();
         // A stop reason already there at start (on battery) emits no change.

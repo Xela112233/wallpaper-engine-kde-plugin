@@ -113,6 +113,13 @@ add_test(NAME tst_filehelper COMMAND tst_filehelper -v2)
 # fails loudly (TIMEOUT) instead of wedging CI/preflight.
 set_tests_properties(tst_filehelper PROPERTIES TIMEOUT 120)
 
+# ── LoadGuard unit tests (safe start after a crash, we-manager load-guard patch)
+# Header-only and Qt Core only, like FileHelper's other helpers.
+add_executable(tst_loadguard tst_loadguard.cpp)
+target_include_directories(tst_loadguard PRIVATE ${WEKDE_SRC_DIR})
+target_link_libraries(tst_loadguard PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME tst_loadguard COMMAND tst_loadguard -v2)
+
 # ── WebUrlInterceptor unit tests ──────────────────────────────────────────────
 # Pure-predicate tests for the file:// allow/block gate.  The QtWebEngineCore
 # component ships in qt6-qtwebengine on Fedora / Bazzite; gated so a build

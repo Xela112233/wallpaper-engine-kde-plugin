@@ -8,10 +8,14 @@
 #include <QJsonDocument>
 #include <QThreadPool>
 
+#include <memory>
+
 class QFileSystemWatcher;
 
 namespace wekde
 {
+
+class LoadGuard;
 
 class FileHelper : public QObject {
     Q_OBJECT
@@ -206,6 +210,18 @@ public:
     // readWorkshopManifest.
     Q_INVOKABLE void seedLastSeenVersions(const QString& steamLibraryPath);
 
+    // Safe start after a crash (we-manager load-guard patch, LoadGuard.hpp).
+    // markLoading writes this instance's guard in ~/.config/wekde/loading/
+    // (one wallpaper item, one FileHelper): the wallpaper it is about to
+    // load; clearLoading removes it, and so does the destructor, so only a
+    // process that ends without tearing its items down leaves one behind.
+    // stoppedLoading(source, withinMs) is the newest guard such a process of
+    // this application left for `source`, written within `withinMs`
+    // (workshopid, source, time, app, pid, file), else an empty map.
+    Q_INVOKABLE bool        markLoading(const QString& workshopId, const QString& source);
+    Q_INVOKABLE void        clearLoading();
+    Q_INVOKABLE QVariantMap stoppedLoading(const QString& source, int withinMs) const;
+
 signals:
     // Emitted when lastGcBytesFreed changes (after every enforceCacheQuota
     // run that actually freed bytes; not emitted for no-op runs that
@@ -266,6 +282,9 @@ private:
     // walk; the throttle skips runs called < kGcCooldownMs after.
     // qint64{0} sentinel = never ran (always allow first run).
     qint64 m_lastEnforceMs { 0 };
+
+    // This instance's load guard, made at the first markLoading.
+    std::unique_ptr<LoadGuard> m_loadGuard;
 };
 
 } // namespace wekde

@@ -162,6 +162,25 @@ Item {
         fileHelper.seedLastSeenVersions(steamLibraryPath);
     }
 
+    // Safe start after a crash (we-manager load-guard patch): this item's
+    // guard in ~/.config/wekde/loading/, and the newest one a plasmashell that
+    // ended while loading `source` left behind (src/LoadGuard.hpp).  After an
+    // RPM upgrade inside the session plasmashell keeps the plugin library it
+    // started with, which may have none of the three: load_guard_available()
+    // says so, and the calls do nothing.
+    function load_guard_available() {
+        return typeof fileHelper.markLoading === "function" && typeof fileHelper.stoppedLoading === "function";
+    }
+    function mark_loading(workshopId, source) {
+        return load_guard_available() ? fileHelper.markLoading(workshopId, source) : false;
+    }
+    function clear_loading() {
+        if (typeof fileHelper.clearLoading === "function") fileHelper.clearLoading();
+    }
+    function stopped_loading(source, withinMs) {
+        return load_guard_available() ? fileHelper.stoppedLoading(source, withinMs) : ({});
+    }
+
     // Expose the underlying FileHelper so QML can bind to its
     // Q_PROPERTY values (e.g. lastGcBytesFreed for the SettingPage readout).
     // Read-only — callers should still go through this wrapper for the

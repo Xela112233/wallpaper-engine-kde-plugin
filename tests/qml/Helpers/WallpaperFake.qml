@@ -55,6 +55,7 @@ Item {
         "MpvVideoSync":        0,
         "AudioConfigFile":     true,
         "VerboseLogging":      false,
+        "SafeStartAfterCrash": true,     // matches main.xml default (we-manager load-guard patch)
         "MouseInput":          false,
         "KeyboardInput":       false,    // matches main.xml default (we-manager input patch)
         "IconOpacity":         100,      // matches main.xml default (we-manager icon-opacity patch)

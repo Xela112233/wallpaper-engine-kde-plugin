@@ -20,6 +20,13 @@ Item {
     property string type: "unknown"
     property string wid: "unknown"
     property string source
+    // Safe start after a crash (we-manager load-guard patch): main.qml's
+    // loadSafeStart() shows this pane for a wallpaper it did not load because
+    // Plasma stopped while loading it, with its own heading and a Load anyway
+    // button that emits loadAnywayRequested.
+    property string heading: i18nc("@info wallpaper load failure heading", "Wallpaper failed to load")
+    property bool loadAnyway: false
+    signal loadAnywayRequested
 
     // Emitted by the recovery row's "Pick another wallpaper" button. The
     // host (main.qml's loadInfoShow) connects this to a clear-recovery
@@ -51,7 +58,7 @@ Item {
 
         Label {
             Layout.fillWidth: true
-            text: i18nc("@info wallpaper load failure heading", "Wallpaper failed to load")
+            text: infoItem.heading
             font.bold: true
             font.pointSize: 18
             color: Kirigami.Theme.textColor
@@ -92,6 +99,11 @@ Item {
             Layout.alignment: Qt.AlignHCenter
             spacing: 8
 
+            Button {
+                visible: infoItem.loadAnyway
+                text: i18nc("@action:button load a wallpaper that stopped Plasma last time", "Load anyway")
+                onClicked: infoItem.loadAnywayRequested()
+            }
             Button {
                 text: i18nc("@action:button copy workshop id to clipboard", "Copy ID")
                 enabled: infoItem.wid && infoItem.wid !== "unknown"
