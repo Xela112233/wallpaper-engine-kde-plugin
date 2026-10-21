@@ -37,6 +37,10 @@
       <arg name="id" type="s" direction="in"/>
     </method>
     <method name="Reload"/>
+    <!-- Keyboard mode for web wallpapers: off everywhere when a screen has
+         it, else on for one screen (the one under the pointer, else the one
+         whose desktop window is active, else the first that can). -->
+    <method name="ToggleKeyboard"/>
     <method name="CurrentWorkshopId">
       <arg name="value" type="s" direction="out"/>
     </method>

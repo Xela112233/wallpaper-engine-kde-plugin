@@ -20,6 +20,9 @@ public:
     using wekde::MouseGrabber::mousePressEvent;
     using wekde::MouseGrabber::mouseReleaseEvent;
     using wekde::MouseGrabber::mouseUngrabEvent;
+    using wekde::MouseGrabber::touchEvent;
+    using wekde::MouseGrabber::touchUngrabEvent;
+    using wekde::MouseGrabber::wheelEvent;
 };
 
 // Captures events sent to the item it's installed on, so tests can verify
@@ -32,6 +35,7 @@ public:
     QList<QPointF>         positions;
     QList<QPointF>         oldPositions;
     QList<Qt::MouseButton> buttons;
+    QList<QPoint>          angleDeltas;
 
     bool eventFilter(QObject* /*watched*/, QEvent* ev) override {
         types.append(ev->type());
@@ -52,6 +56,13 @@ public:
             buttons.append(Qt::NoButton);
             break;
         }
+        case QEvent::Wheel: {
+            auto* we = static_cast<QWheelEvent*>(ev);
+            positions.append(we->position());
+            angleDeltas.append(we->angleDelta());
+            buttons.append(Qt::NoButton);
+            break;
+        }
         default: break;
         }
         // Consume mouse/hover events so target->event() doesn't try to run
@@ -62,6 +73,7 @@ public:
         case QEvent::MouseMove:
         case QEvent::MouseButtonRelease:
         case QEvent::MouseButtonDblClick:
+        case QEvent::Wheel:
         case QEvent::HoverMove: return true;
         default: return false;
         }
@@ -117,6 +129,20 @@ private slots:
     // Mid-event target swap — target nulled between press and release.
     // Pins the `if (m_target)` guard in sendMouseEvent.
     void setTarget_nullBetweenPressAndRelease_noCrash();
+
+    // Wheel, right / middle buttons, touch (we-manager input patch)
+    void wheel_forwardedAndIgnored();
+    void rightPress_toTargetTakingIt_isAClickAndIgnored();
+    void middlePress_toTargetTakingIt_isAClick();
+    void rightPress_toLeftOnlyTarget_notForwarded();
+    void extraButtons_neverForwarded();
+    void extraButtons_doubleClick_neverForwarded();
+    void otherButtonRelease_whileLeftHeld_notForwardedAgain();
+    void ungrab_afterForwardedPress_sendsRelease();
+    void ungrab_afterRelease_sendsNothing();
+    void touch_firstPointIsTheLeftButton();
+    void touch_otherFingersNotForwarded();
+    void touchCancel_endsThePress();
 };
 
 // ---------------------------------------------------------------------------
@@ -127,9 +153,11 @@ void TestMouseGrabber::defaultState() {
     wekde::MouseGrabber g;
     QCOMPARE(g.forceCapture(), false);
     QCOMPARE(g.target(), nullptr);
-    // Ctor configures accepted mouse buttons and hover events
-    QCOMPARE(g.acceptedMouseButtons(), Qt::LeftButton);
+    // Ctor configures accepted mouse buttons, hover and touch events: every
+    // button reaches the press handler, which accepts the left one only.
+    QCOMPARE(g.acceptedMouseButtons(), Qt::AllButtons);
     QVERIFY(g.acceptHoverEvents());
+    QVERIFY(g.acceptTouchEvents());
 }
 
 void TestMouseGrabber::setTarget_emitsSignalOnChange() {
@@ -522,6 +550,258 @@ void TestMouseGrabber::setTarget_nullBetweenPressAndRelease_noCrash() {
     auto move = mkMouse(QEvent::MouseMove);
     g.mouseMoveEvent(&move);
     QCOMPARE(filter.types.size(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Wheel, right / middle buttons, touch
+// ---------------------------------------------------------------------------
+
+// A target that takes every button itself (a WebEngineView's input item does)
+// before the grabber attaches; a scene takes the left button only.
+static void takeAllButtons(QQuickItem& item) { item.setAcceptedMouseButtons(Qt::AllButtons); }
+
+void TestMouseGrabber::wheel_forwardedAndIgnored() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    g.setPosition(QPointF(10, 20));
+    target.setPosition(QPointF(3, 4));
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    QWheelEvent ev(QPointF(7, 11),
+                   QPointF(7, 11),
+                   QPoint(),
+                   QPoint(0, 120),
+                   Qt::NoButton,
+                   Qt::NoModifier,
+                   Qt::NoScrollPhase,
+                   false);
+    ev.accept();
+    g.wheelEvent(&ev);
+    QCOMPARE(filter.types.size(), 1);
+    QCOMPARE(filter.types.at(0), QEvent::Wheel);
+    QCOMPARE(filter.positions.at(0), QPointF(14, 27));
+    QCOMPARE(filter.angleDeltas.at(0), QPoint(0, 120));
+    // Plasma's wheel action on the desktop still runs.
+    QVERIFY(! ev.isAccepted());
+}
+
+void TestMouseGrabber::rightPress_toTargetTakingIt_isAClickAndIgnored() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    takeAllButtons(target);
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto ev = mkMouse(QEvent::MouseButtonPress, QPointF(5, 6), Qt::RightButton);
+    ev.accept();
+    g.mousePressEvent(&ev);
+    QCOMPARE(filter.types,
+             (QList<QEvent::Type> { QEvent::MouseButtonPress, QEvent::MouseButtonRelease }));
+    QCOMPARE(filter.buttons, (QList<Qt::MouseButton> { Qt::RightButton, Qt::RightButton }));
+    QCOMPARE(filter.positions.at(1), QPointF(5, 6));
+    // The containment's context menu still opens.
+    QVERIFY(! ev.isAccepted());
+}
+
+void TestMouseGrabber::middlePress_toTargetTakingIt_isAClick() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    takeAllButtons(target);
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto ev = mkMouse(QEvent::MouseButtonPress, QPointF(1, 1), Qt::MiddleButton);
+    g.mousePressEvent(&ev);
+    QCOMPARE(filter.types.size(), 2);
+    QCOMPARE(filter.buttons.at(0), Qt::MiddleButton);
+    QVERIFY(! ev.isAccepted());
+}
+
+void TestMouseGrabber::rightPress_toLeftOnlyTarget_notForwarded() {
+    TestableMouseGrabber g;
+    QQuickItem           scene;
+    EventCapturingFilter filter;
+    scene.setAcceptedMouseButtons(Qt::LeftButton); // SceneViewer.setAcceptMouse(true)
+    g.setTarget(&scene);
+    scene.installEventFilter(&filter);
+
+    auto ev = mkMouse(QEvent::MouseButtonPress, QPointF(1, 1), Qt::RightButton);
+    g.mousePressEvent(&ev);
+    QCOMPARE(filter.types.size(), 0);
+    QVERIFY(! ev.isAccepted());
+}
+
+// Back, Forward and the other extra buttons are Plasma's, even for a target
+// that takes every button: Chromium navigates a page's history on Back and
+// Forward, and the patch hands the page only the wheel, right and middle.
+void TestMouseGrabber::extraButtons_neverForwarded() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    takeAllButtons(target);
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    for (Qt::MouseButton b : { Qt::BackButton, Qt::ForwardButton, Qt::TaskButton, Qt::ExtraButton4,
+                               Qt::ExtraButton5 }) {
+        auto press = mkMouse(QEvent::MouseButtonPress, QPointF(1, 1), b);
+        press.accept();
+        g.mousePressEvent(&press);
+        QVERIFY2(! press.isAccepted(), "the press goes on to Plasma");
+        auto release = mkMouse(QEvent::MouseButtonRelease, QPointF(1, 1), b);
+        g.mouseReleaseEvent(&release);
+    }
+    QCOMPARE(filter.types.size(), 0);
+}
+
+void TestMouseGrabber::extraButtons_doubleClick_neverForwarded() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    takeAllButtons(target);
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    for (Qt::MouseButton b : { Qt::BackButton, Qt::ForwardButton }) {
+        auto dbl = mkMouse(QEvent::MouseButtonDblClick, QPointF(1, 1), b);
+        g.mouseDoubleClickEvent(&dbl);
+    }
+    QCOMPARE(filter.types.size(), 0);
+    auto right = mkMouse(QEvent::MouseButtonDblClick, QPointF(1, 1), Qt::RightButton);
+    g.mouseDoubleClickEvent(&right);
+    QCOMPARE(filter.types, (QList<QEvent::Type> { QEvent::MouseButtonDblClick }));
+}
+
+void TestMouseGrabber::otherButtonRelease_whileLeftHeld_notForwardedAgain() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    takeAllButtons(target);
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto left = mkMouse(QEvent::MouseButtonPress, QPointF(1, 1));
+    g.mousePressEvent(&left);
+    auto right = mkMouse(QEvent::MouseButtonPress, QPointF(1, 1), Qt::RightButton);
+    g.mousePressEvent(&right);
+    auto rightUp = mkMouse(QEvent::MouseButtonRelease, QPointF(1, 1), Qt::RightButton);
+    g.mouseReleaseEvent(&rightUp);
+    // left press, right press + its release; the real right release adds nothing.
+    QCOMPARE(filter.types.size(), 3);
+    auto leftUp = mkMouse(QEvent::MouseButtonRelease, QPointF(1, 1));
+    g.mouseReleaseEvent(&leftUp);
+    QCOMPARE(filter.types.size(), 4);
+    QCOMPARE(filter.buttons.at(3), Qt::LeftButton);
+}
+
+void TestMouseGrabber::ungrab_afterForwardedPress_sendsRelease() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto press = mkMouse(QEvent::MouseButtonPress, QPointF(2, 3));
+    g.mousePressEvent(&press);
+    auto move = mkMouse(QEvent::MouseMove, QPointF(8, 9));
+    g.mouseMoveEvent(&move);
+    // Another item takes the mouse before the release: the target gets a
+    // left release where the pointer last was.
+    g.mouseUngrabEvent();
+    QCOMPARE(filter.types.size(), 3);
+    QCOMPARE(filter.types.at(2), QEvent::MouseButtonRelease);
+    QCOMPARE(filter.buttons.at(2), Qt::LeftButton);
+    QCOMPARE(filter.positions.at(2), QPointF(8, 9));
+    g.mouseUngrabEvent(); // once only
+    QCOMPARE(filter.types.size(), 3);
+}
+
+void TestMouseGrabber::ungrab_afterRelease_sendsNothing() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto press = mkMouse(QEvent::MouseButtonPress);
+    g.mousePressEvent(&press);
+    auto release = mkMouse(QEvent::MouseButtonRelease);
+    g.mouseReleaseEvent(&release);
+    g.mouseUngrabEvent(); // Qt calls this after every release
+    QCOMPARE(filter.types.size(), 2);
+}
+
+static QTouchEvent mkTouch(QEvent::Type type, const QList<QEventPoint>& points) {
+    return QTouchEvent(type, QPointingDevice::primaryPointingDevice(), Qt::NoModifier, points);
+}
+
+void TestMouseGrabber::touch_firstPointIsTheLeftButton() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    g.setPosition(QPointF(10, 20));
+    target.setPosition(QPointF(3, 4));
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto down = mkTouch(QEvent::TouchBegin, { QEventPoint(7, QEventPoint::Pressed, {}, {}) });
+    down.ignore();
+    g.touchEvent(&down);
+    QVERIFY(down.isAccepted());
+    auto drag = mkTouch(QEvent::TouchUpdate, { QEventPoint(7, QEventPoint::Updated, {}, {}) });
+    g.touchEvent(&drag);
+    auto up = mkTouch(QEvent::TouchEnd, { QEventPoint(7, QEventPoint::Released, {}, {}) });
+    g.touchEvent(&up);
+    QCOMPARE(filter.types,
+             (QList<QEvent::Type> {
+                 QEvent::MouseButtonPress, QEvent::MouseMove, QEvent::MouseButtonRelease }));
+    QCOMPARE(filter.buttons.at(0), Qt::LeftButton);
+    // The point is mapped into the target like a mouse press (the public
+    // QEventPoint constructor leaves the item-local position at 0,0).
+    QCOMPARE(filter.positions.at(0), QPointF(7, 16));
+}
+
+void TestMouseGrabber::touch_otherFingersNotForwarded() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto down = mkTouch(QEvent::TouchBegin, { QEventPoint(1, QEventPoint::Pressed, {}, {}) });
+    g.touchEvent(&down);
+    auto second = mkTouch(QEvent::TouchUpdate,
+                          { QEventPoint(1, QEventPoint::Stationary, {}, {}),
+                            QEventPoint(2, QEventPoint::Pressed, {}, {}) });
+    g.touchEvent(&second);
+    auto secondUp = mkTouch(QEvent::TouchUpdate,
+                            { QEventPoint(1, QEventPoint::Stationary, {}, {}),
+                              QEventPoint(2, QEventPoint::Released, {}, {}) });
+    g.touchEvent(&secondUp);
+    QCOMPARE(filter.types.size(), 1); // the first finger's press only
+}
+
+void TestMouseGrabber::touchCancel_endsThePress() {
+    TestableMouseGrabber g;
+    QQuickItem           target;
+    EventCapturingFilter filter;
+    g.setTarget(&target);
+    target.installEventFilter(&filter);
+
+    auto down = mkTouch(QEvent::TouchBegin, { QEventPoint(4, QEventPoint::Pressed, {}, {}) });
+    g.touchEvent(&down);
+    auto cancel = mkTouch(QEvent::TouchCancel, {});
+    g.touchEvent(&cancel);
+    QCOMPARE(filter.types,
+             (QList<QEvent::Type> { QEvent::MouseButtonPress, QEvent::MouseButtonRelease }));
+    // A new touch starts afresh.
+    auto again = mkTouch(QEvent::TouchBegin, { QEventPoint(5, QEventPoint::Pressed, {}, {}) });
+    g.touchEvent(&again);
+    QCOMPARE(filter.types.size(), 3);
 }
 
 QTEST_GUILESS_MAIN(TestMouseGrabber)

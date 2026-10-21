@@ -6,10 +6,11 @@
 // emitWallpaperChanged hook is callable and that setPlaylistController is
 // a no-op (the routing is exercised in tst_wekcontrol.cpp).
 //
-// broadcastStop (StopScope "all screens") does go round: every stub in the
-// engine shares WekControlRegistry.js, like the C++ process-wide registry,
-// so two ScreenRigs reach each other's controllers.  The calls are direct
-// here; the C++ queues them (tst_wekcontrol.cpp covers that side).
+// broadcastStop (StopScope "all screens") and toggleKeyboardAt (the D-Bus
+// ToggleKeyboard) do go round: every stub in the engine shares
+// WekControlRegistry.js, like the C++ process-wide registry, so two
+// ScreenRigs reach each other's controllers.  The calls are direct here; the
+// C++ queues them (tst_wekcontrol.cpp covers that side).
 import QtQuick
 import "WekControlRegistry.js" as Registry
 
@@ -30,6 +31,28 @@ QtObject {
         if (Registry.controls.indexOf(control) < 0) Registry.controls.push(control);
     }
 
+    // WekControl.cpp's ToggleKeyboard, with the pointer position the C++
+    // reads from QCursor given here: off everywhere when a screen has it,
+    // else on for the controller whose keyboardScore(cursor) is highest.
+    function toggleKeyboardAt(cursor) {
+        if (Registry.keyboardOwner) {
+            Registry.keyboardOwner = null;
+            for (const c of Registry.controls.slice()) if (c._controller) c._controller.endKeyboard();
+            return;
+        }
+        let best = null, top = 0;
+        for (const c of Registry.controls) {
+            const s = c._controller ? c._controller.keyboardScore(cursor) : 0;
+            if (s > top) { top = s; best = c._controller; }
+        }
+        if (!best) return;
+        Registry.keyboardOwner = best;
+        best.startKeyboard();
+    }
+    function keyboardModeEnded() {
+        if (_controller && Registry.keyboardOwner === _controller) Registry.keyboardOwner = null;
+    }
+
     function broadcastStop(stopped) {
         _stopAnnounced = stopped;
         for (const c of Registry.controls.slice())
@@ -37,6 +60,7 @@ QtObject {
     }
 
     Component.onDestruction: {
+        if (_controller && Registry.keyboardOwner === _controller) Registry.keyboardOwner = null;
         if (_stopAnnounced) broadcastStop(false);
         const i = Registry.controls.indexOf(control);
         if (i >= 0) Registry.controls.splice(i, 1);

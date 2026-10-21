@@ -25,6 +25,7 @@ Flickable {
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
     property alias cfg_MouseInput: ckbox_mouseInput.checked
+    property alias cfg_KeyboardInput: ckbox_keyboardInput.checked
     property alias cfg_AccentFromSchemeColor: ckbox_accentFromSchemeColor.checked
     property alias cfg_AnimatedPreview: ckbox_animatedPreview.checked
     property alias cfg_ResumeTime: resumeSpin.value
@@ -665,6 +666,25 @@ Flickable {
                 icon: '../../images/mouse.svg'
                 actor: Switch {
                     id: ckbox_mouseInput
+                }
+            }
+
+            OptionItem {
+                visible: libcheck.wallpaper
+                text_color: Kirigami.Theme.textColor
+                text: i18nc("@label settings option", "Keyboard Mode for Web Wallpapers")
+                actor: Switch {
+                    id: ckbox_keyboardInput
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        text: i18nc("@info keyboard mode help text", "Bind \"Give the keyboard to the web wallpaper\" in System Settings, Shortcuts, Wallpaper Engine. The shortcut then hands the keyboard to the web wallpaper on the screen under the pointer (one screen at a time) until you press Esc, click an icon or a widget, or press the shortcut again. Click the desktop first if the keys do not arrive: only the active window gets them.")
+                        color: Kirigami.Theme.disabledTextColor
+                        wrapMode: Text.WordWrap
+                        font.italic: true
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    }
                 }
             }
 

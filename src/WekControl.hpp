@@ -83,6 +83,11 @@ public:
     // then, so the other screens do not stay stopped.
     Q_INVOKABLE void broadcastStop(bool stopped);
 
+    // main.qml, when keyboard mode ends on its screen however it ends (Esc,
+    // a click elsewhere, another wallpaper) or could not start: the next
+    // ToggleKeyboard starts it again instead of ending it.
+    Q_INVOKABLE void keyboardModeEnded();
+
 public slots:
     // Playlist navigation
     Q_NOREPLY void Next();
@@ -99,6 +104,12 @@ public slots:
     // Activation
     Q_NOREPLY void ActivatePlaylist(const QString& id);
     Q_NOREPLY void Reload();
+
+    // Keyboard mode for web wallpapers (we-manager patch; main.qml).  Off
+    // everywhere when a screen has it; else on for one screen only: the one
+    // under the pointer, else the one whose desktop window is active, else
+    // the first that can take it (KeyboardInput on, a web wallpaper).
+    Q_NOREPLY void ToggleKeyboard();
 
     // Query (sync, returns a value — D-Bus method, not signal/property)
     QString CurrentWorkshopId() const;

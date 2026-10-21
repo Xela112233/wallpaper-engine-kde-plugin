@@ -1,5 +1,6 @@
 #include "WekControl.hpp"
 
+#include <QCursor>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDebug>
@@ -21,6 +22,15 @@ constexpr const char* kObjectPath  = "/WallpaperEngine";
 QList<QPointer<QObject>>& controllerRegistry() {
     static QList<QPointer<QObject>> registry;
     return registry;
+}
+
+// Keyboard mode's screen: the controller the last ToggleKeyboard started it
+// on, until it ends (keyboardModeEnded) or the next ToggleKeyboard.  One
+// screen at a time: only one desktop window can be the active one, and the
+// keys reach only that one.
+QPointer<QObject>& keyboardOwner() {
+    static QPointer<QObject> owner;
+    return owner;
 }
 
 void broadcast(const char* method) {
@@ -140,6 +150,48 @@ void WekControl::ToggleMute() { broadcast("toggleMute"); }
 
 void WekControl::ActivatePlaylist(const QString& id) { broadcast("activatePlaylistById", id); }
 void WekControl::Reload() { broadcast("reload"); }
+
+void WekControl::ToggleKeyboard() {
+    QPointer<QObject>& owner = keyboardOwner();
+    if (owner) {
+        // On anywhere: off everywhere, so the next press starts it afresh.
+        owner = nullptr;
+        broadcast("endKeyboard");
+        return;
+    }
+    // Off: on one screen, the one that scores highest (main.qml
+    // keyboardScore: the pointer over it, its desktop window active, or
+    // just able to take it).  0 is a screen that cannot (KeyboardInput off,
+    // or no web wallpaper).
+    const QVariant cursor = QVariant(QCursor::pos());
+    QObject*       best   = nullptr;
+    int            top    = 0;
+    for (const QPointer<QObject>& ctrl : controllerRegistry()) {
+        if (! ctrl) continue;
+        QVariant score;
+        if (! QMetaObject::invokeMethod(ctrl,
+                                        "keyboardScore",
+                                        Qt::DirectConnection,
+                                        Q_RETURN_ARG(QVariant, score),
+                                        Q_ARG(QVariant, cursor)))
+            continue;
+        if (score.toInt() > top) {
+            top  = score.toInt();
+            best = ctrl;
+        }
+    }
+    if (! best) {
+        qInfo("wek-dbus: ToggleKeyboard: no screen can take the keyboard (KeyboardInput is off, or the "
+              "wallpaper is not a web one, on every screen)");
+        return;
+    }
+    owner = best;
+    QMetaObject::invokeMethod(best, "startKeyboard", Qt::QueuedConnection);
+}
+
+void WekControl::keyboardModeEnded() {
+    if (m_controller && keyboardOwner() == m_controller) keyboardOwner() = nullptr;
+}
 
 // -- Query (sync) --
 

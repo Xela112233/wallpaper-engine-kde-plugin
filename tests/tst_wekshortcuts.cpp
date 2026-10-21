@@ -50,7 +50,8 @@ void TestWekShortcuts::registersExpectedActions() {
     const QStringList expectedIds = {
         QStringLiteral("next_wallpaper"),   QStringLiteral("previous_wallpaper"),
         QStringLiteral("toggle_pause"),     QStringLiteral("toggle_mute"),
-        QStringLiteral("reload_wallpaper"), QStringLiteral("open_library")
+        QStringLiteral("reload_wallpaper"), QStringLiteral("open_library"),
+        QStringLiteral("toggle_wallpaper_keyboard")
     };
     for (const auto& id : expectedIds) {
         QVERIFY2(coll->action(id) != nullptr, qPrintable(QStringLiteral("missing action: ") + id));
@@ -113,6 +114,7 @@ void TestWekShortcuts::dispatchTable_matchesExpectedDBusMembers() {
         { QStringLiteral("toggle_pause"), QStringLiteral("Toggle") },
         { QStringLiteral("toggle_mute"), QStringLiteral("ToggleMute") },
         { QStringLiteral("reload_wallpaper"), QStringLiteral("Reload") },
+        { QStringLiteral("toggle_wallpaper_keyboard"), QStringLiteral("ToggleKeyboard") },
     };
     for (auto it = expected.constBegin(); it != expected.constEnd(); ++it) {
         auto* action = coll->action(it.key());
@@ -189,7 +191,7 @@ void TestWekShortcuts::allActions_haveDistinctIds() {
         QVERIFY2(! seen.contains(id), qPrintable(QStringLiteral("duplicate action id: ") + id));
         seen.insert(id);
     }
-    QCOMPARE(seen.size(), 6);
+    QCOMPARE(seen.size(), 7);
 }
 
 void TestWekShortcuts::wrappedLabels_respectTranslationDomain() {

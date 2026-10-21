@@ -4,13 +4,19 @@
 #include <QCoreApplication>
 #include <QHoverEvent>
 #include <QMouseEvent>
+#include <QTouchEvent>
+#include <QWheelEvent>
 #include <QtGlobal>
 
 using namespace wekde;
 
 MouseGrabber::MouseGrabber(QQuickItem* parent): QQuickItem(parent) {
-    setAcceptedMouseButtons(Qt::LeftButton);
+    // Every button reaches mousePressEvent; only the left one is accepted
+    // there, so the others still go on to Plasma (the context menu on the
+    // right button, paste on the middle one).
+    setAcceptedMouseButtons(Qt::AllButtons);
     setAcceptHoverEvents(true);
+    setAcceptTouchEvents(true);
 }
 
 bool MouseGrabber::forceCapture() const { return m_forceCapture; }
@@ -44,10 +50,40 @@ void MouseGrabber::setTarget(QQuickItem* item) {
     } else {
         m_prevTargetButtons = Qt::NoButton;
     }
+    // A press the old target saw is not ended on the new one.
+    m_pressForwarded = false;
+    m_touchId        = -1;
     Q_EMIT targetChanged();
 }
 
+bool MouseGrabber::targetTakes(Qt::MouseButton button) const {
+    // Only the right and middle buttons, besides the left: Back, Forward and
+    // the other extra buttons stay Plasma's.  A WebEngineView takes every
+    // button, and Chromium goes back or forward in the page's history on
+    // those.
+    if (! (button & (Qt::RightButton | Qt::MiddleButton))) return false;
+    return m_target && (m_prevTargetButtons & button);
+}
+
+void MouseGrabber::sendSynthetic(QEvent::Type type, const QPointF& pos, const QPointF& globalPos,
+                                 Qt::MouseButton button, Qt::MouseButtons buttons) {
+    if (! m_target) return;
+    QMouseEvent temp(type, mapToItem(m_target, pos), globalPos, button, buttons, Qt::NoModifier);
+    QCoreApplication::sendEvent(m_target, &temp);
+}
+
+void MouseGrabber::endPress() {
+    if (! m_pressForwarded) return;
+    m_pressForwarded = false;
+    sendSynthetic(
+        QEvent::MouseButtonRelease, m_lastPos, m_lastGlobalPos, Qt::LeftButton, Qt::NoButton);
+}
+
 void MouseGrabber::mouseUngrabEvent() {
+    // After a release this does nothing.  Before one (another item took the
+    // mouse), the target gets the release it would otherwise never see: a
+    // scene's input.cursorLeftDown, a page's mouseup.
+    endPress();
     if (m_forceCapture) grabMouse();
 }
 
@@ -96,7 +132,26 @@ void MouseGrabber::sendHoverEvent(QHoverEvent* event) {
 }
 
 void MouseGrabber::mousePressEvent(QMouseEvent* event) {
+    if (event->button() != Qt::LeftButton) {
+        // A right or middle click: a target that takes the button gets it as
+        // a press and its release (the real release goes to whoever takes
+        // the press next, Plasma), and the press goes on to Plasma.  Other
+        // buttons only go on to Plasma (targetTakes).
+        if (targetTakes(event->button())) {
+            sendMouseEvent(event);
+            sendSynthetic(QEvent::MouseButtonRelease,
+                          event->position(),
+                          event->globalPosition(),
+                          event->button(),
+                          event->buttons() & ~event->button());
+        }
+        event->ignore();
+        return;
+    }
     sendMouseEvent(event);
+    m_pressForwarded = m_target != nullptr;
+    m_lastPos        = event->position();
+    m_lastGlobalPos  = event->globalPosition();
     // need accept press to receive release
     // this break long press on desktop
     event->accept();
@@ -104,17 +159,101 @@ void MouseGrabber::mousePressEvent(QMouseEvent* event) {
 
 void MouseGrabber::mouseMoveEvent(QMouseEvent* event) {
     sendMouseEvent(event);
+    if (m_pressForwarded) {
+        m_lastPos       = event->position();
+        m_lastGlobalPos = event->globalPosition();
+    }
     event->ignore();
 }
 
 void MouseGrabber::mouseReleaseEvent(QMouseEvent* event) {
-    sendMouseEvent(event);
+    // While the left button holds the grab, other buttons' releases come here
+    // too; their click was already sent whole at the press.
+    if (event->button() == Qt::LeftButton) {
+        sendMouseEvent(event);
+        m_pressForwarded = false;
+    }
     event->ignore();
 }
 
 void MouseGrabber::mouseDoubleClickEvent(QMouseEvent* event) {
-    sendMouseEvent(event);
+    if (event->button() == Qt::LeftButton || targetTakes(event->button())) sendMouseEvent(event);
     event->ignore();
+}
+
+void MouseGrabber::wheelEvent(QWheelEvent* event) {
+    if (m_target) {
+        QWheelEvent temp(mapToItem(m_target, event->position()),
+                         event->globalPosition(),
+                         event->pixelDelta(),
+                         event->angleDelta(),
+                         event->buttons(),
+                         event->modifiers(),
+                         event->phase(),
+                         event->inverted(),
+                         event->source());
+        QCoreApplication::sendEvent(m_target, &temp);
+    }
+    // Ignored, so Plasma's own wheel action on the desktop still runs.
+    event->ignore();
+}
+
+void MouseGrabber::touchEvent(QTouchEvent* event) {
+    if (event->type() == QEvent::TouchCancel) {
+        touchUngrabEvent();
+        event->accept();
+        return;
+    }
+    // The first finger down is the left button until it lifts; other fingers
+    // are not forwarded.
+    const QEventPoint* point = nullptr;
+    for (const QEventPoint& p : event->points()) {
+        if (m_touchId < 0 ? p.state() == QEventPoint::Pressed : p.id() == m_touchId) {
+            point = &p;
+            break;
+        }
+    }
+    if (point) {
+        switch (point->state()) {
+        case QEventPoint::Pressed:
+            m_touchId = point->id();
+            sendSynthetic(QEvent::MouseButtonPress,
+                          point->position(),
+                          point->globalPosition(),
+                          Qt::LeftButton,
+                          Qt::LeftButton);
+            m_pressForwarded = m_target != nullptr;
+            m_lastPos        = point->position();
+            m_lastGlobalPos  = point->globalPosition();
+            break;
+        case QEventPoint::Updated:
+            sendSynthetic(QEvent::MouseMove,
+                          point->position(),
+                          point->globalPosition(),
+                          Qt::NoButton,
+                          Qt::LeftButton);
+            m_lastPos       = point->position();
+            m_lastGlobalPos = point->globalPosition();
+            break;
+        case QEventPoint::Released:
+            sendSynthetic(QEvent::MouseButtonRelease,
+                          point->position(),
+                          point->globalPosition(),
+                          Qt::LeftButton,
+                          Qt::NoButton);
+            m_touchId        = -1;
+            m_pressForwarded = false;
+            break;
+        default: break;
+        }
+    }
+    // Accepted, like the left press, so the rest of the touch comes here.
+    event->accept();
+}
+
+void MouseGrabber::touchUngrabEvent() {
+    m_touchId = -1;
+    endPress();
 }
 
 void MouseGrabber::hoverMoveEvent(QHoverEvent* event) {

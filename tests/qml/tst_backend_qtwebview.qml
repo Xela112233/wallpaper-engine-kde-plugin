@@ -114,6 +114,27 @@ TestCase {
         verify(t !== undefined);
     }
 
+    // Keyboard mode (we-manager input patch): main.qml takes the keyboard
+    // only for a backend with getKeyboardTarget, the page's input item.
+    function test_getKeyboardTargetReturnsBinding() {
+        verify(typeof web.getKeyboardTarget === "function");
+        const t = web.getKeyboardTarget();
+        verify(t !== undefined);
+    }
+
+    // A right click reaches the page as well as Plasma's desktop menu, so
+    // Chromium's own context menu is refused.
+    function test_contextMenuIsRefused() {
+        const wev = _findWebEngineView();
+        verify(wev !== null);
+        // A QObject, like Qt WebEngine's ContextMenuRequest (a JS object would
+        // reach the handler as a copy).
+        const request = Qt.createQmlObject("import QtQuick; QtObject { property bool accepted: false }", web);
+        wev.contextMenuRequested(request);
+        compare(request.accepted, true);
+        request.destroy();
+    }
+
     function test_userPropsJsonChange_earlyReturnsWhenWebobjUnloaded() {
         // onUserPropsJsonChanged early-returns when !webobj.loaded
         // (QtWebView.qml:46). The delta-emit code path that fires

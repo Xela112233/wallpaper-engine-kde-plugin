@@ -384,9 +384,12 @@ Item {
         property bool paused: false
         property bool _scriptsReady: false
 
-        //onContextMenuRequested: function(request) {
-        //    request.accepted = true;
-        //}
+        // The desktop's MouseGrabber hands right clicks to the page too
+        // (we-manager input patch) while Plasma opens its own desktop menu;
+        // Chromium's menu must not open on top of it.
+        onContextMenuRequested: function(request) {
+            request.accepted = true;
+        }
         // Track whether the first page load succeeded — in-page nav
         // failures after that shouldn't kick the user to InfoShow.
         property bool _firstLoadOk: false
@@ -728,5 +731,12 @@ Item {
     function getMouseTarget() {
         web.activeFocusOnPress = true;
         return Qt.binding(function() { return web.children[0]; })
+    }
+
+    // Keyboard mode (we-manager input patch, main.qml): the KeyGrabber hands
+    // keys to the page's input item, the same one the mouse goes to.  Having
+    // this function is what makes a backend take the keyboard.
+    function getKeyboardTarget() {
+        return Qt.binding(function() { return web.children[0] ?? null; })
     }
 }

@@ -21,6 +21,7 @@ add_library(${PROJECT_NAME}
 	SHARED
 	plugin.cpp
 	MouseGrabber.cpp
+	KeyGrabber.cpp
 	TTYSwitchMonitor.cpp
 	ScreenSaverMonitor.cpp
 	MprisMonitor.cpp

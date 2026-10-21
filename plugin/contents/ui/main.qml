@@ -35,6 +35,16 @@ Rectangle {
     property bool   randomizeWallpaper: wallpaper.configuration.RandomizeWallpaper
     property bool   noRandomWhilePaused: wallpaper.configuration.NoRandomWhilePaused
     property bool   mouseInput: wallpaper.configuration.MouseInput
+    // Keyboard mode for web wallpapers (we-manager input patch): with
+    // KeyboardInput on, the "Give the keyboard to the web wallpaper"
+    // shortcut (WekShortcuts -> D-Bus ToggleKeyboard -> PlaylistController)
+    // hands the desktop's keys to the page until Escape, a click on the
+    // desktop's icons or widgets, the shortcut again, or another wallpaper.
+    property bool   keyboardInput: wallpaper.configuration.KeyboardInput ?? false
+    property bool   keyboardMode: false
+    readonly property bool keyboardModeAvailable: keyboardInput && backendLoader.item !== null
+                                                  && typeof backendLoader.item.getKeyboardTarget === "function"
+    onKeyboardModeAvailableChanged: if (!keyboardModeAvailable) keyboardMode = false
     property bool   animatedPreview: wallpaper.configuration.AnimatedPreview
     property bool   mpvStats: wallpaper.configuration.MpvStats
     property bool   mpvPowerSaving: wallpaper.configuration.MpvPowerSaving
@@ -281,6 +291,94 @@ Rectangle {
             anchors.fill: parent
         }
     }
+    // Keyboard mode: sits beside the MouseGrabber on the desktop's
+    // AppletsLayout, where Folder View's keyboard focus lives.  Made on the
+    // first toggle, so a screen that never uses the mode never takes focus.
+    // KeyboardGrab.qml is its own file, made with Qt.createComponent: after
+    // an RPM upgrade inside a session plasmashell keeps the plugin library it
+    // started with, and one from before the input patch has no KeyGrabber.
+    // Naming the type here would fail this whole file and every wallpaper
+    // with it; this way only keyboard mode is missing, and the log says why.
+    property var keyHooker: null
+    function makeKeyHooker(hookParent) {
+        const comp = Qt.createComponent("KeyboardGrab.qml");
+        if (comp.status !== Component.Ready) {
+            console.warn("[WEK] keyboard mode: KeyboardGrab.qml did not load (" + comp.errorString().trim()
+                         + "): the plugin library plasmashell runs has no KeyGrabber (it is older than this "
+                         + "QML; log out and in again), so the keys stay with the desktop");
+            return null;
+        }
+        const grabber = comp.createObject(hookParent);
+        grabber.active = Qt.binding(function() { return background.keyboardMode; });
+        grabber.exitRequested.connect(function() { background.keyboardMode = false; });
+        return grabber;
+    }
+    // How good a choice this screen is for the shortcut (WekControl's
+    // ToggleKeyboard asks every screen and starts the mode on the best one):
+    // 0 cannot take it, 1 can, 2 its desktop window is the active one, 3 the
+    // pointer (`cursor`, global coordinates) is over it.
+    function keyboardScore(cursor) {
+        if (!background.keyboardModeAvailable) return 0;
+        const g = wallpaper.parent ? wallpaper.parent.screenGeometry : undefined;
+        if (cursor && g && cursor.x >= g.x && cursor.x < g.x + g.width && cursor.y >= g.y && cursor.y < g.y + g.height)
+            return 3;
+        return background.Window.active ? 2 : 1;
+    }
+    // Returns whether the mode started.
+    function startKeyboardMode() {
+        if (background.keyboardMode) return true;
+        if (!background.keyboardModeAvailable) {
+            console.log("[WEK] keyboard mode: " + (background.keyboardInput
+                ? "the wallpaper on this screen is not a web wallpaper"
+                : "KeyboardInput is off for this screen") + "; the shortcut does nothing here");
+            return false;
+        }
+        if (!background.keyHooker) {
+            const hookParent = background.findHookParent();
+            if (hookParent === null) {
+                console.warn("[WEK] keyboard mode: Common.findItem(Window.contentItem, \"AppletsLayout\") "
+                             + "and \"FolderViewDropArea\" found nothing; the keys stay with the desktop");
+                return false;
+            }
+            background.keyHooker = background.makeKeyHooker(hookParent);
+            if (!background.keyHooker) return false;
+        }
+        background.keyHooker.target = backendLoader.item.getKeyboardTarget();
+        background.keyboardMode = true;
+        return true;
+    }
+    // Tells WekControl the mode is over on this screen, however it ended.
+    function reportKeyboardModeEnded() {
+        if (typeof dbusControl.keyboardModeEnded === "function") dbusControl.keyboardModeEnded();
+    }
+    onKeyboardModeChanged: if (!keyboardMode) reportKeyboardModeEnded()
+    Connections {
+        target: playlistController
+        function onKeyboardStartRequested() {
+            if (!background.startKeyboardMode()) background.reportKeyboardModeEnded();
+        }
+        function onKeyboardEndRequested() { background.keyboardMode = false; }
+    }
+    // Says the keys go to the wallpaper and how to give them back.
+    Rectangle {
+        id: keyboardModeNote
+        visible: background.keyboardMode
+        z: 10
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.top
+        anchors.topMargin: Kirigami.Units.gridUnit * 2
+        radius: Kirigami.Units.smallSpacing
+        color: Qt.rgba(0, 0, 0, 0.7)
+        width: keyboardModeLabel.implicitWidth + Kirigami.Units.gridUnit * 2
+        height: keyboardModeLabel.implicitHeight + Kirigami.Units.gridUnit
+        Text {
+            id: keyboardModeLabel
+            anchors.centerIn: parent
+            color: "white"
+            text: i18nc("@info:status keyboard mode for web wallpapers",
+                        "The keyboard goes to the wallpaper. Press Esc to give it back.")
+        }
+    }
     // hasLib is a one-shot capability probe, NOT a live binding.  Common.
     // checklib_wallpaper calls Qt.createQmlObject(import …; QtObject{},
     // background) — invoking that DURING binding evaluation (i.e. during
@@ -347,6 +445,10 @@ Rectangle {
     Component.onDestruction: {
         if(mouseHooker) {
             mouseHooker.destroy();
+        }
+        if (keyHooker) {
+            keyHooker.active = false;
+            keyHooker.destroy();
         }
     }
 
@@ -449,22 +551,29 @@ Rectangle {
             hookTimer.tryTimes = 0;
         }
     }
-    function doHookMouse() {
-        if(background.Window) {
-            let hookParent = null;
-            // Plasma 5: MouseEventListener → QQuickGridView
+    // The desktop's icon and widget area in plasmashell's item tree, where
+    // the mouse and keyboard hooks go; null when not found (yet).
+    function findHookParent() {
+        if (!background.Window || !Window.contentItem) return null;
+        let hookParent = null;
+        // Plasma 5: MouseEventListener → QQuickGridView
 //            const screenArea = Common.findItem(Window.contentItem, "MouseEventListener");
 //            if(screenArea !== null) {
 //                hookParent = Common.findItem(screenArea, "QQuickGridView");
 //            }
-            // Plasma 6: AppletsLayout (desktop widget/icon area)
-            if(hookParent === null) {
-                hookParent = Common.findItem(Window.contentItem, "AppletsLayout");
-            }
-            // Plasma 6 fallback: FolderViewDropArea
-            if(hookParent === null) {
-                hookParent = Common.findItem(Window.contentItem, "FolderViewDropArea");
-            }
+        // Plasma 6: AppletsLayout (desktop widget/icon area)
+        if(hookParent === null) {
+            hookParent = Common.findItem(Window.contentItem, "AppletsLayout");
+        }
+        // Plasma 6 fallback: FolderViewDropArea
+        if(hookParent === null) {
+            hookParent = Common.findItem(Window.contentItem, "FolderViewDropArea");
+        }
+        return hookParent;
+    }
+    function doHookMouse() {
+        if(background.Window) {
+            const hookParent = background.findHookParent();
             if(hookParent === null) {
                 if(hookTimer.tryTimes >= 9) {
                     const tree = Common.genItemListStr(Window.contentItem, "  ", function(item) {
@@ -609,6 +718,7 @@ Rectangle {
         notifier: notifier
         notifyOnAdvance: wallpaper.configuration.PlaylistNotifyOnAdvance
         dbusControl: dbusControl
+        keyboardScoreFor: function(cursor) { return background.keyboardScore(cursor); }
 
         // Runtime mgr owns the playback cycle. (editorMode defaults to false.)
         activePlaylistIdRead:      wallpaper.configuration.ActivePlaylistId
@@ -772,6 +882,8 @@ Rectangle {
                 this.loaded.connect(this.changeMouseTarget);
                 background.mouseHookerChanged.connect(this.changeMouseTarget);
             }
+            // Another wallpaper ends keyboard mode.
+            this.loaded.connect(function() { background.keyboardMode = false; });
         }
         Component.onDestruction: {
             if(this.item) this.retire(this.item);

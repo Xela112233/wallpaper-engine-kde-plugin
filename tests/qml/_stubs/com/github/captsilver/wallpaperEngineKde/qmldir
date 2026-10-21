@@ -2,6 +2,7 @@ module com.github.captsilver.wallpaperEngineKde
 FileHelper 1.2 FileHelper.qml
 PluginInfo 1.2 PluginInfo.qml
 MouseGrabber 1.2 MouseGrabber.qml
+KeyGrabber 1.2 KeyGrabber.qml
 MprisMonitor 1.2 MprisMonitor.qml
 TTYSwitchMonitor 1.2 TTYSwitchMonitor.qml
 ScreenSaverMonitor 1.2 ScreenSaverMonitor.qml

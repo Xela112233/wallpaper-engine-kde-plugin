@@ -176,6 +176,25 @@ Item {
         if (! root.editorMode) mgr.reload();
     }
 
+    // The keyboard-mode shortcut (D-Bus ToggleKeyboard, we-manager input
+    // patch).  The mode is the screen's, not the playlist's: main.qml owns
+    // it.  WekControl asks every screen's keyboardScore, starts the mode on
+    // the best one only, and ends it everywhere on the next press.
+    signal keyboardStartRequested()
+    signal keyboardEndRequested()
+    // main.qml supplies it: 0 when this screen cannot take the keyboard,
+    // higher for a better choice.  Null in editor / tests.
+    property var keyboardScoreFor: null
+    function keyboardScore(cursor) {
+        return typeof root.keyboardScoreFor === "function" ? root.keyboardScoreFor(cursor) : 0;
+    }
+    function startKeyboard() {
+        root.keyboardStartRequested();
+    }
+    function endKeyboard() {
+        root.keyboardEndRequested();
+    }
+
     // Getters — direct-connection from the C++ adapter.  Return QVariant
     // so Q_RETURN_ARG(QVariant) marshalling works on the C++ side.
     function currentWorkshopId() {

@@ -15,6 +15,7 @@
 
 #include "../src/WekControl.hpp"
 
+#include <QCursor>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
 #include <QDBusInterface>
@@ -35,6 +36,12 @@ public:
     QString     lastMethod;
     QString     lastArg;
     QList<bool> stops; // remoteStop calls, in order
+    // Keyboard mode: what keyboardScore answers, what it was asked, and the
+    // startKeyboard / endKeyboard calls.
+    int      score { 0 };
+    QVariant lastCursor;
+    int      starts { 0 };
+    int      ends { 0 };
 
 public slots:
     void next() { lastMethod = QStringLiteral("next"); }
@@ -50,6 +57,19 @@ public slots:
         lastArg    = id;
     }
     void reload() { lastMethod = QStringLiteral("reload"); }
+    // Keyboard mode: main.qml's keyboardScore (0 cannot, higher is better).
+    QVariant keyboardScore(const QVariant& cursor) {
+        lastCursor = cursor;
+        return score;
+    }
+    void startKeyboard() {
+        lastMethod = QStringLiteral("startKeyboard");
+        ++starts;
+    }
+    void endKeyboard() {
+        lastMethod = QStringLiteral("endKeyboard");
+        ++ends;
+    }
     // QML functions take QVariant arguments, so the stub does too.
     void remoteStop(const QVariant& source, const QVariant& stopped) {
         lastMethod = QStringLiteral("remoteStop");
@@ -119,6 +139,10 @@ private slots:
     void toggleMute_routesToController();
     void activatePlaylist_routesArgumentToController();
     void reload_routesToController();
+    void toggleKeyboard_startsOnTheBestScreenOnly();
+    void toggleKeyboard_again_endsItEverywhere();
+    void toggleKeyboard_afterTheModeEndedOnItsScreen_startsAgain();
+    void toggleKeyboard_noScreenCanTakeIt_startsNothing();
     void currentWorkshopId_returnsStubValue();
     void currentPlaylistId_returnsStubValue();
     void currentItemIndex_returnsStubValue();
@@ -250,6 +274,87 @@ void TestWekControl::reload_routesToController() {
     QTRY_COMPARE(stub.lastMethod, QString("reload"));
 }
 
+// Keyboard mode for web wallpapers (we-manager input patch): one screen at a
+// time.  Only one desktop window can be the active one, and the keys reach
+// only it, so ToggleKeyboard starts the mode on the screen that scores
+// highest (main.qml: the pointer over it, its window active, able to) and
+// the next press ends it everywhere.
+void TestWekControl::toggleKeyboard_startsOnTheBestScreenOnly() {
+    PlaylistControllerStub a, b, c;
+    a.score = 2; // its desktop window is the active one
+    b.score = 3; // the pointer is over it
+    c.score = 0; // KeyboardInput off
+    auto ca = std::make_unique<WekControl>();
+    auto cb = std::make_unique<WekControl>();
+    auto cc = std::make_unique<WekControl>();
+    ca->setPlaylistController(&a);
+    cb->setPlaylistController(&b);
+    cc->setPlaylistController(&c);
+    ca->ToggleKeyboard();
+    QTRY_COMPARE(b.starts, 1);
+    QCoreApplication::processEvents();
+    QCOMPARE(a.starts, 0);
+    QCOMPARE(c.starts, 0);
+    // Each screen was asked with the pointer's position.
+    QCOMPARE(a.lastCursor.toPoint(), QCursor::pos());
+    QCOMPARE(b.lastCursor.toPoint(), QCursor::pos());
+    ca->ToggleKeyboard(); // leave it, so the next case starts clean
+    QTRY_COMPARE(b.ends, 1);
+}
+
+void TestWekControl::toggleKeyboard_again_endsItEverywhere() {
+    PlaylistControllerStub a, b;
+    a.score = 1;
+    b.score = 1;
+    auto ca = std::make_unique<WekControl>();
+    auto cb = std::make_unique<WekControl>();
+    ca->setPlaylistController(&a);
+    cb->setPlaylistController(&b);
+    cb->ToggleKeyboard();
+    QTRY_COMPARE(a.starts + b.starts, 1);
+    cb->ToggleKeyboard();
+    QTRY_COMPARE(a.ends, 1);
+    QTRY_COMPARE(b.ends, 1);
+    QCOMPARE(a.starts + b.starts, 1);
+}
+
+void TestWekControl::toggleKeyboard_afterTheModeEndedOnItsScreen_startsAgain() {
+    PlaylistControllerStub a, b;
+    a.score = 1;
+    b.score = 3;
+    auto ca = std::make_unique<WekControl>();
+    auto cb = std::make_unique<WekControl>();
+    ca->setPlaylistController(&a);
+    cb->setPlaylistController(&b);
+    ca->ToggleKeyboard();
+    QTRY_COMPARE(b.starts, 1);
+    // Escape on that screen: its main.qml reports it through its own control.
+    ca->keyboardModeEnded(); // another screen's report frees nothing
+    cb->keyboardModeEnded();
+    ca->ToggleKeyboard();
+    QTRY_COMPARE(b.starts, 2);
+    QCOMPARE(b.ends, 0);
+    ca->ToggleKeyboard();
+    QTRY_COMPARE(b.ends, 1);
+}
+
+void TestWekControl::toggleKeyboard_noScreenCanTakeIt_startsNothing() {
+    PlaylistControllerStub a;
+    auto                   ca = std::make_unique<WekControl>();
+    ca->setPlaylistController(&a);
+    QTest::ignoreMessage(QtInfoMsg, QRegularExpression("ToggleKeyboard: no screen can take the keyboard"));
+    ca->ToggleKeyboard();
+    QCoreApplication::processEvents();
+    QCOMPARE(a.starts, 0);
+    QCOMPARE(a.ends, 0);
+    // Nothing is held: a screen that can take it later gets it at once.
+    a.score = 1;
+    ca->ToggleKeyboard();
+    QTRY_COMPARE(a.starts, 1);
+    ca->ToggleKeyboard();
+    QTRY_COMPARE(a.ends, 1);
+}
+
 void TestWekControl::currentWorkshopId_returnsStubValue() {
     auto                   control = std::make_unique<WekControl>();
     PlaylistControllerStub stub;
@@ -351,6 +456,7 @@ void TestWekControl::reload_broadcastsToEveryRegisteredController() {
         QStringLiteral("reload"));
 }
 
+
 // -- Registry lifetime safety net --------------------------------------------
 // Not TDD-red: a genuinely dangling registry entry can't be driven red/green
 // reliably -- the failure mode of a raw dangling pointer depends on allocator
@@ -450,6 +556,7 @@ void TestWekControl::allSlots_areNoOpsWhenControllerIsNull() {
     control->ToggleMute();
     control->ActivatePlaylist(QStringLiteral("anything"));
     control->Reload();
+    control->ToggleKeyboard();
     QVERIFY(true); // none of the above crashed
 }
 

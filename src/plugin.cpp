@@ -9,6 +9,7 @@
 #include <KCrash>
 #include "MpvBackend.hpp"
 #include "SceneBackend.hpp"
+#include "KeyGrabber.hpp"
 #include "MouseGrabber.hpp"
 #include "TTYSwitchMonitor.hpp"
 #include "ScreenSaverMonitor.hpp"
@@ -106,6 +107,7 @@ public:
 
         qmlRegisterType<wekde::PluginInfo>(uri, WPVer[0], WPVer[1], "PluginInfo");
         qmlRegisterType<wekde::MouseGrabber>(uri, WPVer[0], WPVer[1], "MouseGrabber");
+        qmlRegisterType<wekde::KeyGrabber>(uri, WPVer[0], WPVer[1], "KeyGrabber");
         qmlRegisterType<scenebackend::SceneObject>(uri, WPVer[0], WPVer[1], "SceneViewer");
         qmlRegisterType<mpv::MpvObject>(uri, WPVer[0], WPVer[1], "Mpv");
         qmlRegisterType<wekde::TTYSwitchMonitor>(uri, WPVer[0], WPVer[1], "TTYSwitchMonitor");

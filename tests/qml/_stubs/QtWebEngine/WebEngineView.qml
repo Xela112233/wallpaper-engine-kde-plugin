@@ -44,6 +44,9 @@ Item {
         DesktopAudioVideoCapture = 7
     }
     signal featurePermissionRequested(url securityOrigin, int feature)
+    // Qt WebEngine's ContextMenuRequest: QtWebView.qml accepts it, so
+    // Chromium's menu never opens over Plasma's (we-manager input patch).
+    signal contextMenuRequested(var request)
     property int grantPermissionCount: 0
     property var lastGrantArgs: ({ origin: "", feature: -1, allow: false })
     function grantFeaturePermission(origin, feature, allow) {

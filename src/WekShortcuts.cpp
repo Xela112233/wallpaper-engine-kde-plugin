@@ -114,6 +114,13 @@ WekShortcuts::WekShortcuts(QObject* parent)
                    i18nc("@action shortcut label", "Reload current wallpaper"),
                    QStringLiteral("Reload"));
 
+    // Keyboard mode: the desktop's keys go to a web wallpaper until Escape or
+    // this shortcut again (KeyGrabber, main.qml).  Only screens whose
+    // KeyboardInput setting is on and that show a web wallpaper take it.
+    registerAction(QStringLiteral("toggle_wallpaper_keyboard"),
+                   i18nc("@action shortcut label", "Give the keyboard to the web wallpaper / take it back"),
+                   QStringLiteral("ToggleKeyboard"));
+
     // open_library opens we-manager (openWallpaperLibrary above), or, without
     // it, logs a hint rather than D-Bus dispatch: no clean Plasma 6 API exists
     // to programmatically open a containment-owned dialog.  Revisit when

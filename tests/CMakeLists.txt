@@ -262,6 +262,20 @@ if(Qt6Gui_FOUND AND Qt6Quick_FOUND)
     endif()
     add_test(NAME tst_mousegrabber COMMAND tst_mousegrabber -v2)
 
+    # ── KeyGrabber keyboard-mode tests (we-manager input patch) ───────────────
+    add_executable(tst_keygrabber
+        tst_keygrabber.cpp
+        ${WEKDE_SRC_DIR}/KeyGrabber.cpp
+        # A click on the page through the mouse hook, in keyboard mode.
+        ${WEKDE_SRC_DIR}/MouseGrabber.cpp
+    )
+    target_include_directories(tst_keygrabber PRIVATE ${WEKDE_SRC_DIR})
+    target_link_libraries(tst_keygrabber PRIVATE
+        Qt6::Core Qt6::Test Qt6::Gui Qt6::Quick)
+    add_test(NAME tst_keygrabber COMMAND tst_keygrabber -v2)
+    # Its window cases need a platform; offscreen needs no display.
+    set_tests_properties(tst_keygrabber PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # ── TTYSwitchMonitor suspend/wake dispatch tests ──────────────────────────
     # The D-Bus connect in the ctor only succeeds against a live system bus
     # (gracefully degrades otherwise), but the slot logic + signal contract
@@ -731,8 +745,9 @@ if(Qt6DBus_FOUND)
         ${WEKDE_SRC_DIR}/WekControl.cpp
     )
     target_include_directories(tst_wekcontrol PRIVATE ${WEKDE_SRC_DIR})
+    # Gui: ToggleKeyboard reads the pointer's position (QCursor).
     target_link_libraries(tst_wekcontrol PRIVATE
-        Qt6::Core Qt6::Test Qt6::DBus)
+        Qt6::Core Qt6::Gui Qt6::Test Qt6::DBus)
     if(COVERAGE)
         target_compile_options(tst_wekcontrol PRIVATE ${_cov_compile_flags})
         target_link_options(tst_wekcontrol PRIVATE ${_cov_link_flags})
