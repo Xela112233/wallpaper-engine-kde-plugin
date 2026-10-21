@@ -14,6 +14,7 @@
 #    include <QtGui/QOpenGLFramebufferObject>
 #endif
 #include <QtGui/QOpenGLFunctions>
+#include <QtGui/QScreen>
 #include <QtQuick/QQuickWindow>
 #if (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
 #    include <QtQuick/QQuickOpenGLUtils>
@@ -135,6 +136,9 @@ void MpvObject::stopAsync() {
     // Nothing on the GUI thread may touch this player again: the outgoing
     // backend's status no longer matters, and event handling is where a
     // synchronous call would wait on the busy core.
+    m_stopping = true;
+    QObject::disconnect(m_screenConn);
+    QObject::disconnect(m_refreshConn);
     if (m_shared_mpv) m_shared_mpv->detachOwner();
     const char* cmd[] = { "stop", nullptr };
     mpv_command_async(m_mpv, 0, cmd);
@@ -364,7 +368,58 @@ void MpvObject::setPowerSaving(bool on) {
             m_savedOptions.clear();
         }
     }
+    // Interpolation needs display sync, which power saving turns off; whichever
+    // of the two QML bindings fires last, its video-sync must end up right.
+    applyInterpolation(true);
     emit powerSavingChanged();
+}
+
+void MpvObject::setInterpolation(bool on) {
+    if (on == m_interpolation) return;
+    m_interpolation = on;
+    applyInterpolation();
+    emit interpolationChanged();
+}
+
+// The window can be absent (not in a scene yet) or move to another screen;
+// keep display-fps-override on the refresh rate of the screen in use.
+void MpvObject::followScreen() {
+    QObject::disconnect(m_refreshConn);
+    QScreen* s = window() ? window()->screen() : nullptr;
+    if (s) m_refreshConn = connect(s, &QScreen::refreshRateChanged, this, [this] { applyInterpolation(); });
+    applyInterpolation();
+}
+
+// Owns video-sync once interpolation has been on.  On: display-resample with
+// the screen's rate as display-fps-override (vo_libmpv cannot report it, and
+// interpolation needs display sync).  Off again: video-sync=audio, i.e. the
+// system clock without an audio track, which is what display-resample did
+// here before (it never engaged) and what keeps mpv from syncing to a rate it
+// measured meanwhile.  Never on: nothing is written, the constructor's options
+// stand.  `force` re-applies after setPowerSaving() restored its options.
+void MpvObject::applyInterpolation(bool force) {
+    if (! m_inited_ok || m_stopping || ! window()) return; // nothing on screen to retime
+    const QScreen* s    = window()->screen();
+    const double   hz   = s ? s->refreshRate() : 0.0;
+    const bool     want = m_interpolation && ! m_powerSaving && hz > 0;
+    if (want) {
+        if (! force && m_appliedOn && hz == m_appliedHz) return;
+        const QByteArray fps = QByteArray::number(hz, 'f', 3);
+        mpv_set_property_string(m_mpv, "video-sync", "display-resample");
+        mpv_set_property_string(m_mpv, "display-fps-override", fps.constData());
+        mpv_set_property_string(m_mpv, "tscale", "oversample");
+        mpv_set_property_string(m_mpv, "interpolation", "yes");
+        m_appliedOn = true;
+        m_appliedHz = hz;
+        m_syncOwned = true;
+    } else {
+        if (! m_syncOwned || (! force && ! m_appliedOn)) return;
+        mpv_set_property_string(m_mpv, "interpolation", "no");
+        mpv_set_property_string(m_mpv, "display-fps-override", "0");
+        mpv_set_property_string(m_mpv, "video-sync", "audio");
+        m_appliedOn = false;
+        m_appliedHz = 0;
+    }
 }
 
 int MpvObject::frameCapDelayMs(int maxFps, qint64 sinceLastMs) {
@@ -646,6 +701,12 @@ MpvObject::MpvObject(QQuickItem* parent)
         m_shared_mpv->owner = this;
     }
     mpv_set_wakeup_callback(m_mpv, &MpvObject::wakeup, m_shared_mpv.get());
+
+    connect(this, &QQuickItem::windowChanged, this, [this](QQuickWindow* w) {
+        QObject::disconnect(m_screenConn);
+        if (w) m_screenConn = connect(w, &QWindow::screenChanged, this, &MpvObject::followScreen);
+        followScreen();
+    });
 
     Q_EMIT initializedChanged();
 }

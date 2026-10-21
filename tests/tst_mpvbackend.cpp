@@ -155,6 +155,7 @@ private slots:
     void stopAsync_uninitializedOrRepeated_isSafe();
     void powerSaving_setsFastOptions_andRestoresPrevious();
     void powerSaving_defaultOff_leavesOptionsAlone();
+    void interpolation_withoutWindow_writesNothing();
     void frameCapDelayMs_table();
     void maxFps_negativeClampsToUncapped();
     void beginShutdown_neverInitializedCore_doesNotWarn();
@@ -886,6 +887,25 @@ void TestMpvBackend::powerSaving_setsFastOptions_andRestoresPrevious() {
         QCOMPARE(obj->getProperty(QString::fromLatin1(name)).toString(), before[name]);
     // The constructor's own choice survives a round trip.
     QCOMPARE(obj->getProperty("video-sync").toString(), QStringLiteral("display-resample"));
+}
+
+// MpvInterpolation needs a screen to take its refresh rate from; an item that
+// is not on screen (or never had interpolation on) must leave mpv's options as
+// the constructor set them, so the default path is exactly as before.
+void TestMpvBackend::interpolation_withoutWindow_writesNothing() {
+    auto obj = makeObject();
+    QVERIFY(obj->initialized());
+    QSignalSpy spy(obj.get(), &MpvObject::interpolationChanged);
+    obj->setInterpolation(true);
+    QCOMPARE(spy.count(), 1);
+    QVERIFY(obj->interpolation());
+    QCOMPARE(obj->getProperty("interpolation").toString(), QStringLiteral("no"));
+    QCOMPARE(obj->getProperty("video-sync").toString(), QStringLiteral("display-resample"));
+    obj->setPowerSaving(true);
+    obj->setPowerSaving(false);
+    QCOMPARE(obj->getProperty("video-sync").toString(), QStringLiteral("display-resample"));
+    obj->setInterpolation(false);
+    QCOMPARE(spy.count(), 2);
 }
 
 void TestMpvBackend::powerSaving_defaultOff_leavesOptionsAlone() {

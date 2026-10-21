@@ -70,6 +70,9 @@ Item{
         // at most as many redraws per second as scenes get (Fps setting).
         powerSaving: background.mpvPowerSaving
         maxFps: background.mpvPowerSaving ? background.fps : 0
+        // Opt-in frame blending at the display's refresh rate.  It needs
+        // mpv's display sync, which power saving turns off (video-sync=audio).
+        interpolation: background.mpvInterpolation && !background.mpvPowerSaving
         Connections {
             ignoreUnknownSignals: true
             function onFirstFrame() {
@@ -132,6 +135,7 @@ Item{
         player.mute = player.mute;
         player.powerSaving = player.powerSaving;
         player.maxFps = player.maxFps;
+        player.interpolation = player.interpolation;
         volumeFade.freeze();
     }
     // Called by main.qml once this backend has faded out, some time before

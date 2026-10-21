@@ -11,6 +11,7 @@ Item {
     property real   volume:    50
     property bool   mute:      false
     property bool   powerSaving: false
+    property bool   interpolation: false
     property int    maxFps:      0
 
     // ── test recorders (test-only stub) ──────────────────────────────────

@@ -127,6 +127,20 @@ TestCase {
         compare(p.maxFps, 0);
     }
 
+    // MpvInterpolation is opt-in, and power saving (video-sync=audio) wins.
+    function test_interpolationFollowsSettingUnlessPowerSaving() {
+        const p = _findMpvPlayer();
+        compare(p.interpolation, false);
+        background.mpvInterpolation = true;
+        compare(p.interpolation, true);
+        background.mpvPowerSaving = true;
+        compare(p.interpolation, false);
+        background.mpvPowerSaving = false;
+        compare(p.interpolation, true);
+        background.mpvInterpolation = false;
+        compare(p.interpolation, false);
+    }
+
     function test_videoRateChangedSetsSpeedProperty() {
         // onVideoRateChanged forwards to player.setProperty('speed', videoRate)
         // (Mpv.qml:49). videoRate is bound to background.speed, so the
@@ -306,6 +320,22 @@ TestCase {
         background.fps = 30;
         compare(p.powerSaving, true, "frozen backend followed the power-saving switch");
         compare(p.maxFps, 24, "frozen backend followed the Fps setting");
+        item.destroy();
+    }
+
+    function test_freezeOptions_keeps_interpolation() {
+        background.mpvPowerSaving = false;
+        background.mpvInterpolation = true;
+        const item = freshMpvComp.createObject(mpv.parent);
+        const p = item.data.find(o => o && typeof o.setProperty === "function"
+                                      && typeof o.command === "function");
+        compare(p.interpolation, true);
+        item.freezeOptions();
+        background.mpvInterpolation = false;
+        compare(p.interpolation, true, "frozen backend followed the smooth-motion switch");
+        background.mpvPowerSaving = true;
+        compare(p.interpolation, true, "frozen backend followed the power-saving switch");
+        background.mpvPowerSaving = false;
         item.destroy();
     }
 

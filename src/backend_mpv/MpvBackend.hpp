@@ -81,6 +81,9 @@ class MpvObject : public QQuickFramebufferObject {
     Q_PROPERTY(bool initialized READ initialized NOTIFY initializedChanged)
     // Opt-in (MpvPowerSaving): cheap scalers, frames at the video's own rate.
     Q_PROPERTY(bool powerSaving READ powerSaving WRITE setPowerSaving NOTIFY powerSavingChanged)
+    // Opt-in (MpvInterpolation): frame blending at the display's refresh
+    // rate, interpolation=yes with tscale=oversample.
+    Q_PROPERTY(bool interpolation READ interpolation WRITE setInterpolation NOTIFY interpolationChanged)
     // Upper bound on how often a new video frame is drawn; 0 = every frame
     // mpv produces.  mpv drops the frames in between, like on a slow display.
     Q_PROPERTY(int maxFps READ maxFps WRITE setMaxFps NOTIFY maxFpsChanged)
@@ -124,6 +127,7 @@ public:
     QString logfile() const;
     int     volume() const;
     bool    powerSaving() const { return m_powerSaving; }
+    bool    interpolation() const { return m_interpolation; }
     int     maxFps() const { return m_maxFps; }
 
     // The mpv options powerSaving sets: the built-in `fast` profile (bilinear
@@ -140,6 +144,7 @@ public:
     void setLogfile(const QString& logfile);
     void setVolume(const int& volume);
     void setPowerSaving(bool on);
+    void setInterpolation(bool on);
     void setMaxFps(int fps);
 
 public slots:
@@ -182,6 +187,7 @@ signals:
     void muteChanged();
     void volumeChanged();
     void powerSavingChanged();
+    void interpolationChanged();
     void maxFpsChanged();
     void logfileChanged();
 
@@ -204,6 +210,21 @@ private:
     // switching it off restores exactly those (mpv's defaults vary by version).
     bool                                             m_powerSaving { false };
     std::vector<std::pair<std::string, std::string>> m_savedOptions;
+    // interpolation: mpv blends frames only with its display sync running, and
+    // vo_libmpv cannot report the display's refresh rate, so it is passed as
+    // display-fps-override from the screen this item is on, and followed when
+    // the window moves to another screen or the mode changes.  m_applied* is
+    // what mpv has now (skips repeated writes); m_syncOwned is set once
+    // interpolation was on, from then on applyInterpolation() owns video-sync.
+    bool                    m_interpolation { false };
+    bool                    m_appliedOn { false };
+    double                  m_appliedHz { 0.0 };
+    bool                    m_syncOwned { false };
+    bool                    m_stopping { false }; // stopAsync(): never touch the player again
+    QMetaObject::Connection m_screenConn;
+    QMetaObject::Connection m_refreshConn;
+    void                    followScreen();
+    void                    applyInterpolation(bool force = false);
     // Frame-rate cap (GUI thread): when the last redraw went out, and a
     // single-shot timer for a deferred one.
     int           m_maxFps { 0 };

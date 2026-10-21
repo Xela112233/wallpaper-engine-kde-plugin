@@ -32,6 +32,7 @@ Rectangle {
     property bool   animatedPreview: wallpaper.configuration.AnimatedPreview
     property bool   mpvStats: wallpaper.configuration.MpvStats
     property bool   mpvPowerSaving: wallpaper.configuration.MpvPowerSaving
+    property bool   mpvInterpolation: wallpaper.configuration.MpvInterpolation
     property bool   verboseLogging: wallpaper.configuration.VerboseLogging
 
     property string videoFolderPath: wallpaper.configuration.VideoFolderPath

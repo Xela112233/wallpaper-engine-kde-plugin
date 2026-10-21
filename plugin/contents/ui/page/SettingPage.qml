@@ -20,6 +20,7 @@ Flickable {
     property alias cfg_Volume: sliderVol.value
     property alias cfg_MpvStats: ckbox_mpvStats.checked
     property alias cfg_MpvPowerSaving: ckbox_mpvPowerSaving.checked
+    property alias cfg_MpvInterpolation: ckbox_mpvInterpolation.checked
     property alias cfg_VerboseLogging: ckbox_verboseLogging.checked
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
@@ -534,6 +535,19 @@ Flickable {
                     id: ckbox_mpvPowerSaving
                     ToolTip.visible: hovered
                     ToolTip.text: i18nc("@info:tooltip", "Cheaper scaling, frames at the video's own rate and at most the scene Fps redraws per second. Uses noticeably less CPU and GPU; loop points may be less smooth.")
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Smooth video motion")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/tuning.svg'
+                visible: cfg_VideoBackend == Common.VideoBackend.Mpv
+                actor: Switch {
+                    id: ckbox_mpvInterpolation
+                    enabled: !ckbox_mpvPowerSaving.checked
+                    ToolTip.visible: hovered
+                    ToolTip.text: i18nc("@info:tooltip", "mpv frame interpolation (tscale=oversample): blends neighbouring frames where a frame change falls between two display refreshes, and retimes the video to the display (up to 1% faster or slower; with sound, the pitch moves as much). Redraws at the display's refresh rate, so it costs noticeably more GPU time, most on high-refresh panels. Video is then timed by the refreshes drawn: if the desktop cannot draw every one, it plays slower than normal; switch this off then. Has no effect while power-saving playback is on.")
                 }
             }
         }
