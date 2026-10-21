@@ -358,12 +358,27 @@ Rectangle {
     // A long pause (UnloadAfterPausedMin minutes, 0 off): paused for any of
     // the pause reasons in `ok` (the shortcut or tray, a window condition set
     // to pause, the battery, the screen locker), this long, unloads too; the
-    // end of the pause loads it again.
+    // end of the pause loads it again.  A peek (Show Desktop, Overview:
+    // windowModel.peeking) lifts the window pause but does not end an unload
+    // that has happened, so a glance does not reload the scene; the timer
+    // stops during a peek and starts from zero after it (unpause-overview
+    // patch).
     readonly property int unloadAfterPausedMin: Math.max(0, wallpaper.configuration.UnloadAfterPausedMin ?? 0)
     property int    pauseUnloadMs: unloadAfterPausedMin * 60000
     readonly property bool pausedNow: playlistController.userPaused || windowModel.reqPause || powerSource.reqPause
                        || (lockMonitor.active && wallpaper.configuration.ScreenSaverPolicy === 1)
-    onPausedNowChanged: if (!pausedNow) setStopReason("paused", false)
+    onPausedNowChanged: _endPauseUnload(false)
+    // `byUser`: the user's Resume ends the unload even during a peek; it is
+    // the window pause a peek lifts that it must not end.
+    function _endPauseUnload(byUser) {
+        if (!background.pausedNow && (byUser || !windowModel.peeking)) background.setStopReason("paused", false);
+    }
+    Connections {
+        target: playlistController
+        function onUserPausedChanged() {
+            if (!playlistController.userPaused) background._endPauseUnload(true);
+        }
+    }
     onUnloadAfterPausedMinChanged: if (unloadAfterPausedMin === 0) setStopReason("paused", false)
     Timer {
         id: pauseUnload
@@ -996,6 +1011,14 @@ Rectangle {
         maximizedAction: wallpaper.configuration.MaximizedAction
         fullscreenAction: wallpaper.configuration.FullscreenAction
         onReqStopChanged: diagnostics.logPauseTransition("windowStop", !windowModel.reqStop)
+        // Show Desktop and Overview lift the windows' pause (unpause-overview
+        // patch; both on by default).
+        unpauseOnShowDesktop: wallpaper.configuration.UnpauseOnShowDesktop ?? true
+        unpauseOnOverview: wallpaper.configuration.UnpauseOnOverview ?? true
+        onPeekingChanged: {
+            diagnostics.logPauseTransition(windowModel.peekSource, windowModel.peeking);
+            background._endPauseUnload(false);
+        }
     }
 
     PowerSource {

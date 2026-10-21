@@ -27,6 +27,8 @@ Flickable {
     property alias cfg_SafeStartAfterCrash: ckbox_safeStartAfterCrash.checked
     property alias cfg_VramStop: ckbox_vramStop.checked
     property alias cfg_ReloadAfterSleep: ckbox_reloadAfterSleep.checked
+    property alias cfg_UnpauseOnShowDesktop: ckbox_unpauseOnShowDesktop.checked
+    property alias cfg_UnpauseOnOverview: ckbox_unpauseOnOverview.checked
     property alias cfg_UnloadAfterPausedMin: spin_unloadAfterPausedMin.value
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
@@ -201,6 +203,31 @@ Flickable {
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
                         text: i18nc("@info playback action help text", "A fullscreen or borderless window covers the screen; a focused fullscreen game counts here. Stop unloads the wallpaper 10 seconds after the window appears, so its memory and video memory are free, and loads it again when the window goes.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            // we-manager unpause-overview patch: a peek lifts a window's pause.
+            OptionItem {
+                text: i18nc("@label settings option", "Unpause while Show Desktop is on")
+                text_color: Kirigami.Theme.textColor
+                enabled: cfg_PauseMode !== Common.PauseMode.Never
+                actor: Switch {
+                    id: ckbox_unpauseOnShowDesktop
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Unpause during Overview")
+                text_color: Kirigami.Theme.textColor
+                enabled: cfg_PauseMode !== Common.PauseMode.Never
+                actor: Switch {
+                    id: ckbox_unpauseOnOverview
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info unpause on overview help text", "While Show Desktop is on, or KWin's Overview, Desktop Grid or Present Windows shows, the wallpaper plays even if a window has paused it. A window set to mute or stop the wallpaper keeps it muted or stopped. Alt+Tab does not count.")
                         wrapMode: Text.Wrap
                     }
                 }

@@ -51,6 +51,8 @@ ColumnLayout {
     property alias  cfg_SafeStartAfterCrash: settingPage.cfg_SafeStartAfterCrash
     property alias  cfg_VramStop:            settingPage.cfg_VramStop
     property alias  cfg_ReloadAfterSleep:    settingPage.cfg_ReloadAfterSleep
+    property alias  cfg_UnpauseOnShowDesktop: settingPage.cfg_UnpauseOnShowDesktop
+    property alias  cfg_UnpauseOnOverview:   settingPage.cfg_UnpauseOnOverview
     property alias  cfg_UnloadAfterPausedMin: settingPage.cfg_UnloadAfterPausedMin
     property alias  cfg_Speed:               settingPage.cfg_Speed
     property alias  cfg_MuteAudio:           settingPage.cfg_MuteAudio

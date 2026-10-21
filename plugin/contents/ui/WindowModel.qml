@@ -83,6 +83,58 @@ Item {
     onMaximizedActionChanged: updateWindowsinfo()
     onFullscreenActionChanged: updateWindowsinfo()
 
+    // A peek (we-manager unpause-overview patch): while Show Desktop is on, or
+    // KWin's Overview (also the Desktop Grid) or Present Windows shows, the
+    // windows' pause is lifted, at once, not after resumeTime; their mute and
+    // their stop stay, so a glance never reloads a stopped scene.  Each kind
+    // has its key (UnpauseOnShowDesktop, UnpauseOnOverview).  Overview comes
+    // from an EffectsWatcher (src/EffectsWatcher.hpp: KWin's activeEffects,
+    // asked only while `watching`, that is while the windows ask for a pause).
+    property bool unpauseOnShowDesktop: true
+    property bool unpauseOnOverview: true
+    // A changed key applies now, not at the next window event: turned on
+    // while a window pauses, it makes the watcher.
+    onUnpauseOnShowDesktopChanged: updateWindowsinfo()
+    onUnpauseOnOverviewChanged: updateWindowsinfo()
+    // What the windows ask for before a peek lifts it.
+    property bool _windowsWantPause: false
+    property var  overviewWatch: null
+    readonly property bool overviewActive: overviewWatch !== null && overviewWatch.overviewActive === true
+    readonly property bool peek: (unpauseOnShowDesktop && KWindowSystem.showingDesktop)
+                                 || (unpauseOnOverview && overviewActive)
+    // A peek is lifting a window pause now (main.qml: a long-pause unload
+    // holds through it).  Set with the request it goes with, in the order
+    // that never shows main.qml a moment with neither: on before the pause
+    // is lifted, off after it is back.
+    readonly property bool peeking: _peeking
+    property bool _peeking: false
+    // What the peek is ("peek: show desktop", "peek: overview"), kept from its
+    // start: at its end the state that named it is already gone.
+    readonly property string peekSource: _peekLabel
+    property string _peekLabel: ""
+    onPeekChanged: updateWindowsinfo()
+    // Made the first time a window pauses with UnpauseOnOverview on: a screen
+    // no window pauses has no watcher at all, and an older library's missing
+    // type is named once, when it would matter.
+    property bool _overviewWatchTried: false
+    // The file that makes it (tests point it at one naming a type the library
+    // lacks, as an older library does).
+    property url overviewWatchSource: Qt.resolvedUrl("OverviewWatch.qml")
+    function makeOverviewWatch() {
+        if (wModel._overviewWatchTried) return;
+        wModel._overviewWatchTried = true;
+        const comp = Qt.createComponent(wModel.overviewWatchSource);
+        if (comp.status !== Component.Ready) {
+            console.warn("[WEK] overview: OverviewWatch.qml did not load (" + comp.errorString().trim() + "): the "
+                         + "plugin library plasmashell runs has no EffectsWatcher (it is older than this QML; log "
+                         + "out and in again), so Overview does not unpause the wallpaper; Show Desktop still does");
+            return;
+        }
+        wModel.overviewWatch = comp.createObject(wModel, {
+            watching: Qt.binding(function() { return wModel.unpauseOnOverview && wModel._windowsWantPause; })
+        });
+    }
+
     // ---
     readonly property bool reqPause: _reqPause
     readonly property bool reqMute: _reqMute
@@ -210,16 +262,16 @@ Item {
     }
     function _updateWindowsinfo() {
         if(modePlay === Common.PauseMode.Never) {
+            _windowsWantPause = false;
             playBy(true);
+            _peeking = false;
             return;
         }
         // "Show Desktop" (Meta+D, panel button) hides windows without
-        // minimizing them, so the maximized/fullscreen checks below would
-        // keep the wallpaper paused while the user is looking right at it.
-        if(KWindowSystem.showingDesktop) {
-            playBy(true);
-            return;
-        }
+        // minimizing them, so the maximized/fullscreen checks below still
+        // see them: the peek below lifts their pause while it lasts (with
+        // UnpauseOnShowDesktop; before the unpause-overview patch, Show
+        // Desktop lifted their mute and stop too).
 
         // Single pass over the task model: read each row once, keep windows that
         // are real windows in the current activity, and build a plain descriptor
@@ -249,9 +301,22 @@ Item {
             });
         }
 
-        requestBy(WindowPlay.windowRequests(windows, modePlay, wModel.screenGeometry, {
+        const r = WindowPlay.windowRequests(windows, modePlay, wModel.screenGeometry, {
             focus: wModel.focusAction, maximized: wModel.maximizedAction, fullscreen: wModel.fullscreenAction,
-        }));
+        });
+        _windowsWantPause = r.pause === true;
+        if (_windowsWantPause && wModel.unpauseOnOverview) makeOverviewWatch();
+        if (wModel.peek && r.pause === true) {
+            if (!_peeking)
+                _peekLabel = (unpauseOnShowDesktop && KWindowSystem.showingDesktop) ? "peek: show desktop"
+                                                                                    : "peek: overview";
+            _peeking = true;
+            _reqPause = false;                // lifted at once
+            requestBy({ mute: r.mute === true, stop: r.stop === true });
+        } else {
+            requestBy(r);
+            _peeking = false;
+        }
 
         if(logging) {
             // Keep the diagnostic dump (gated on `logging`, off the hot path).

@@ -32,6 +32,7 @@
 #include "WekDiagnostics.hpp"
 #include "ActivityHelper.hpp"
 #include "VramSampler.hpp"
+#include "EffectsWatcher.hpp"
 #include "Audio/AudioBus.h"
 #ifdef WEKDE_HAS_GLOBALACCEL
 #    include "WekShortcuts.hpp"
@@ -144,6 +145,10 @@ public:
         // we-manager vram patch: made from VramWatch.qml only (Qt.createComponent),
         // so a main.qml newer than the library still loads.
         qmlRegisterType<wekde::VramSampler>(uri, WPVer[0], WPVer[1], "VramSampler");
+        // we-manager unpause-overview patch: made from OverviewWatch.qml only
+        // (Qt.createComponent), so a WindowModel.qml newer than the library
+        // still loads.
+        qmlRegisterType<wekde::EffectsWatcher>(uri, WPVer[0], WPVer[1], "EffectsWatcher");
     }
 
     void initializeEngine(QQmlEngine* engine, const char* uri) override {

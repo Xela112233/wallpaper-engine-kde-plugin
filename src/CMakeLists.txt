@@ -42,6 +42,7 @@ add_library(${PROJECT_NAME}
 	WekDiagnostics.cpp
 	ActivityHelper.cpp
 	VramSampler.cpp
+	EffectsWatcher.cpp
 	qmldir
 	qwebchannel.qrc
 )

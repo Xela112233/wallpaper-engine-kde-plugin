@@ -23,6 +23,21 @@ TestCase {
         screenGeometry: ({ x: 0, y: 0, width: 1920, height: 1080 })
         modePlay: Plugin.Common.PauseMode.FocusOrMax
     }
+    // A WindowModel of its own, for the cases that need a fresh one (no
+    // watcher made yet).
+    Component {
+        id: freshComp
+        Plugin.WindowModel {
+            screenGeometry: ({ x: 0, y: 0, width: 1920, height: 1080 })
+            modePlay: Plugin.Common.PauseMode.Max
+        }
+    }
+    // Every peek start and end of `wm`, with the source it was logged under.
+    property var peekLog: []
+    Connections {
+        target: wm
+        function onPeekingChanged() { tc.peekLog = tc.peekLog.concat([[wm.peekSource, wm.peeking]]); }
+    }
 
     function _findInner(parent, marker) {
         const buckets = [parent.children || [], parent.data || []];
@@ -476,6 +491,10 @@ TestCase {
     }
     function cleanup() {
         // Back to the defaults (Pause) and no requests, for the tests above.
+        KWindowSystem.showingDesktop = false;
+        wm.unpauseOnShowDesktop = true;
+        wm.unpauseOnOverview = true;
+        if (wm.overviewWatch) wm.overviewWatch.overviewActive = false;
         _actions(2, 2, 2);
         _setWindows([]);
         _runUpdate();
@@ -571,5 +590,192 @@ TestCase {
         wm.fullscreenAction = 3;
         verify(tt.running, "a changed action must apply now, not at the next window event");
         tt.stop();
+    }
+
+    // ── a peek: Show Desktop and Overview (we-manager unpause-overview patch) ──
+    // While one shows, the windows' pause is lifted at once (no resumeTime);
+    // their mute and their stop stay.  The stub EffectsWatcher stands for
+    // KWin's activeEffects (tst_effectswatcher.cpp covers the C++).
+    function test_peek_overviewLiftsAWindowPauseAtOnce_andItsEndPausesAgain() {
+        wm.modePlay = Plugin.Common.PauseMode.Max;
+        _setWindows(_maximizedWindow());
+        _runUpdate();
+        compare(wm.reqPause, true);
+        verify(wm.overviewWatch !== null, "a window pause made no Overview watcher");
+        compare(wm.overviewWatch.watching, true, "KWin is not asked while a window pauses");
+        wm.overviewWatch.overviewActive = true;
+        _runUpdate();
+        compare(wm.reqPause, false, "Overview did not lift the pause at once");
+        compare(wm.peeking, true);
+        compare(wm.peekSource, "peek: overview");
+        compare(wm.overviewWatch.watching, true, "the watcher must see Overview close");
+        wm.overviewWatch.overviewActive = false;
+        _runUpdate();
+        compare(wm.reqPause, true, "the end of Overview did not pause again");
+        compare(wm.peeking, false);
+    }
+
+    function test_peek_eachKeyOffKeepsThePause() {
+        wm.modePlay = Plugin.Common.PauseMode.Max;
+        _setWindows(_maximizedWindow());
+        _runUpdate();
+        wm.unpauseOnOverview = false;
+        compare(wm.overviewWatch.watching, false, "KWin is asked with UnpauseOnOverview off");
+        wm.overviewWatch.overviewActive = true;
+        _runUpdate();
+        _settlePendingPlay();
+        compare(wm.reqPause, true, "Overview lifted the pause with UnpauseOnOverview off");
+        wm.overviewWatch.overviewActive = false;
+        wm.unpauseOnShowDesktop = false;
+        KWindowSystem.showingDesktop = true;
+        _runUpdate();
+        _settlePendingPlay();
+        compare(wm.reqPause, true, "Show Desktop lifted the pause with UnpauseOnShowDesktop off");
+        wm.unpauseOnShowDesktop = true;
+        _runUpdate();
+        compare(wm.reqPause, false);
+        compare(wm.peekSource, "peek: show desktop");
+    }
+
+    function test_peek_keepsAWindowsStopAndMute() {
+        wm.modePlay = Plugin.Common.PauseMode.Max;
+        _actions(2, 3, 2);                 // a maximised window stops the wallpaper
+        _setWindows(_maximizedWindow());
+        _runUpdate();
+        compare(wm.reqStop, true);
+        KWindowSystem.showingDesktop = true;
+        _runUpdate();
+        _settlePendingPlay();
+        compare(wm.reqStop, true, "Show Desktop lifted a window's stop: a glance would reload the scene");
+        KWindowSystem.showingDesktop = false;
+        _actions(2, 1, 2);                 // now it mutes
+        _runUpdate();
+        _settlePendingPlay();
+        compare(wm.reqMute, true);
+        compare(wm.reqStop, false);
+        KWindowSystem.showingDesktop = true;
+        _runUpdate();
+        _settlePendingPlay();
+        compare(wm.reqMute, true, "Show Desktop lifted a window's mute");
+        compare(wm.peeking, false, "no pause to lift, so no peek");
+        KWindowSystem.showingDesktop = false;
+        // A focused window pauses while a maximised one stops, then mutes:
+        // the peek lifts the pause alone.
+        wm.modePlay = Plugin.Common.PauseMode.FocusOrMax;
+        const both = [
+            { isWindow: true, isActive: false, isMaximized: true, isFullScreen: false, isMinimized: false,
+              activities: [], appName: "maximised" },
+            { isWindow: true, isActive: true, isMaximized: false, isFullScreen: false, isMinimized: false,
+              activities: [], appName: "focused" },
+        ];
+        for (const action of [3, 1]) {
+            _actions(2, action, 2);
+            _setWindows(both);
+            KWindowSystem.showingDesktop = false;
+            _runUpdate();
+            _settlePendingPlay();
+            compare(wm.reqPause, true);
+            KWindowSystem.showingDesktop = true;
+            _runUpdate();
+            compare(wm.reqPause, false, "the peek did not lift the focused window's pause");
+            compare(wm.peeking, true);
+            _settlePendingPlay();
+            if (action === 3) compare(wm.reqStop, true, "the peek lifted the maximised window's stop");
+            else compare(wm.reqMute, true, "the peek lifted the maximised window's mute");
+        }
+    }
+
+    function test_peek_kwinIsAskedOnlyWhileAWindowPauses() {
+        wm.modePlay = Plugin.Common.PauseMode.Max;
+        _setWindows([]);
+        _runUpdate();
+        verify(wm.overviewWatch === null || wm.overviewWatch.watching === false);
+        _setWindows(_maximizedWindow());
+        _runUpdate();
+        compare(wm.overviewWatch.watching, true);
+        _setWindows([]);
+        _runUpdate();
+        compare(wm.overviewWatch.watching, false);
+        _setWindows(_maximizedWindow());
+        wm.modePlay = Plugin.Common.PauseMode.Never;
+        _runUpdate();
+        compare(wm.overviewWatch.watching, false, "PauseMode Never still asks KWin");
+    }
+
+    // The decision on a model of one's own: its windows, then its trigger run now.
+    function _decide(m, windows) {
+        const tm = _findInner(m, "_windows");
+        verify(tm !== null);
+        tm._windows = windows;
+        m.updateWindowsinfo();
+        const buckets = [m.children || [], m.data || []];
+        for (const b of buckets)
+            for (let i = 0; i < b.length; i++)
+                if (b[i] && typeof b[i].start === "function" && b[i].interval == 100) { b[i].triggered(); return; }
+        fail("no trigger timer");
+    }
+
+    function test_peek_endIsLoggedUnderTheSourceItStartedWith() {
+        wm.modePlay = Plugin.Common.PauseMode.Max;
+        _setWindows(_maximizedWindow());
+        _runUpdate();
+        tc.peekLog = [];
+        KWindowSystem.showingDesktop = true;
+        _runUpdate();
+        KWindowSystem.showingDesktop = false;
+        _runUpdate();
+        compare(JSON.stringify(tc.peekLog),
+                JSON.stringify([["peek: show desktop", true], ["peek: show desktop", false]]),
+                "the end of a Show Desktop peek was logged as another peek");
+        wm.overviewWatch.overviewActive = true;
+        _runUpdate();
+        wm.overviewWatch.overviewActive = false;
+        _runUpdate();
+        compare(JSON.stringify(tc.peekLog.slice(2)),
+                JSON.stringify([["peek: overview", true], ["peek: overview", false]]));
+    }
+
+    function test_peek_turningUnpauseOnOverviewOnDuringAPauseMakesTheWatcher() {
+        const m = freshComp.createObject(tc, { unpauseOnOverview: false });
+        _decide(m, _maximizedWindow());
+        compare(m.reqPause, true);
+        compare(m.overviewWatch, null, "a watcher with UnpauseOnOverview off");
+        const tt = (function() {
+            const buckets = [m.children || [], m.data || []];
+            for (const b of buckets)
+                for (let i = 0; i < b.length; i++)
+                    if (b[i] && typeof b[i].start === "function" && b[i].interval == 100) return b[i];
+            return null;
+        })();
+        verify(tt !== null);
+        tt.stop();                         // no window event pending
+        m.unpauseOnOverview = true;
+        verify(tt.running, "turning the key on did not re-decide");
+        tt.triggered();
+        verify(m.overviewWatch !== null, "turning the key on during a pause made no watcher");
+        compare(m.overviewWatch.watching, true);
+        m.destroy();
+    }
+
+    // An older plugin library (no EffectsWatcher, kept by plasmashell across an
+    // RPM upgrade): one warning the first time a window pauses, no watcher,
+    // and Show Desktop still lifts the pause, every time.
+    function test_peek_onAnOlderLibrary_oneWarningAndShowDesktopStillWorks() {
+        const m = freshComp.createObject(tc, { overviewWatchSource: Qt.resolvedUrl("fixtures/MissingEffectsWatcher.qml") });
+        ignoreWarning(/^\[WEK\] overview: OverviewWatch\.qml did not load \(.*NoSuchEffectsWatcher is not a type.*so Overview does not unpause the wallpaper; Show Desktop still does$/);
+        _decide(m, _maximizedWindow());
+        compare(m.reqPause, true);
+        compare(m.overviewWatch, null);
+        failOnWarning(/OverviewWatch|did not load/);
+        for (let i = 0; i < 3; i++) {
+            KWindowSystem.showingDesktop = true;
+            _decide(m, _maximizedWindow());
+            compare(m.reqPause, false, "Show Desktop did not lift the pause on an older library");
+            KWindowSystem.showingDesktop = false;
+            _decide(m, _maximizedWindow());
+            compare(m.reqPause, true);
+        }
+        compare(m.overviewWatch, null);
+        m.destroy();
     }
 }

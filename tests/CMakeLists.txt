@@ -328,6 +328,23 @@ if(Qt6Gui_FOUND AND Qt6Quick_FOUND)
     set_tests_properties(tst_ttyswitchmonitor PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # ── EffectsWatcher (we-manager unpause-overview patch) ───────────────────
+    # A fake org.kde.KWin on a private session bus answers activeEffects; run
+    # under dbus-run-session so it never asks a real compositor (the bus
+    # cases skip when org.kde.KWin is taken).
+    add_executable(tst_effectswatcher
+        tst_effectswatcher.cpp
+        ${WEKDE_SRC_DIR}/EffectsWatcher.cpp
+    )
+    target_include_directories(tst_effectswatcher PRIVATE ${WEKDE_SRC_DIR})
+    target_link_libraries(tst_effectswatcher PRIVATE Qt6::Core Qt6::Test Qt6::DBus)
+    find_program(DBUS_RUN_SESSION_EW dbus-run-session)
+    if(DBUS_RUN_SESSION_EW)
+        add_test(NAME tst_effectswatcher COMMAND ${DBUS_RUN_SESSION_EW} -- $<TARGET_FILE:tst_effectswatcher> -v2)
+    else()
+        add_test(NAME tst_effectswatcher COMMAND tst_effectswatcher -v2)
+    endif()
+
     # ── ScreenSaverMonitor screen-lock dispatch tests ─────────────────────
     # The D-Bus connect in the ctor only succeeds against a live session bus
     # (gracefully degrades otherwise), but the slot logic + signal contract
