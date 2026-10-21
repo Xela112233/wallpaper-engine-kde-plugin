@@ -122,7 +122,16 @@ public slots:
 
     // Activation
     Q_NOREPLY void ActivatePlaylist(const QString& id);
+    // Re-reads the plugin's playlists.json (only that, as before).
     Q_NOREPLY void Reload();
+    // Reload the wallpaper itself (we-manager resume-reload patch): a fresh
+    // backend on the screen named (QScreen::name, the output's connector; ""
+    // for every screen), as a change of render resolution reloads it; a
+    // stopped screen, or one held back by safe start, is left as it is.
+    // Each screen writes one line to the journal ("[WEK] reload: ...").
+    Q_NOREPLY void ReloadWallpaper(const QString& screen);
+    // The same on every screen, from the "Reload current wallpaper" shortcut.
+    Q_NOREPLY void ReloadWallpaperShortcut();
 
     // Keyboard mode for web wallpapers (we-manager patch; main.qml).  Off
     // everywhere when a screen has it; else on for one screen only: the one

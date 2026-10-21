@@ -35,7 +35,219 @@ private slots:
     void sessionActiveAndPrepareForSleep_combineWithOrSemantics();
     void sessionPropertiesChangedConnect_signatureCompilesWithMatchingSlot();
     void handleSessionPropertiesChanged_filtersInterfaceAndExtractsActive();
+    // we-manager resume-reload patch: a resume, told apart from a VT switch.
+    void aWakeAfterPrepareForSleepIsAResumeWithItsKindAndTime();
+    void aWakeWithoutASleepAndAVtSwitchAreNoResume();
+    void theSuspendedTimeCatchesASleepLogindDidNotAnnounce();
+    void bothSourcesForOneSleepAreOneResume();
+    void aSleepOnlyTheClockSawSoonAfterLogindsIsASecondResume();
+    void anAbortedSuspendIsNamedSo();
+    void aPrepareForSleepHandledAfterTheWakeIsOneResumeOfTheWholeSleep();
 };
+
+namespace
+{
+// The clocks a test drives: suspended time, suspend count.
+struct Clocks {
+    qint64 suspended { 0 };
+    qint64 count { 5 };
+    void   attach(TTYSwitchMonitor& m) {
+        m.setClocksForTest([this] { return suspended; }, [this] { return count; });
+    }
+};
+} // namespace
+
+void TestTTYSwitchMonitor::aWakeAfterPrepareForSleepIsAResumeWithItsKindAndTime() {
+    TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+    Clocks           c;
+    c.attach(mon);
+    QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+    mon.handlePrepareForSleep(true);
+    c.suspended += 2 * 3600 * 1000;                   // two hours in suspend
+    c.count += 1;
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toString(), QStringLiteral("suspend"));
+    QCOMPARE(spy.at(0).at(1).toString(), QStringLiteral("logind"));
+    QCOMPARE(spy.at(0).at(2).toLongLong(), 2LL * 3600 * 1000);
+    QCOMPARE(mon.isSleeping(), false);                // the pause chain hears the wake as before
+    // A hibernation: the suspend count stays.
+    mon.handlePrepareForSleep(true);
+    c.suspended += 600'000;
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(1).at(0).toString(), QStringLiteral("hibernation"));
+    // The count cannot be read: "sleep".
+    c.count = -1;
+    mon.handlePrepareForSleep(true);
+    c.suspended += 60'000;
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.at(2).at(0).toString(), QStringLiteral("sleep"));
+}
+
+void TestTTYSwitchMonitor::aWakeWithoutASleepAndAVtSwitchAreNoResume() {
+    TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+    Clocks           c;
+    c.attach(mon);
+    QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+    QSignalSpy tty(&mon, &TTYSwitchMonitor::ttySwitch);
+    mon.handlePrepareForSleep(false);                 // made mid-sleep, or a repeated signal
+    mon.handleSessionActiveChanged(false);            // Ctrl+Alt+F3 away
+    mon.handleSessionActiveChanged(true);             // and back
+    mon.checkSuspendedTime();                         // the machine never slept
+    QCOMPARE(spy.count(), 0);
+    QCOMPARE(tty.count(), 2);
+}
+
+void TestTTYSwitchMonitor::theSuspendedTimeCatchesASleepLogindDidNotAnnounce() {
+    TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+    Clocks           c;
+    c.attach(mon);
+    QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+    c.suspended += 1500;                              // below kMinAsleepMs: not a sleep
+    mon.checkSuspendedTime();
+    QCOMPARE(spy.count(), 0);
+    c.suspended += 45 * 60'000;
+    c.count += 1;
+    mon.checkSuspendedTime();
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toString(), QStringLiteral("suspend"));
+    QCOMPARE(spy.at(0).at(1).toString(), QStringLiteral("clock"));
+    QCOMPARE(spy.at(0).at(2).toLongLong(), 45LL * 60'000);
+    mon.checkSuspendedTime();                         // the same sleep is not seen twice
+    QCOMPARE(spy.count(), 1);
+}
+
+void TestTTYSwitchMonitor::bothSourcesForOneSleepAreOneResume() {
+    TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+    Clocks           c;
+    c.attach(mon);
+    QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+    // logind first: the clock's next look sees nothing more.
+    mon.handlePrepareForSleep(true);
+    c.suspended += 600'000;
+    mon.handlePrepareForSleep(false);
+    mon.checkSuspendedTime();
+    QCOMPARE(spy.count(), 1);
+    // The clock first, logind's wake 20 s later: one resume.
+    mon.handlePrepareForSleep(true);
+    c.suspended += 600'000;
+    mon.checkSuspendedTime();
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(1).at(1).toString(), QStringLiteral("clock"));
+    // Another sleep a little later is a resume of its own.
+    mon.handlePrepareForSleep(true);
+    c.suspended += 600'000;
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.count(), 3);
+}
+
+// The review's case: logind announces a wake, and 30 s later a sleep logind
+// did not announce is seen by the clock.  Two sleeps, two resumes.
+void TestTTYSwitchMonitor::aSleepOnlyTheClockSawSoonAfterLogindsIsASecondResume() {
+    TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+    Clocks           c;
+    c.attach(mon);
+    QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+    mon.handlePrepareForSleep(true);
+    c.suspended += 600'000;
+    c.count += 1;
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(1).toString(), QStringLiteral("logind"));
+    mon.checkSuspendedTime();                         // 15 s on: logind's sleep is not seen again
+    QCOMPARE(spy.count(), 1);
+    c.suspended += 300'000;                           // 30 s after the wake, a sleep logind missed
+    c.count += 1;
+    mon.checkSuspendedTime();
+    QCOMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(1).at(0).toString(), QStringLiteral("suspend"));
+    QCOMPARE(spy.at(1).at(1).toString(), QStringLiteral("clock"));
+    QCOMPARE(spy.at(1).at(2).toLongLong(), 300'000LL);
+    // And the other way round: the clock's sleep, then logind's own one.
+    mon.handlePrepareForSleep(true);
+    c.suspended += 120'000;
+    c.count += 1;
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.count(), 3);
+    QCOMPARE(spy.at(2).at(1).toString(), QStringLiteral("logind"));
+    QCOMPARE(spy.at(2).at(2).toLongLong(), 120'000LL);
+}
+
+// A suspend the kernel refused, or one a wake event cut short: logind sends
+// the wake, but the machine spent (almost) no time suspended and the suspend
+// count did not rise.  Not a hibernation.
+void TestTTYSwitchMonitor::anAbortedSuspendIsNamedSo() {
+    TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+    Clocks           c;
+    c.attach(mon);
+    QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+    mon.handlePrepareForSleep(true);
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toString(), QStringLiteral("aborted"));
+    QCOMPARE(spy.at(0).at(2).toLongLong(), 0LL);
+    mon.handlePrepareForSleep(true);
+    c.suspended += 800;                               // cut short under a second in
+    c.count = -1;                                     // and with the count unreadable
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.at(1).at(0).toString(), QStringLiteral("aborted"));
+    // A short suspend that did happen is still a suspend.
+    c.count = 7;
+    mon.checkSuspendedTime();                         // the count readable again at a look
+    mon.handlePrepareForSleep(true);
+    c.suspended += 900;
+    c.count = 8;
+    mon.handlePrepareForSleep(false);
+    QCOMPARE(spy.at(2).at(0).toString(), QStringLiteral("suspend"));
+}
+
+// systemd 256 and later freeze the user session for a sleep: a GUI thread
+// that had not handled PrepareForSleep(true) before the freeze gets the true
+// and the false back to back after the wake.  An hour's suspend, in either
+// order against the clock's look, is one resume of an hour, a suspend.
+void TestTTYSwitchMonitor::aPrepareForSleepHandledAfterTheWakeIsOneResumeOfTheWholeSleep() {
+    {
+        TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+        Clocks           c;
+        c.attach(mon);
+        mon.checkSuspendedTime();                     // a look before the sleep
+        QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+        c.suspended += 3'600'000;                     // asleep, the true still queued
+        c.count += 1;
+        mon.handlePrepareForSleep(true);              // after the wake
+        mon.handlePrepareForSleep(false);
+        mon.checkSuspendedTime();
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toString(), QStringLiteral("suspend"));
+        QCOMPARE(spy.at(0).at(1).toString(), QStringLiteral("logind"));
+        QCOMPARE(spy.at(0).at(2).toLongLong(), 3'600'000LL);
+    }
+    {
+        TTYSwitchMonitor mon(QDBusConnection(QStringLiteral("none")), nullptr);
+        Clocks           c;
+        c.attach(mon);
+        QSignalSpy spy(&mon, &TTYSwitchMonitor::resumedFromSleep);
+        c.suspended += 3'600'000;
+        c.count += 1;
+        mon.checkSuspendedTime();                     // the clock's look comes first
+        mon.handlePrepareForSleep(true);
+        mon.handlePrepareForSleep(false);
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toString(), QStringLiteral("suspend"));
+        QCOMPARE(spy.at(0).at(1).toString(), QStringLiteral("clock"));
+        QCOMPARE(spy.at(0).at(2).toLongLong(), 3'600'000LL);
+        // The next sleep, announced in time, is a resume of its own.
+        mon.handlePrepareForSleep(true);
+        c.suspended += 600'000;
+        c.count += 1;
+        mon.handlePrepareForSleep(false);
+        QCOMPARE(spy.count(), 2);
+        QCOMPARE(spy.at(1).at(1).toString(), QStringLiteral("logind"));
+        QCOMPARE(spy.at(1).at(2).toLongLong(), 600'000LL);
+    }
+}
 
 void TestTTYSwitchMonitor::initialState_isAwake() {
     TTYSwitchMonitor mon;

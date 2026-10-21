@@ -144,6 +144,10 @@
       <label>Safe start after a crash: a wallpaper that was loading when Plasma stopped (crashed or was killed) less than two minutes earlier is not loaded again at the restart; the screen offers Load anyway</label>
       <default>true</default>
     </entry>
+    <entry name="ReloadAfterSleep" type="Bool">
+      <label>Reload the wallpaper after a suspend or hibernation (3 s after the wake): a fresh backend, as a change of render resolution makes one; a stopped wallpaper, or one held back by safe start, is left as it is; each reload is a line in the journal</label>
+      <default>true</default>
+    </entry>
     <entry name="MouseInput" type="Bool">
       <label>Mouse Input</label>
       <default>true</default>

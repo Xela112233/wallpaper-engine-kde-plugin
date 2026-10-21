@@ -219,6 +219,10 @@ public:
     // this application left for `source`, written within `withinMs`
     // (workshopid, source, time, app, pid, file), else an empty map.
     Q_INVOKABLE bool        markLoading(const QString& workshopId, const QString& source);
+    // The same with the load's cause (LoadGuard::mark's `after`): "resume"
+    // for a reload after sleep, which stoppedLoading does not count
+    // (we-manager resume-reload patch).
+    Q_INVOKABLE bool        markLoadingWhy(const QString& workshopId, const QString& source, const QString& why);
     Q_INVOKABLE void        clearLoading();
     Q_INVOKABLE QVariantMap stoppedLoading(const QString& source, int withinMs) const;
 

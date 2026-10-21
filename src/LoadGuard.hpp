@@ -84,7 +84,12 @@ public:
 
     // Write this item's guard: the wallpaper it is about to load.  Written
     // to a temporary file and renamed, so a reader never sees half of it.
-    bool mark(const QString& workshopId, const QString& source, qint64 nowMs) {
+    // `after`: why this load happens when it is not an ordinary one: "resume",
+    // a reload after sleep (we-manager resume-reload patch), which stopped()
+    // does not count: a plasmashell that dies in it is far more often the
+    // graphics driver after the wake than the wallpaper, and the next start's
+    // own load is guarded as any.
+    bool mark(const QString& workshopId, const QString& source, qint64 nowMs, const QString& after = QString()) {
         if (! QDir().mkpath(m_dir)) {
             qWarning() << "LoadGuard: cannot create" << m_dir << "- safe start is off for this load";
             return false;
@@ -97,6 +102,7 @@ public:
         o[QStringLiteral("pid")]        = static_cast<double>(QCoreApplication::applicationPid());
         o[QStringLiteral("start")]      = static_cast<double>(processStart(QCoreApplication::applicationPid()));
         o[QStringLiteral("boot")]       = bootId();
+        if (! after.isEmpty()) o[QStringLiteral("after")] = after;
         const QByteArray bytes          = QJsonDocument(o).toJson(QJsonDocument::Compact);
         const QString    target         = path();
         const QString    tmp            = target + QStringLiteral(".tmp");
@@ -163,6 +169,7 @@ public:
             }
             if (o.value(QStringLiteral("app")).toString() != app) continue;
             if (o.value(QStringLiteral("source")).toString() != source) continue;
+            if (o.value(QStringLiteral("after")).toString() == QStringLiteral("resume")) continue;   // a reload after sleep
             if (age > withinMs || age < -withinMs) continue;
             if (! best.isEmpty() && best.value(QStringLiteral("time")).toLongLong() >= time) continue;
             best = o.toVariantMap();

@@ -173,6 +173,17 @@ Item {
         root.setActivePlaylistId(id);
     }
 
+    // WekControl.ReloadWallpaper(screen) and the "Reload current wallpaper"
+    // shortcut (we-manager resume-reload patch): the screen named, or every
+    // screen for "", hands it to main.qml, which reloads its backend.
+    signal reloadRequested(string how)
+    function reloadBackend(screen, how) {
+        const want = String(screen || "");
+        if (want !== "" && want !== root.screenName) return false;
+        root.reloadRequested(String(how || "D-Bus"));
+        return true;
+    }
+
     function reload() {
         // Bump the cross-context reload seq + re-read playlists.json on the
         // runtime side.

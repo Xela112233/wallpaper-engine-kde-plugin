@@ -113,7 +113,7 @@ void TestWekShortcuts::dispatchTable_matchesExpectedDBusMembers() {
         { QStringLiteral("previous_wallpaper"), QStringLiteral("Previous") },
         { QStringLiteral("toggle_pause"), QStringLiteral("Toggle") },
         { QStringLiteral("toggle_mute"), QStringLiteral("ToggleMute") },
-        { QStringLiteral("reload_wallpaper"), QStringLiteral("Reload") },
+        { QStringLiteral("reload_wallpaper"), QStringLiteral("ReloadWallpaperShortcut") },
         { QStringLiteral("toggle_wallpaper_keyboard"), QStringLiteral("ToggleKeyboard") },
         { QStringLiteral("save_screenshot"), QStringLiteral("SaveScreenshots") },
     };
@@ -192,7 +192,7 @@ void TestWekShortcuts::allActions_haveDistinctIds() {
         QVERIFY2(! seen.contains(id), qPrintable(QStringLiteral("duplicate action id: ") + id));
         seen.insert(id);
     }
-    QCOMPARE(seen.size(), 7);
+    QCOMPARE(seen.size(), 8);   // save_screenshot (the screenshot patch) is the eighth
 }
 
 void TestWekShortcuts::wrappedLabels_respectTranslationDomain() {

@@ -10,10 +10,10 @@ var marks = 0;
 var _next = 0;
 function nextOwner() { _next += 1; return "filehelper-stub-" + _next; }
 function reset() { guards = []; marks = 0; }
-function mark(owner, workshopId, source) {
+function mark(owner, workshopId, source, after) {
     guards = guards.filter(g => g.owner !== owner);
     guards.push({ owner: owner, workshopid: workshopId, source: source, time: Date.now(), app: "plasmashell",
-                  pid: 4242 });
+                  pid: 4242, after: after || "" });
     marks += 1;
     return true;
 }
@@ -25,6 +25,7 @@ function stopped(source, withinMs) {
     for (const g of guards) {
         const age = Date.now() - g.time;
         if (g.owner !== null || g.source !== source || age > withinMs || age < -withinMs) continue;
+        if (g.after === "resume") continue;          // a reload after sleep (LoadGuard::stopped skips it too)
         if (best === null || g.time > best.time) best = g;
     }
     return best === null ? ({}) : ({ workshopid: best.workshopid, source: best.source, time: best.time,

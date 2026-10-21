@@ -171,8 +171,14 @@ Item {
     function load_guard_available() {
         return typeof fileHelper.markLoading === "function" && typeof fileHelper.stoppedLoading === "function";
     }
-    function mark_loading(workshopId, source) {
-        return load_guard_available() ? fileHelper.markLoading(workshopId, source) : false;
+    // `why`: the load's cause when it is not an ordinary one ("resume": a
+    // reload after sleep, which stoppedLoading does not count; resume-reload
+    // patch).  A library without markLoadingWhy writes an ordinary guard.
+    function mark_loading(workshopId, source, why) {
+        if (!load_guard_available()) return false;
+        if (why && typeof fileHelper.markLoadingWhy === "function")
+            return fileHelper.markLoadingWhy(workshopId, source, why);
+        return fileHelper.markLoading(workshopId, source);
     }
     function clear_loading() {
         if (typeof fileHelper.clearLoading === "function") fileHelper.clearLoading();

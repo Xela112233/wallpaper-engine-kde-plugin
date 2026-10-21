@@ -87,6 +87,7 @@ Item {
         "PlaylistNotifyOnAdvance": false,
         "MsaaMode":            0,
         "TextureQuality":      0,
+        "ReloadAfterSleep":    true,
         "ProcessPriority":     0
     })
 }

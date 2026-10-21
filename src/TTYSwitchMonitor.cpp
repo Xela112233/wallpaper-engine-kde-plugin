@@ -5,11 +5,92 @@
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDebug>
+#include <QFile>
+
+#include <algorithm>
+
+#include <time.h>
 
 using namespace wekde;
 
+namespace
+{
+qint64 clockMs(clockid_t id) {
+    timespec ts {};
+    if (clock_gettime(id, &ts) != 0) return 0;
+    return static_cast<qint64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+// The time the machine has been suspended since boot: CLOCK_BOOTTIME counts
+// it, CLOCK_MONOTONIC does not.
+qint64 suspendedMsNow() { return clockMs(CLOCK_BOOTTIME) - clockMs(CLOCK_MONOTONIC); }
+// The kernel's count of suspends that worked (to RAM or idle; a hibernation
+// is not one), -1 when it cannot be read.
+qint64 suspendCountNow() {
+    QFile f(QStringLiteral("/sys/power/suspend_stats/success"));
+    if (! f.open(QIODevice::ReadOnly)) return -1;
+    bool         ok = false;
+    const qint64 n  = f.readAll().trimmed().toLongLong(&ok);
+    return ok ? n : -1;
+}
+} // namespace
+
+void TTYSwitchMonitor::startClock() {
+    m_suspendedMs   = suspendedMsNow;
+    m_suspendCount  = suspendCountNow;
+    m_lastSuspended = m_suspendedMs();
+    m_toldSuspended = m_lastSuspended;
+    m_lastCount     = m_suspendCount();
+    m_poll.setInterval(kPollMs);
+    connect(&m_poll, &QTimer::timeout, this, &TTYSwitchMonitor::checkSuspendedTime);
+    m_poll.start();
+}
+
+void TTYSwitchMonitor::setClocksForTest(std::function<qint64()> suspendedMs, std::function<qint64()> suspendCount) {
+    m_suspendedMs   = std::move(suspendedMs);
+    m_suspendCount  = std::move(suspendCount);
+    m_lastSuspended = m_suspendedMs();
+    m_toldSuspended = m_lastSuspended;
+    m_lastCount     = m_suspendCount();
+}
+
+void TTYSwitchMonitor::checkSuspendedTime() {
+    const qint64 now = m_suspendedMs();
+    if (now - m_lastSuspended > kMinAsleepMs) noteResume(QStringLiteral("clock"));
+    m_lastSuspended = now;
+    if (! m_suspending) m_lastCount = m_suspendCount();
+}
+
+// A resume, from either source: once per sleep, with the time asleep and its
+// kind.
+void TTYSwitchMonitor::noteResume(const QString& how) {
+    const bool   logind       = how == QStringLiteral("logind");
+    const qint64 nowSuspended = m_suspendedMs();
+    const qint64 since        = logind ? m_sleptAtSuspended : m_lastSuspended;
+    const qint64 asleep       = std::max<qint64>(0, nowSuspended - since);
+    const qint64 before       = logind ? m_sleptAtCount : m_lastCount;
+    const qint64 count        = m_suspendCount();
+    // logind's wake for a sleep the clock has told already: the clock saw the
+    // suspended time rise after this sleep's PrepareForSleep(true), or (that
+    // signal handled late, after the clock's look) the last resume was the
+    // clock's and nothing has risen since.
+    const bool told = logind
+                      && (m_toldSuspended > m_sleptAtSuspended
+                          || (m_toldHow == QStringLiteral("clock") && m_toldSuspended == nowSuspended));
+    m_lastSuspended = nowSuspended;   // the clock's next look starts from here
+    m_lastCount     = count;
+    m_toldSuspended = nowSuspended;
+    m_toldHow       = told ? QString() : how;   // a clock resume pairs with one logind wake at most
+    if (told) return;
+    const QString kind = (before >= 0 && count > before) ? QStringLiteral("suspend")
+                         : asleep < kMinAsleepMs             ? QStringLiteral("aborted")
+                         : (before < 0 || count < 0)         ? QStringLiteral("sleep")
+                                                             : QStringLiteral("hibernation");
+    emit resumedFromSleep(kind, how, asleep);
+}
+
 TTYSwitchMonitor::TTYSwitchMonitor(QQuickItem* parent)
     : QQuickItem(parent), m_sleeping(false), m_suspending(false), m_sessionActive(true) {
+    startClock();
     // Pause-on-suspend is a polish feature — degrading to "no TTY/suspend
     // pause" is fine in toolbox / sandbox / minimal environments. Don't
     // qFatal; that takes down plasmashell with us.
@@ -24,6 +105,7 @@ TTYSwitchMonitor::TTYSwitchMonitor(QQuickItem* parent)
 
 TTYSwitchMonitor::TTYSwitchMonitor(QDBusConnection bus, QQuickItem* parent)
     : QQuickItem(parent), m_sleeping(false), m_suspending(false), m_sessionActive(true) {
+    startClock();
     if (bus.isConnected()) wireUp(bus);
 }
 
@@ -136,8 +218,21 @@ void TTYSwitchMonitor::subscribeToSessionActive(QDBusConnection bus, const QStri
 }
 
 void TTYSwitchMonitor::handlePrepareForSleep(bool sleep) {
-    m_suspending = sleep;
+    const bool wasSuspending = m_suspending;
+    m_suspending             = sleep;
+    if (sleep && ! wasSuspending) {
+        // The sleep starts where the clock looked last, not where this signal
+        // is handled: systemd (256 on) freezes the user session for a sleep,
+        // and a GUI thread that had not got to PrepareForSleep(true) before
+        // the freeze handles it after the wake, with the time asleep already
+        // counted.  Nothing sleeps between two looks otherwise.
+        m_sleptAtSuspended = m_lastSuspended;
+        m_sleptAtCount     = m_lastCount;
+    }
     updateSleeping();
+    // After the pause chain hears the wake: a false with no true before it
+    // (an item made mid-sleep, a repeated signal) is no resume.
+    if (! sleep && wasSuspending) noteResume(QStringLiteral("logind"));
 }
 
 void TTYSwitchMonitor::handleSessionActiveChanged(bool active) {

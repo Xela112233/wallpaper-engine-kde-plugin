@@ -26,6 +26,7 @@ Flickable {
     property alias cfg_VerboseLogging: ckbox_verboseLogging.checked
     property alias cfg_SafeStartAfterCrash: ckbox_safeStartAfterCrash.checked
     property alias cfg_VramStop: ckbox_vramStop.checked
+    property alias cfg_ReloadAfterSleep: ckbox_reloadAfterSleep.checked
     property alias cfg_UnloadAfterPausedMin: spin_unloadAfterPausedMin.value
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
@@ -827,6 +828,24 @@ Flickable {
                     Text {
                         Layout.fillWidth: true
                         text: i18nc("@info safe start help text", "When Plasma stops (crashes or is killed) while a wallpaper is loading and starts again within two minutes, that wallpaper is not loaded again: the screen says so and offers Load anyway. A wallpaper that has drawn for 30 seconds counts as loaded. A login after a reboot loads it as always.")
+                        color: Kirigami.Theme.disabledTextColor
+                        wrapMode: Text.WordWrap
+                        font.italic: true
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    }
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Reload after sleep")
+                text_color: Kirigami.Theme.textColor
+                actor: Switch {
+                    id: ckbox_reloadAfterSleep
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        text: i18nc("@info reload after sleep help text", "Three seconds after the computer wakes from a suspend or hibernation, the wallpaper loads again, so a graphics driver that came back broken does not leave it frozen or black. A stopped wallpaper, or one held back by safe start, is left as it is. Each reload is a line in the journal: journalctl --user -b | grep '[WEK] resume'")
                         color: Kirigami.Theme.disabledTextColor
                         wrapMode: Text.WordWrap
                         font.italic: true

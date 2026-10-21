@@ -185,6 +185,12 @@ void WekControl::ToggleMute() { broadcast("toggleMute"); }
 
 void WekControl::ActivatePlaylist(const QString& id) { broadcast("activatePlaylistById", id); }
 void WekControl::Reload() { broadcast("reload"); }
+void WekControl::ReloadWallpaper(const QString& screen) {
+    broadcast("reloadBackend", QVariant(screen), QVariant(QStringLiteral("D-Bus")));
+}
+void WekControl::ReloadWallpaperShortcut() {
+    broadcast("reloadBackend", QVariant(QString()), QVariant(QStringLiteral("shortcut")));
+}
 
 void WekControl::ToggleKeyboard() {
     QPointer<QObject>& owner = keyboardOwner();

@@ -202,9 +202,13 @@ FileHelper::~FileHelper() {
 }
 
 bool FileHelper::markLoading(const QString& workshopId, const QString& source) {
+    return markLoadingWhy(workshopId, source, QString());
+}
+
+bool FileHelper::markLoadingWhy(const QString& workshopId, const QString& source, const QString& why) {
     if (! m_loadGuard)
         m_loadGuard = std::make_unique<LoadGuard>(configDir() + QStringLiteral("/loading"), LoadGuard::nextName());
-    return m_loadGuard->mark(workshopId, source, QDateTime::currentMSecsSinceEpoch());
+    return m_loadGuard->mark(workshopId, source, QDateTime::currentMSecsSinceEpoch(), why);
 }
 
 void FileHelper::clearLoading() {

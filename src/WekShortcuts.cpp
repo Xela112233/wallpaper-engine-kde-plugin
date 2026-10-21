@@ -110,9 +110,11 @@ WekShortcuts::WekShortcuts(QObject* parent)
                    i18nc("@action shortcut label", "Toggle wallpaper audio mute"),
                    QStringLiteral("ToggleMute"));
 
+    // Reloads the wallpaper on every screen (we-manager resume-reload patch);
+    // the playlists alone were re-read before, whatever the label said.
     registerAction(QStringLiteral("reload_wallpaper"),
                    i18nc("@action shortcut label", "Reload current wallpaper"),
-                   QStringLiteral("Reload"));
+                   QStringLiteral("ReloadWallpaperShortcut"));
 
     // Keyboard mode: the desktop's keys go to a web wallpaper until Escape or
     // this shortcut again (KeyGrabber, main.qml).  Only screens whose

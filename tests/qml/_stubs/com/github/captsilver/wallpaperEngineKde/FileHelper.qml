@@ -1,6 +1,6 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: src/FileHelper.hpp + src/FileHelper.cpp
-// Last contract review: 2026-11-10
+// Last contract review: 2026-11-11
 
 // Test stub for the C++ FileHelper QML type. Methods return canned values
 // or empty objects so production code can run through happy paths in tests.
@@ -204,6 +204,7 @@ QtObject {
     // that ended without removing its guards.
     readonly property string _guardOwner: LoadGuards.nextOwner()
     function markLoading(workshopId, source) { return LoadGuards.mark(_guardOwner, workshopId, source); }
+    function markLoadingWhy(workshopId, source, why) { return LoadGuards.mark(_guardOwner, workshopId, source, why); }
     function clearLoading()                  { LoadGuards.clear(_guardOwner); }
     function stoppedLoading(source, withinMs) { return LoadGuards.stopped(source, withinMs); }
     function _ownGuards()                    { return LoadGuards.owned(_guardOwner); }

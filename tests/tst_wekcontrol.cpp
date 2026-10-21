@@ -98,6 +98,11 @@ public slots:
     }
     // What PlaylistController.stopReasons answers: JSON text.
     QVariant stopReasons() const { return reasonsJson; }
+    // WekControl.ReloadWallpaper (we-manager resume-reload patch): (screen, how).
+    void reloadBackend(const QVariant& screen, const QVariant& how) {
+        lastMethod = QStringLiteral("reloadBackend");
+        lastArg    = screen.toString() + QLatin1Char('|') + how.toString();
+    }
 
 public:
     QString reasonsJson;
@@ -197,6 +202,7 @@ private slots:
 
     // -- Stop on request, the stop reasons and the video memory (vram patch) --
     void requestStop_reachesEveryControllerWithItsArguments();
+    void reloadWallpaper_reachesEveryControllerAndSaysWhoAsked();
     void requestStop_needsAReasonAndSecondsFromZero();
     void stopReasons_gathersEveryScreensJson();
     void vramStatus_isWhatTheReaderSays();
@@ -571,6 +577,22 @@ void TestWekControl::requestStop_reachesEveryControllerWithItsArguments() {
     QTRY_COMPARE(stubB.lastArg, QStringLiteral("Factorio is running|DP-2|120"));
     controlA->RequestStop(QStringLiteral("x"), QString(), 1e9);         // at most a day
     QTRY_COMPARE(stubB.lastArg, QStringLiteral("x||86400"));
+}
+
+void TestWekControl::reloadWallpaper_reachesEveryControllerAndSaysWhoAsked() {
+    PlaylistControllerStub stubA, stubB;
+    auto                   controlA = std::make_unique<WekControl>();
+    auto                   controlB = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlB->setPlaylistController(&stubB);
+    controlA->ReloadWallpaper(QStringLiteral("DP-2"));
+    QTRY_COMPARE(stubA.lastArg, QStringLiteral("DP-2|D-Bus"));
+    QTRY_COMPARE(stubB.lastArg, QStringLiteral("DP-2|D-Bus"));
+    QCOMPARE(stubB.lastMethod, QStringLiteral("reloadBackend"));
+    controlB->ReloadWallpaperShortcut();
+    QTRY_COMPARE(stubA.lastArg, QStringLiteral("|shortcut"));
+    controlA->Reload();                                   // the playlists only, as before
+    QTRY_COMPARE(stubB.lastMethod, QStringLiteral("reload"));
 }
 
 void TestWekControl::requestStop_needsAReasonAndSecondsFromZero() {

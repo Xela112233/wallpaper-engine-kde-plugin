@@ -73,6 +73,7 @@ private slots:
     void oldGuardsOfDeadProcessesAreDeleted();
     void namesDifferPerItem();
     void aGuardFromAnotherBootNeverCounts();
+    void aReloadAfterSleepIsNotCounted();
 };
 
 void TestLoadGuard::markWritesTheWallpaperAndTheProcess() {
@@ -211,6 +212,27 @@ void TestLoadGuard::aGuardFromAnotherBootNeverCounts() {
     writeGuard(dir, QStringLiteral("this-boot"), guard(dead, 1, kNow - 30'000));
     QCOMPARE(LoadGuard::stopped(dir, kSource, kWindow, kNow).value(QStringLiteral("boot")).toString(),
              LoadGuard::bootId());
+}
+
+void TestLoadGuard::aReloadAfterSleepIsNotCounted() {
+    // we-manager resume-reload patch: a guard marked "resume" (the reload
+    // after a wake) does not hold the wallpaper back; an ordinary guard of the
+    // same source, older, still does, and mark() writes the mark.
+    QTemporaryDir tmp;
+    const QString dir  = tmp.path() + QStringLiteral("/loading");
+    const qint64  dead = deadPid();
+    QJsonObject   resume = guard(dead, 1, kNow - 5'000);
+    resume[QStringLiteral("after")] = QStringLiteral("resume");
+    writeGuard(dir, QStringLiteral("resume"), resume);
+    QVERIFY(LoadGuard::stopped(dir, kSource, kWindow, kNow).isEmpty());
+    writeGuard(dir, QStringLiteral("ordinary"), guard(dead, 1, kNow - 50'000));
+    QCOMPARE(LoadGuard::stopped(dir, kSource, kWindow, kNow).value(QStringLiteral("file")).toString(),
+             dir + QStringLiteral("/ordinary.json"));
+    LoadGuard g(dir, QStringLiteral("mine"));
+    QVERIFY(g.mark(QStringLiteral("111"), kSource, kNow, QStringLiteral("resume")));
+    QCOMPARE(readJson(g.path()).value(QStringLiteral("after")).toString(), QStringLiteral("resume"));
+    QVERIFY(g.mark(QStringLiteral("111"), kSource, kNow));
+    QVERIFY(! readJson(g.path()).contains(QStringLiteral("after")));
 }
 
 QTEST_GUILESS_MAIN(TestLoadGuard)

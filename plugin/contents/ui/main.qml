@@ -443,9 +443,11 @@ Rectangle {
     }
     function markLoadGuard() {
         loadGuardClear.stop();
+        const why = background._guardWhy;
+        background._guardWhy = "";
         if (!background.safeStart) return;
         background._loadGuarded = pyext.mark_loading(wallpaper.configuration.WallpaperWorkShopId || "",
-                                                     background.source);
+                                                     background.source, why);
     }
     function clearLoadGuard() {
         loadGuardClear.stop();
@@ -477,9 +479,98 @@ Rectangle {
         background.loadBackend();
     }
 
+    // Reload after sleep (we-manager resume-reload patch).  TTYSwitchMonitor
+    // tells a resume (logind's PrepareForSleep(false), or the time the machine
+    // spent suspended growing) from a VT switch; resumeDelayMs later this
+    // screen's backend is made again by loadBackend(), as a change of render
+    // resolution does, so a graphics driver that came back broken does not
+    // leave the wallpaper frozen or black.  A stopped screen and one held back
+    // by safe start are left as they are.  The reload's load guard is marked
+    // "resume": a plasmashell that dies in it does not hold the wallpaper back
+    // at the next start (that next load is guarded as usual).  WekControl
+    // ReloadWallpaper(screen) and the "Reload current wallpaper" shortcut
+    // reload the same way.  Every reload, and every resume that does not
+    // reload, is one info line in the journal: "[WEK] resume: ..." or
+    // "[WEK] reload: ...".
+    readonly property bool reloadAfterSleep: wallpaper.configuration.ReloadAfterSleep ?? true
+    property int    resumeDelayMs: 3000
+    // The next load guard's mark (markLoadGuard): "resume" for a reload after sleep.
+    property string _guardWhy: ""
+    property var    _resume: null
+    // The last of those lines, as written (the QML tests read it).
+    property string lastReloadLine: ""
+    function _reloadLine(text) {
+        background.lastReloadLine = text;
+        console.info(text);
+    }
+    Timer {
+        id: resumeReload
+        interval: background.resumeDelayMs
+        repeat: false
+        onTriggered: {
+            const r = background._resume || {};
+            background._resume = null;
+            background.reloadWallpaper("resume", r.how || "", r.kind || "", r.asleepMs || 0);
+        }
+    }
+    function resumeSeen(kind, how, asleepMs) {
+        if (!background.reloadAfterSleep) return;
+        background._resume = { kind: String(kind), how: String(how), asleepMs: Number(asleepMs) };
+        resumeReload.restart();
+    }
+    function _duration(ms) {
+        if (ms < 60000) return Math.max(0, Math.round(ms / 1000)) + " s";
+        const min = Math.round(ms / 60000);
+        return min >= 60 ? Math.floor(min / 60) + " h " + (min % 60) + " min" : min + " min";
+    }
+    // `cause` "resume" or "reload"; `how` names who saw it or asked:
+    // logind, clock, D-Bus, shortcut.
+    function reloadWallpaper(cause, how, kind, asleepMs) {
+        const tag = cause === "resume" ? "[WEK] resume: " : "[WEK] reload: ";
+        const where = background.Screen.name || "this screen";
+        if (background.stopped) {
+            const why = background.stopReasonsReport().reasons.map(r => r.reason).join(", ");
+            background._reloadLine(tag + "not reloading on " + where + ": stopped" + (why ? " (" + why + ")" : "")
+                                   + "; it loads fresh when the stop ends");
+            return false;
+        }
+        if (background._heldSource !== "" && background._heldSource === background.source) {
+            background._reloadLine(tag + "not reloading on " + where + ": held back by safe start");
+            return false;
+        }
+        if (!background.source || backendLoader.item === null) {
+            background._reloadLine(tag + "not reloading on " + where + ": no wallpaper is loaded");
+            return false;
+        }
+        const what = (background.wallpaperType || "wallpaper") + " " + (background.workshopid || background.source);
+        // kind (TTYSwitchMonitor): suspend, hibernation, aborted (a suspend or
+        // hibernation the kernel refused or a wake event cut short), sleep
+        // (the kernel's count unreadable).
+        const from = { suspend: "suspend", hibernation: "hibernation" }[kind] || "suspend or hibernation";
+        const woke = kind === "aborted"
+                   ? "woke from an aborted suspend or hibernation (" + background._duration(asleepMs) + " asleep)"
+                   : "woke from " + from + " after " + background._duration(asleepMs);
+        const said = cause === "resume"
+                   ? woke + " (" + how + ")"
+                   : (how === "shortcut" ? "asked by the Reload current wallpaper shortcut" : "asked over " + how);
+        background._reloadLine(tag + "reloading the wallpaper on " + where + " (" + what + "): " + said);
+        background._guardWhy = cause === "resume" ? "resume" : "";
+        background.loadBackend();
+        background._guardWhy = "";          // spent by markLoadGuard, or the load went no further
+        return true;
+    }
+
     // detect TTY switch and pause wallpaper(s)
     TTYSwitchMonitor {
         id: ttyMonitor
+        // A library from before the resume-reload patch has no resumedFromSleep.
+        Component.onCompleted: {
+            if (typeof ttyMonitor.resumedFromSleep === "function")
+                ttyMonitor.resumedFromSleep.connect(background.resumeSeen);
+            else
+                console.warn("[WEK] resume: TTYSwitchMonitor.resumedFromSleep is missing (the plugin library "
+                             + "plasmashell runs is older than this QML; log out and in again): no reload after sleep");
+        }
         // Pause/resume the active backend on VT switch or sleep.  The wallpaper
         // is backendLoader.item, which can be null mid-load, so guard it.  The
         // handler must be a value assignment: a `function onTtySwitch(sleep)`
@@ -1048,6 +1139,7 @@ Rectangle {
         saveScreenshot: function(path) { return background.saveWallpaperScreenshot(path); }
         stopReasonsReader: function() { return background.stopReasonsReport(); }
         onExternalStopRequested: (reason, seconds) => background.requestExternalStop(reason, seconds)
+        onReloadRequested: how => background.reloadWallpaper("reload", how, "", 0)
     }
 
     // lauch pause time to avoid freezing
