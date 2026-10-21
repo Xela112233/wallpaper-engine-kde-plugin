@@ -69,6 +69,7 @@ Item {
         "SystemAudioCapture":  true,      // matches main.xml default
         "MediaIntegration":    true,      // matches main.xml default
         "VideoFolderPath":     "",
+        "PostProcessingLevels": true,    // marker key, never read
         "ActivePlaylistId":    "",
         "CurrentItemIndex":    0,
         "PlaylistsReloadSeq":  0,

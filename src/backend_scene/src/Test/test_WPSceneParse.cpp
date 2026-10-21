@@ -2253,13 +2253,13 @@ TEST_SUITE("WPSceneParser::Parse (end-to-end)") {
         CHECK(scene->renderTargets.count("_rt_Bloom_Mip5") == 0);
 
         // The knee now tracks the scene's own bloomhdrfeather (WE's default
-        // is 0.1; this fixture authors 0.2).  Scatter and chain depth stay
-        // hard-coded: the shipped hdr_downsample.frag multiplies by
+        // is 0.1; this fixture authors 0.2).  At WE's default iterations (8)
+        // and scatter (1.619) the chain keeps all four mips and a neutral
+        // scatter: the shipped hdr_downsample.frag multiplies by
         // g_BloomScatter at every upsample level, so feeding the authored
         // value through compounds geometrically over the chain and blew up
-        // a real wallpaper's bloom in a prior attempt.  Pin what's still
-        // hard-coded so a future nudge doesn't restyle every HDR
-        // wallpaper's bloom silently.
+        // a real wallpaper's bloom in a prior attempt.  Pin the defaults so a
+        // future nudge doesn't restyle every HDR wallpaper's bloom silently.
         const auto& extract = scene->bloomConfig.nodes[0]->Mesh()->Material()->customShader;
         auto        knee    = extract.constValues.find("g_BloomBlendParams");
         REQUIRE(knee != extract.constValues.end());
@@ -2277,6 +2277,92 @@ TEST_SUITE("WPSceneParser::Parse (end-to-end)") {
         REQUIRE(scatter != upsample.constValues.end());
         REQUIRE(scatter->second.size() == 1);
         CHECK(scatter->second[0] == doctest::Approx(1.0f));
+    }
+
+    // The KDE plugin's post-processing levels: the author's iteration and
+    // scatter limits on the HDR chain, and Off.
+    TEST_CASE("E2E: bloomhdriterations caps the HDR chain and a lower scatter weakens it") {
+        ensureGlslangInit();
+        auto vfs = makeAssetsVfsWith({
+            { "/shaders/hdr_downsample.vert", kTrivialVert },
+            { "/shaders/hdr_downsample.frag", kTrivialFrag },
+            { "/shaders/combine_hdr.vert", kTrivialVert },
+            { "/shaders/combine_hdr.frag", kTrivialFrag },
+        });
+
+        const char*         kSceneJson = R"JSON(
+{
+  "camera": { "eye": "0 0 1000", "center": "0 0 0", "up": "0 1 0" },
+  "general": { "clearcolor": "0 0 0",
+               "orthogonalprojection": { "width": 1920, "height": 1080,
+                                         "postprocessing": "ultra" },
+               "hdr": true, "bloom": true,
+               "bloomhdriterations": 2, "bloomhdrscatter": 0.8095 },
+  "objects": []
+}
+)JSON";
+        audio::SoundManager sm;
+        WPUserProperties    props {};
+        WPSceneParser       parser;
+        auto scene = parser.Parse("scene_bloom_capped_chain", kSceneJson, *vfs, sm, props);
+        REQUIRE(scene != nullptr);
+        REQUIRE(scene->bloomConfig.enabled);
+
+        // 1 extract + 1 down + 1 up + 1 compose, at 2 mip levels.
+        REQUIRE(scene->bloomConfig.nodes.size() == 4);
+        CHECK(scene->bloomConfig.outputs[0] == "_rt_Bloom_Mip1");
+        CHECK(scene->bloomConfig.outputs[1] == "_rt_Bloom_Mip2");
+        CHECK(scene->bloomConfig.outputs[2] == "_rt_Bloom_Mip1");
+        CHECK(scene->bloomConfig.outputs.back() == std::string(SpecTex_Default));
+        CHECK(scene->renderTargets.count("_rt_Bloom_Mip2") == 1);
+        CHECK(scene->renderTargets.count("_rt_Bloom_Mip3") == 0);
+
+        // Half of WE's default scatter: each upsample is weighted 0.5.
+        const auto& upsample = scene->bloomConfig.nodes[2]->Mesh()->Material()->customShader;
+        auto        scatter  = upsample.constValues.find("g_BloomScatter");
+        REQUIRE(scatter != upsample.constValues.end());
+        CHECK(scatter->second[0] == doctest::Approx(0.5f).epsilon(0.001));
+    }
+
+    TEST_CASE("E2E: a scatter above the default stays neutral, and Off builds no bloom") {
+        ensureGlslangInit();
+        auto vfs = makeAssetsVfsWith({
+            { "/shaders/hdr_downsample.vert", kTrivialVert },
+            { "/shaders/hdr_downsample.frag", kTrivialFrag },
+            { "/shaders/combine_hdr.vert", kTrivialVert },
+            { "/shaders/combine_hdr.frag", kTrivialFrag },
+        });
+
+        const char*         kSceneJson = R"JSON(
+{
+  "camera": { "eye": "0 0 1000", "center": "0 0 0", "up": "0 1 0" },
+  "general": { "clearcolor": "0 0 0",
+               "orthogonalprojection": { "width": 1920, "height": 1080,
+                                         "postprocessing": "ultra" },
+               "hdr": true, "bloom": true, "bloomhdrscatter": 4.0 },
+  "objects": []
+}
+)JSON";
+        audio::SoundManager sm;
+        WPUserProperties    props {};
+        {
+            WPSceneParser parser;
+            auto scene = parser.Parse("scene_bloom_wide_scatter", kSceneJson, *vfs, sm, props);
+            REQUIRE(scene != nullptr);
+            REQUIRE(scene->bloomConfig.nodes.size() == 8);
+            const auto& upsample = scene->bloomConfig.nodes[4]->Mesh()->Material()->customShader;
+            auto        scatter  = upsample.constValues.find("g_BloomScatter");
+            REQUIRE(scatter != upsample.constValues.end());
+            CHECK(scatter->second[0] == doctest::Approx(1.0f));
+        }
+        {
+            WPSceneParser parser;
+            parser.SetPostprocessingOverride("off");
+            auto scene = parser.Parse("scene_bloom_off", kSceneJson, *vfs, sm, props);
+            REQUIRE(scene != nullptr);
+            CHECK_FALSE(scene->bloomConfig.enabled);
+            CHECK(scene->bloomConfig.nodes.empty());
+        }
     }
 
     TEST_CASE("E2E: an exactly-zero bloomhdrfeather does not divide by zero") {

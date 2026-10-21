@@ -289,6 +289,32 @@ Flickable {
                 }
             }
             OptionItem {
+                text: i18nc("@label settings option", "Post-processing")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: ComboBox {
+                    id: cbPostProcessing
+                    model: [
+                        { text: i18nc("@item:inlistbox post-processing level", "The scene's own (default)"), value: "" },
+                        { text: i18nc("@item:inlistbox post-processing level", "Off"),                       value: "off" },
+                        { text: i18nc("@item:inlistbox post-processing level", "Low"),                       value: "low" },
+                        { text: i18nc("@item:inlistbox post-processing level", "Medium"),                    value: "medium" },
+                        { text: i18nc("@item:inlistbox post-processing level", "Ultra (HDR bloom)"),         value: "ultra" },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_PostProcessing = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_PostProcessing))
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info post-processing help text", "Bloom for scene wallpapers that have none set of their own (a wallpaper's own setting in the Wallpapers tab wins). Off draws no bloom; Low and Medium the standard bloom; Ultra the HDR bloom on scenes made for it (experimental, can look darker). Changing it reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
                 text: i18nc("@label settings option", "Render resolution")
                 text_color: Kirigami.Theme.textColor
                 icon: '../../images/window.svg'

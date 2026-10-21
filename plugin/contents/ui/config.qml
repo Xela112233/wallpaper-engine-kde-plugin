@@ -93,6 +93,9 @@ ColumnLayout {
     // SettingPage's own scope to this root, so declaring them here (with no
     // page-local shadow, matching cfg_PauseMode's shape) is enough.
     property int    cfg_RenderScale
+    // The screen's post-processing level (SettingPage's combo box writes it
+    // unqualified, like cfg_RenderScale).
+    property string cfg_PostProcessing
     property int    cfg_MsaaMode
 
     property int    cfg_PerOptChanged: 0

@@ -318,6 +318,27 @@ QtObject {
     }
 
 
+    // The post-processing level a value stands for: a wallpaper's
+    // `postprocessing` (a level, or the old on/off switch: true is "ultra")
+    // or the screen's PostProcessing.  null for anything else, which counts
+    // as not set: the old switch's false too, which the plugin always drew
+    // like no value at all, so such a wallpaper follows the screen's level.
+    readonly property var postProcessingLevels: ["", "off", "low", "medium", "ultra"]
+    function postProcessingLevel(v) {
+        if (v === true) return "ultra";
+        return (typeof v === "string" && postProcessingLevels.indexOf(v) >= 0) ? v : null;
+    }
+    // What the Wallpapers tab's row for per-wallpaper option `key` starts on
+    // for its saved value; null for none (the row's default, the screen's
+    // setting).  Post-processing shows the level a value stands for, as
+    // main.qml reads it: the old switch's true is Ultra, its false or a
+    // value main.qml does not know is not set.
+    function shownOptionValue(key, saved) {
+        if (key === "postprocessing" && saved !== null && saved !== undefined)
+            return postProcessingLevel(saved);
+        return saved === undefined ? null : saved;
+    }
+
     function cbCurrentValue(combo) {
         return combo.model[combo.currentIndex].value;
     }

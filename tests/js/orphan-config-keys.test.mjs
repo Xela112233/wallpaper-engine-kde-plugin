@@ -16,12 +16,10 @@ const uiDir = join(repoRoot, 'plugin', 'contents', 'ui');
 
 // Keys with no cfg_/configuration. reader today, on purpose. Extend this list only for a
 // documented, deliberate case -- never to silence a real orphan.
-//   PostProcessing: replaced by a per-wallpaper option (main.qml reads `postProcessing` via
-//   get_opt_value('postprocessing', ...), never wallpaper.configuration.PostProcessing); the
-//   kcfg entry stays dormant so existing configs don't churn on migration. A key read only
-//   from C++ (this scan only looks at plugin/contents/ui/**/*.qml) would be a second
-//   legitimate category here -- there is no such key today.
-const ALLOWLIST = new Set(['PostProcessing']);
+//   A key read only from C++ (this scan only looks at plugin/contents/ui/**/*.qml) would be a
+//   legitimate category here -- there is no such key today.  (PostProcessing used to be
+//   listed: main.qml now reads it as the screen's post-processing level.)
+const ALLOWLIST = new Set([]);
 
 function mainXmlKeys() {
     const text = readFileSync(mainXmlPath, 'utf8');
@@ -42,6 +40,10 @@ function walkQmlFiles(dir) {
     }
     return out;
 }
+
+// PostProcessingLevels: a marker, never read.  It tells tools (we-manager reads main.xml)
+// that in this build PostProcessing and each wallpaper's postprocessing take levels.
+ALLOWLIST.add('PostProcessingLevels');
 
 function readerText() {
     return walkQmlFiles(uiDir)

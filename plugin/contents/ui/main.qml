@@ -50,7 +50,14 @@ Rectangle {
     // target size is fixed when the backend item is built, hence the reload
     // below rather than a live binding.
     property real   renderScale: wallpaper.configuration.RenderScale / 100.0
-    property string postProcessing: get_opt_value('postprocessing', false) ? "ultra" : ""
+    // The post-processing level the scene renderer gets: the wallpaper's own
+    // `postprocessing` ("off", "low", "medium", "ultra", or "" for the scene's
+    // own setting; true from older files is "ultra", false is not set),
+    // else the screen's PostProcessing.  "" leaves the scene's own setting.
+    property string postProcessing: {
+        const own = Common.postProcessingLevel(get_opt_value('postprocessing', null));
+        return own !== null ? own : (Common.postProcessingLevel(wallpaper.configuration.PostProcessing) || "");
+    }
     property bool   systemAudioCapture: wallpaper.configuration.SystemAudioCapture
 
     // Honour the desktop's "Reduce animations" accessibility pref. The

@@ -5393,8 +5393,17 @@ void buildBloomAndReflection(ParseContext& context, const wpscene::WPScene& sc,
     const float scene_bloom_threshold =
         effective_hdr ? sc.general.bloomhdrthreshold : sc.general.bloomthreshold;
 
+    // The post-processing level in effect: the plugin's override, else the
+    // scene's own.  "off" (the KDE plugin's Post-processing Off) builds no
+    // bloom at all; the other levels pick a chain below.
+    const std::string& pp = context.postprocessing_override.empty()
+                                ? sc.general.orthogonalprojection.postprocessing
+                                : context.postprocessing_override;
+    if (sc.general.bloom && pp == "off")
+        LOG_INFO("Bloom off: the postprocessing override is 'off'");
+
     // Create bloom post-processing passes if enabled
-    if (sc.general.bloom) {
+    if (sc.general.bloom && pp != "off") {
         // WE chooses between the legacy LDR bloom path and the modern HDR
         // mip-chain pipeline based on the scene's `postprocessing` enum AND
         // the scene-level `hdr` boolean.  Per asset+binary inspection:
@@ -5409,11 +5418,9 @@ void buildBloomAndReflection(ParseContext& context, const wpscene::WPScene& sc,
         // The HDR branches additionally require `hdr: true` at scene level;
         // without it the LDR path is forced regardless of postprocessing.
         // Plugin-level override (sceneviewer --postprocessing / KDE setting page)
-        // takes precedence over the scene.json value.  Lets users force the HDR
-        // mip-chain on wallpapers that declare hdr+bloom but omit the field.
-        const std::string& pp       = context.postprocessing_override.empty()
-                                          ? sc.general.orthogonalprojection.postprocessing
-                                          : context.postprocessing_override;
+        // takes precedence over the scene.json value (`pp` above).  Lets users
+        // force the HDR mip-chain on wallpapers that declare hdr+bloom but omit
+        // the field.
         const bool use_hdr_pipeline = sc.general.hdr && (pp == "ultra" || pp == "displayhdr");
 
         LOG_INFO("Bloom enabled: strength=%.2f threshold=%.2f (scene_hdr=%d effective_hdr=%d "
@@ -5431,26 +5438,42 @@ void buildBloomAndReflection(ParseContext& context, const wpscene::WPScene& sc,
         const auto fullH = static_cast<float>(context.ortho_h);
 
         if (use_hdr_pipeline) {
-            // 5-level mip chain.  Mip 0 (= scene RT copy) at full res; each next
-            // level is halved.  hdr_downsample.frag handles all DS/US/extract
-            // variants via combos (BLOOM=1 bright-pass, UPSAMPLE=1 scatter-add,
-            // BICUBIC=1 cubic interp).  See WE assets/shaders/hdr_downsample.frag.
+            // Up to a 5-level mip chain.  Mip 0 (= scene RT copy) at full res;
+            // each next level is halved.  hdr_downsample.frag handles all
+            // DS/US/extract variants via combos (BLOOM=1 bright-pass, UPSAMPLE=1
+            // scatter-add, BICUBIC=1 cubic interp).  See WE
+            // assets/shaders/hdr_downsample.frag.
+            //
+            // The author's bloomhdriterations caps the depth (how far the bloom
+            // spreads): WE's default, 8, is deeper than the four mips built
+            // here, so only a lower value changes anything.  bloomhdrscatter
+            // below WE's default (1.619) weakens every upsample, and a value at
+            // or above it stays neutral: an unbounded per-level multiply
+            // compounds over the chain and blew up a real wallpaper's bloom.
+            constexpr int   kMaxBloomMips     = 4;
+            constexpr float kWeDefaultScatter = 1.619f;
+            const int       mips = std::clamp(sc.general.bloomhdriterations, 1, kMaxBloomMips);
+            const float     scatterRatio    = sc.general.bloomhdrscatter / kWeDefaultScatter;
+            const float     upsampleScatter =
+                (scatterRatio >= 0.0f && scatterRatio < 1.0f) ? scatterRatio : 1.0f;
             scene.renderTargets[std::string(WE_BLOOM_SCENE)] = {
                 .width  = context.ortho_w,
                 .height = context.ortho_h,
                 .bind   = { .enable = true, .screen = true },
             };
-            const std::array<std::pair<std::string_view, float>, 4> mip_specs { {
+            // Index n is mip n; mip 0 is the full-resolution scene copy.
+            const std::array<std::pair<std::string_view, float>, kMaxBloomMips + 1> mip_specs { {
+                { WE_BLOOM_SCENE, 1.0f },
                 { WE_BLOOM_MIP1, 0.5f },
                 { WE_BLOOM_MIP2, 0.25f },
                 { WE_BLOOM_MIP3, 0.125f },
                 { WE_BLOOM_MIP4, 0.0625f },
             } };
-            for (auto& [name, scale] : mip_specs) {
-                scene.renderTargets[std::string(name)] = {
+            for (int n = 1; n <= mips; ++n) {
+                scene.renderTargets[std::string(mip_specs[n].first)] = {
                     .width  = 2,
                     .height = 2,
-                    .bind   = { .enable = true, .screen = true, .scale = scale },
+                    .bind   = { .enable = true, .screen = true, .scale = mip_specs[n].second },
                 };
             }
 
@@ -5472,34 +5495,44 @@ void buildBloomAndReflection(ParseContext& context, const wpscene::WPScene& sc,
                 std::string              output;    // destination RT
                 float                    src_scale; // source mip scale (for offset calc)
             };
-            const std::array<BloomPassDef, 8> bloomPasses { {
-                // Bright-pass extract: source is mip0 at full res
-                { Stage::Extract,
-                  { std::string(WE_BLOOM_SCENE) },
-                  std::string(WE_BLOOM_MIP1),
-                  1.0f },
-                // Cascade downsample
-                { Stage::Down, { std::string(WE_BLOOM_MIP1) }, std::string(WE_BLOOM_MIP2), 0.5f },
-                { Stage::Down, { std::string(WE_BLOOM_MIP2) }, std::string(WE_BLOOM_MIP3), 0.25f },
-                { Stage::Down, { std::string(WE_BLOOM_MIP3) }, std::string(WE_BLOOM_MIP4), 0.125f },
-                // Cascade upsample (additive — accumulates into the next-larger mip
-                // which already holds its downsampled-from-above content).
-                { Stage::Up, { std::string(WE_BLOOM_MIP4) }, std::string(WE_BLOOM_MIP3), 0.0625f },
-                { Stage::Up, { std::string(WE_BLOOM_MIP3) }, std::string(WE_BLOOM_MIP2), 0.125f },
-                { Stage::Up, { std::string(WE_BLOOM_MIP2) }, std::string(WE_BLOOM_MIP1), 0.25f },
-                // Final compose: combine_hdr LINEAR=1 path outputs the scene plus
-                // the 4-tap upsampled bloom, clamped and otherwise untouched.
-                // FinPass owns the single sRGB encode (see its srgb_encode note:
-                // render targets hold linear data and the compositor expects
-                // display-encoded).  The LINEAR=0 branch would sRGB-DECODE the
-                // scene first, which is right only if the RT held display-encoded
-                // values — it does not, so that decode was unpaired and darkened
-                // the composed frame by a full gamma.
-                { Stage::Compose,
-                  { std::string(WE_BLOOM_SCENE), std::string(WE_BLOOM_MIP1) },
-                  std::string(SpecTex_Default),
-                  0.5f },
-            } };
+            std::vector<BloomPassDef> bloomPasses;
+            // Bright-pass extract: source is mip0 at full res
+            bloomPasses.push_back({ Stage::Extract,
+                                    { std::string(WE_BLOOM_SCENE) },
+                                    std::string(WE_BLOOM_MIP1),
+                                    1.0f });
+            // Cascade downsample, mip n -> mip n+1 (src_scale: mip n's)
+            for (int n = 1; n < mips; ++n)
+                bloomPasses.push_back({ Stage::Down,
+                                        { std::string(mip_specs[n].first) },
+                                        std::string(mip_specs[n + 1].first),
+                                        mip_specs[n].second });
+            // Cascade upsample, mip n -> mip n-1 (additive — accumulates into
+            // the next-larger mip which already holds its downsampled-from-above
+            // content).
+            for (int n = mips; n > 1; --n)
+                bloomPasses.push_back({ Stage::Up,
+                                        { std::string(mip_specs[n].first) },
+                                        std::string(mip_specs[n - 1].first),
+                                        mip_specs[n].second });
+            // Final compose: combine_hdr LINEAR=1 path outputs the scene plus
+            // the 4-tap upsampled bloom, clamped and otherwise untouched.
+            // FinPass owns the single sRGB encode (see its srgb_encode note:
+            // render targets hold linear data and the compositor expects
+            // display-encoded).  The LINEAR=0 branch would sRGB-DECODE the
+            // scene first, which is right only if the RT held display-encoded
+            // values — it does not, so that decode was unpaired and darkened
+            // the composed frame by a full gamma.
+            bloomPasses.push_back({ Stage::Compose,
+                                    { std::string(WE_BLOOM_SCENE), std::string(WE_BLOOM_MIP1) },
+                                    std::string(SpecTex_Default),
+                                    0.5f });
+            LOG_INFO("bloom: %d mip level(s) (bloomhdriterations=%d), upsample scatter %.3f "
+                     "(bloomhdrscatter=%.3f)",
+                     mips,
+                     (int)sc.general.bloomhdriterations,
+                     upsampleScatter,
+                     sc.general.bloomhdrscatter);
 
             scene.bloomConfig.enabled   = true;
             scene.bloomConfig.strength  = scene_bloom_strength;
@@ -5626,9 +5659,10 @@ void buildBloomAndReflection(ParseContext& context, const wpscene::WPScene& sc,
                     }
                     if (def.stage == Stage::Up) {
                         // UPSAMPLE=1 branch reads g_BloomScatter (multiplies the
-                        // 4-tap average).  1.0 = neutral pass-through scatter.
+                        // 4-tap average).  1.0 = neutral pass-through scatter;
+                        // below it, the author's lower bloomhdrscatter.
                         material.customShader.constValues["g_BloomScatter"] =
-                            std::vector<float> { 1.0f };
+                            std::vector<float> { upsampleScatter };
                     }
                 }
 

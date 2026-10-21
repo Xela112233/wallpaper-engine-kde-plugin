@@ -82,7 +82,8 @@ uint32_t volumetric_quality_from_pp_tier(std::string_view pp) {
     // march.  Unknown / empty defaults to the medium tier so a misconfigured
     // wallpaper still renders volumetrics instead of failing closed.
     if (pp == "ultra" || pp == "displayhdr") return 4u;
-    if (pp == "low") return 1u;
+    // "off" is the KDE plugin's Post-processing Off: no bloom, cheapest march.
+    if (pp == "low" || pp == "off") return 1u;
     return 2u;
 }
 

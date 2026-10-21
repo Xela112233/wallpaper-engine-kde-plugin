@@ -994,16 +994,26 @@ RowLayout {
                                     dStepSize: 0.1,
                                 },
                             },
-                            // ON → "ultra" (HDR mip-chain bloom), OFF → scene
-                            // default. Experimental: Ultra can look too dark on
-                            // some scenes (audit open); opt-in per wallpaper.
+                            // A level for this wallpaper ("" the scene's own,
+                            // "off", "low", "medium", "ultra" = HDR mip-chain
+                            // bloom, experimental: can look too dark).  Older
+                            // files hold true ("ultra") or false (not set);
+                            // main.qml reads both.  Without a value the
+                            // screen's Post-processing applies.
                             {
                                 scene_only: true,
-                                text: i18nc("@label per-wallpaper postprocessing option", "Postprocessing (Ultra, experimental)"),
+                                text: i18nc("@label per-wallpaper postprocessing option", "Post-processing"),
                                 config_key: 'postprocessing',
-                                comp: right_opt_switch,
+                                comp: right_opt_combox,
                                 props: {
-                                    def_val: false,
+                                    model: [
+                                        { text: i18nc("@item:inlistbox post-processing level", "The scene's own"), value: "" },
+                                        { text: i18nc("@item:inlistbox post-processing level", "Off"),             value: "off" },
+                                        { text: i18nc("@item:inlistbox post-processing level", "Low"),             value: "low" },
+                                        { text: i18nc("@item:inlistbox post-processing level", "Medium"),          value: "medium" },
+                                        { text: i18nc("@item:inlistbox post-processing level", "Ultra (experimental)"), value: "ultra" },
+                                    ],
+                                    def_val: Common.postProcessingLevel(cfg_PostProcessing) || "",
                                 },
                             },
 
@@ -1023,7 +1033,10 @@ RowLayout {
                                     Object.entries(modelData.props).forEach(([key, value]) => {
                                         this.item[key] = value;
                                     });
-                                    const changed_val = right_opts.get_config_val(modelData.config_key);
+                                    // A saved post-processing value as the
+                                    // level it stands for (Common).
+                                    const changed_val = Common.shownOptionValue(modelData.config_key,
+                                        right_opts.get_config_val(modelData.config_key));
                                     if(changed_val !== null) {
                                         this.item['def_val'] = changed_val;
                                     }
