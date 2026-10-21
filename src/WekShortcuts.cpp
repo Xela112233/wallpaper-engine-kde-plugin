@@ -7,7 +7,14 @@
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusPendingCall>
+#include <QDebug>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QString>
+
+#ifdef WEK_HAS_KIO
+#    include <KIO/CommandLauncherJob>
+#endif
 
 namespace wekde
 {
@@ -29,6 +36,39 @@ void invokeDBusMethod(const QString& method) {
                                        QStringLiteral("com.github.captsilver.WallpaperEngine"),
                                        method);
     QDBusConnection::sessionBus().asyncCall(msg);
+}
+
+// The wallpaper library is we-manager's window when we-manager is installed
+// (we-manager patch). Starting we-manager-gui raises the window already
+// running: a second launch asks the first to show itself and hands it its
+// XDG activation token, which KIO::CommandLauncherJob gets from KWin, so the
+// window may take the focus on Wayland. Without KIO at build time it is
+// started with QProcess and no token (KWin may then only flash its task bar
+// entry). Without we-manager, the hint as before: no clean Plasma 6 API opens
+// the containment-owned configuration dialog.
+void openWallpaperLibrary() {
+    const QString exe = QStandardPaths::findExecutable(QStringLiteral("we-manager-gui"));
+    if (exe.isEmpty()) {
+        qInfo("wek-shortcuts: 'Open Library' shortcut triggered; user "
+              "should right-click desktop -> Configure Desktop and "
+              "Wallpaper... (we-manager-gui is not on PATH)");
+        return;
+    }
+#ifdef WEK_HAS_KIO
+    auto* job = new KIO::CommandLauncherJob(exe, QStringList {});
+    // we-manager's desktop file, without .desktop: the activation token and
+    // the startup notification are for that application.
+    job->setDesktopName(QStringLiteral("io.github.wemanager"));
+    QObject::connect(job, &KJob::result, job, [exe](KJob* j) {
+        if (j->error())
+            qWarning().noquote() << "wek-shortcuts: KIO::CommandLauncherJob(" + exe
+                                        + ") failed:" << j->errorString();
+    });
+    job->start();
+#else
+    if (! QProcess::startDetached(exe, QStringList {}))
+        qWarning().noquote() << "wek-shortcuts: QProcess::startDetached(" + exe + ") failed";
+#endif
 }
 
 } // namespace
@@ -74,19 +114,15 @@ WekShortcuts::WekShortcuts(QObject* parent)
                    i18nc("@action shortcut label", "Reload current wallpaper"),
                    QStringLiteral("Reload"));
 
-    // open_library opens the config dialog.  No clean Plasma 6 API exists to
-    // programmatically open a containment-owned dialog, so this one logs a
-    // hint rather than D-Bus dispatch.  Revisit when Plasma 6.x adds an
-    // openWallpaperConfig signal.
+    // open_library opens we-manager (openWallpaperLibrary above), or, without
+    // it, logs a hint rather than D-Bus dispatch: no clean Plasma 6 API exists
+    // to programmatically open a containment-owned dialog.  Revisit when
+    // Plasma 6.x adds an openWallpaperConfig signal.
     auto* openLib = m_actions->addAction(QStringLiteral("open_library"));
     openLib->setText(
         i18nc("@action shortcut label", "Open wallpaper library (configuration dialog)"));
     KGlobalAccel::self()->setGlobalShortcut(openLib, QList<QKeySequence> {});
-    QObject::connect(openLib, &QAction::triggered, this, []() {
-        qInfo("wek-shortcuts: 'Open Library' shortcut triggered; user "
-              "should right-click desktop -> Configure Desktop and "
-              "Wallpaper...");
-    });
+    QObject::connect(openLib, &QAction::triggered, this, []() { openWallpaperLibrary(); });
 }
 
 } // namespace wekde

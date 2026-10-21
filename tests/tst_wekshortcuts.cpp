@@ -16,10 +16,13 @@
 #include <KLocalizedString>
 #include <QAction>
 #include <QDBusConnection>
+#include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QHash>
+#include <QRegularExpression>
 #include <QSignalSpy>
+#include <QTemporaryDir>
 #include <QtTest/QtTest>
 
 using namespace wekde;
@@ -35,6 +38,7 @@ private slots:
     void dispatchTable_matchesExpectedDBusMembers();
     void triggerNext_firesTriggeredSignal();
     void openLibrary_triggerDoesNotCrash();
+    void openLibrary_startsWeManagerGui();
     void allActions_haveDistinctIds();
     void wrappedLabels_respectTranslationDomain();
 };
@@ -136,14 +140,41 @@ void TestWekShortcuts::triggerNext_firesTriggeredSignal() {
 }
 
 void TestWekShortcuts::openLibrary_triggerDoesNotCrash() {
-    // open_library is the exceptional action -- logs instead of dispatching.
-    // No assertion possible without a log spy; smoke-test the trigger.
+    // open_library is the exceptional action -- without we-manager-gui on
+    // PATH it logs the hint instead of dispatching. An empty PATH directory
+    // keeps a we-manager installed on this machine from starting.
+    QTemporaryDir empty;
+    QVERIFY(empty.isValid());
+    const QByteArray path = qgetenv("PATH");
+    qputenv("PATH", QFile::encodeName(empty.path()));
     WekShortcuts shortcuts;
     auto*        coll   = shortcuts.collectionForTest();
     auto*        action = coll->action(QStringLiteral("open_library"));
     QVERIFY(action);
+    QTest::ignoreMessage(QtInfoMsg, QRegularExpression("'Open Library' shortcut triggered.*not on PATH"));
     action->trigger();
-    QVERIFY(true); // no crash
+    qputenv("PATH", path);
+}
+
+// we-manager installed: the action starts its we-manager-gui (here a script
+// that leaves a marker), which raises the running window.
+void TestWekShortcuts::openLibrary_startsWeManagerGui() {
+    QTemporaryDir bin;
+    QVERIFY(bin.isValid());
+    const QString marker = bin.filePath(QStringLiteral("started"));
+    QFile         script(bin.filePath(QStringLiteral("we-manager-gui")));
+    QVERIFY(script.open(QIODevice::WriteOnly));
+    script.write(QByteArray("#!/bin/sh\necho \"$@\" > '") + QFile::encodeName(marker) + "'\n");
+    script.close();
+    script.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    const QByteArray path = qgetenv("PATH");
+    qputenv("PATH", QFile::encodeName(bin.path()) + ":/usr/bin:/bin");
+    WekShortcuts shortcuts;
+    auto*        action = shortcuts.collectionForTest()->action(QStringLiteral("open_library"));
+    QVERIFY(action);
+    action->trigger();
+    QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(marker), 10000);
+    qputenv("PATH", path);
 }
 
 void TestWekShortcuts::allActions_haveDistinctIds() {

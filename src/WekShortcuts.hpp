@@ -26,6 +26,8 @@ namespace wekde
 // Action ids (visible in ~/.config/kglobalshortcutsrc):
 //   next_wallpaper, previous_wallpaper, toggle_pause,
 //   toggle_mute, reload_wallpaper, open_library
+// open_library starts we-manager-gui when it is on PATH (we-manager patch),
+// else logs where the configuration dialog is.
 class WekShortcuts : public QObject {
     Q_OBJECT
 public:

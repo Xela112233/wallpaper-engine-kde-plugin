@@ -806,6 +806,12 @@ msgstr \"MARKER-TRANSLATED-NEXT\"
     target_compile_definitions(tst_wekshortcuts PRIVATE
         WEK_TEST_I18N_LOCALE_DIR="${_i18n_fixture_dir}"
         TRANSLATION_DOMAIN="${WEK_TRANSLATION_DOMAIN}")
+    # The same launcher the plugin .so gets (src/CMakeLists.txt).
+    find_package(KF6KIO QUIET)
+    if(TARGET KF6::KIOGui)
+        target_link_libraries(tst_wekshortcuts PRIVATE KF6::KIOGui)
+        target_compile_definitions(tst_wekshortcuts PRIVATE WEK_HAS_KIO)
+    endif()
     if(COVERAGE)
         target_compile_options(tst_wekshortcuts PRIVATE ${_cov_compile_flags})
         target_link_options(tst_wekshortcuts PRIVATE ${_cov_link_flags})

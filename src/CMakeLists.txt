@@ -85,6 +85,18 @@ if(TARGET KF6::GlobalAccel AND TARGET KF6::CoreAddons AND TARGET KF6::XmlGui)
         KF6::XmlGui)
     target_compile_definitions(${PROJECT_NAME} PRIVATE WEKDE_HAS_GLOBALACCEL)
     message(STATUS "Global shortcuts (WekShortcuts): enabled (GlobalAccel + CoreAddons + XmlGui)")
+    # we-manager: "Open wallpaper library" starts we-manager-gui through
+    # KIO::CommandLauncherJob, which gets it an XDG activation token so its
+    # window may take the focus. Optional: without kf6-kio-devel it is
+    # started with QProcess, without a token.
+    find_package(KF6KIO QUIET)
+    if(TARGET KF6::KIOGui)
+        target_link_libraries(${PROJECT_NAME} PRIVATE KF6::KIOGui)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE WEK_HAS_KIO)
+        message(STATUS "Open wallpaper library shortcut: KIO::CommandLauncherJob (with an activation token)")
+    else()
+        message(STATUS "Open wallpaper library shortcut: QProcess (no activation token; kf6-kio-devel not found)")
+    endif()
 else()
     message(STATUS "Global shortcuts (WekShortcuts): disabled (GlobalAccel/CoreAddons/XmlGui not found)")
 endif()
