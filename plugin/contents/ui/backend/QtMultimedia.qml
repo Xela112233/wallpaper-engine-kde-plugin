@@ -14,11 +14,12 @@ Item{
     // announcement, a pause/resume cycle does not.
     property bool announcedFirstFrame: false
     onSourceChanged: announcedFirstFrame = false
-    property var volumeFade: Common.createVolumeFade(
-        videoItem, 
-        Qt.binding(function() { return background.mute ? 0 : background.volume; }),
-        (volume) => { audioOut.volume = volume / 100.0; }
-    )
+    // A mute fades out before the output is muted, and a pause before the
+    // player pauses (we-manager mute patch: Common.createVolumeFade).
+    // Made in Component.onCompleted, not in a binding here: the fade reads its
+    // own properties as it starts, and inside a binding that would make it
+    // again at every change of the mute.
+    property var volumeFade: null
 
     onDisplayModeChanged: {
         if(displayMode == Common.DisplayMode.Scale)
@@ -51,14 +52,17 @@ Item{
     AudioOutput {
         id: audioOut
         volume: 0.0
-        muted: background.mute
+        muted: videoItem.volumeFade ? videoItem.volumeFade.state.hardMuted : background.mute
     }
     MediaPlayer {
         id: player
         loops: MediaPlayer.Infinite
         playbackRate: background.speed
         videoOutput: videoView
-        audioOutput: audioOut
+        // Audio output off (we-manager mute patch): no output at all, so the
+        // player keeps no audio stream open (a muted AudioOutput keeps its
+        // sink, at volume 0); it comes back when the switch is on again.
+        audioOutput: background.audioOutput !== false ? audioOut : null
     }
     // Surface load errors to InfoShow so users see a real reason instead
     // of a black screen. Use a Connections block — assigning
@@ -91,24 +95,25 @@ Item{
     }
     Component.onCompleted:{
         background.nowBackend = "QtMultimedia";
+        videoItem.volumeFade = Common.createVolumeFade(
+            videoItem,
+            Qt.binding(function() { return background.volume; }),
+            (volume) => { audioOut.volume = volume / 100.0; },
+            Qt.binding(function() { return background.mute; }));
         videoItem.displayModeChanged();
     }
 
     function play(){
-        pauseTimer.stop();
+        // A play during a pause's fade-out cancels the pause.
         player.play();
-        volumeFade.start();
+        if (volumeFade) volumeFade.start();
     }
-    function pause(){
-        volumeFade.stop();
-        pauseTimer.start();
-    }
-    Timer{
-        id: pauseTimer
-        running: false
-        repeat: false
-        interval: 300
-        onTriggered: {
+    // The sound fades out (Common.fadeOutMs), then the player pauses;
+    // pause(true) cuts at once (before a sleep).
+    function pause(now){
+        if (volumeFade && !now) volumeFade.fadeOut(() => player.pause());
+        else {
+            if (volumeFade) volumeFade.stop();
             player.pause();
         }
     }
@@ -119,7 +124,7 @@ Item{
         displayMode = displayMode;
         player.playbackRate = player.playbackRate;
         audioOut.muted = audioOut.muted;
-        volumeFade.freeze();
+        if (volumeFade) volumeFade.freeze();
     }
     function getMouseTarget() {
     }

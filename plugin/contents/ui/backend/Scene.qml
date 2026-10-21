@@ -13,11 +13,12 @@ Item{
     property string assets: "assets"
     property int displayMode: background.displayMode
     property string userPropsJson: background.userPropsJson
-    property var volumeFade: Common.createVolumeFade(
-        sceneItem, 
-        Qt.binding(function() { return background.mute ? 0 : background.volume; }),
-        (volume) => { player.volume = volume / 100.0; }
-    )
+    // A mute fades out before the scene's sound is muted, and a pause before
+    // the renderer pauses (we-manager mute patch: Common.createVolumeFade).
+    // Made in Component.onCompleted, not in a binding here: the fade reads its
+    // own properties as it starts, and inside a binding that would make it
+    // again at every change of the mute.
+    property var volumeFade: null
     // Both drive the load watchdog below.
     property bool _paused: false
     property bool _firstFrameSeen: false
@@ -117,7 +118,7 @@ Item{
         // SceneWallpaper.  The refresh feeds frame pacing; the policy only
         // matters on surface builds (standalone viewer).
         presentMode: background.presentMode
-        muted: background.mute
+        muted: sceneItem.volumeFade ? sceneItem.volumeFade.state.hardMuted : background.mute
         speed: background.speed
         assets: sceneItem.assets
         userProperties: sceneItem.userPropsJson
@@ -148,6 +149,10 @@ Item{
             // already uses it.
             Common.setIfSupported(player, "SceneViewer", "sceneQuality",
                                   Qt.binding(function() { return { textures: background.textureQuality }; }));
+            // Audio output (mute patch, AudioOutput): off, the scene opens no
+            // sound device at all.
+            Common.setIfSupported(player, "SceneViewer", "audioOutput",
+                                  Qt.binding(function() { return background.audioOutput !== false; }));
         }
 
         Connections {
@@ -288,19 +293,29 @@ Item{
 
     Component.onCompleted: {
         background.nowBackend = 'scene';
+        sceneItem.volumeFade = Common.createVolumeFade(
+            sceneItem,
+            Qt.binding(function() { return background.volume; }),
+            (volume) => { player.volume = volume / 100.0; },
+            Qt.binding(function() { return background.mute; }));
     }
     function play() {
         _paused = false;
         // Give the renderer a fresh window to draw in: the load budget should
         // start when rendering actually resumes, not when the item was built.
         if (! _firstFrameSeen) loadWatchdog.restart();
-        volumeFade.start();
+        if (volumeFade) volumeFade.start();
         player.play();
     }
-    function pause() {
+    // The sound fades out (Common.fadeOutMs), then the renderer pauses; a
+    // play() before that cancels it.  pause(true) cuts at once (before a sleep).
+    function pause(now) {
         _paused = true;
-        volumeFade.stop();
-        player.pause();
+        if (volumeFade && !now) volumeFade.fadeOut(() => player.pause());
+        else {
+            if (volumeFade) volumeFade.stop();
+            player.pause();
+        }
     }
     
     // main.qml calls this when the backend becomes the outgoing layer of a
@@ -315,8 +330,9 @@ Item{
         player.pixelArt = player.pixelArt;
         if ("sceneQuality" in player) player.sceneQuality = player.sceneQuality;
         if ("videoHwdec" in player) player.videoHwdec = player.videoHwdec;
+        if ("audioOutput" in player) player.audioOutput = player.audioOutput;
         player.muted = player.muted;
-        volumeFade.freeze();
+        if (volumeFade) volumeFade.freeze();
     }
     function getMouseTarget() {
         return Qt.binding(function() { return player; })

@@ -115,10 +115,28 @@ public slots:
     Q_NOREPLY void Resume();
     Q_NOREPLY void Toggle();
 
-    // Audio
+    // Audio.  Mute, Unmute and ToggleMute write MuteAudio (saved).
     Q_NOREPLY void Mute();
     Q_NOREPLY void Unmute();
     Q_NOREPLY void ToggleMute();
+    // Unsaved mutes (we-manager mute patch), on every screen, over each
+    // wallpaper's own sound setting; a plasmashell restart clears them.  The
+    // process keeps one value of each (a screen that comes later starts with
+    // it).  SetGlobalMute: the tray's Mute; ToggleGlobalMute: the mute
+    // shortcut, the opposite of that one value on every screen.
+    Q_NOREPLY void SetGlobalMute(bool on);
+    Q_NOREPLY void ToggleGlobalMute();
+    // A watcher's mute (wave 4's mute while other applications play): held
+    // for `seconds` (at most a day; one expiry for the process) unless set
+    // again.  false ends it; a mute needs seconds >= 1, so (true, 0) and a
+    // negative lease are refused with a warning and change nothing.
+    Q_NOREPLY void SetAutoMuted(bool on, int seconds);
+    // The process's unsaved mutes and every screen's mute, as JSON:
+    // {"globalMute", "autoMuted", "autoMuteSeconds" (what is left of the
+    // lease, 0 without one), "screens":
+    // [{"screen", "muted", "audioOutput", "reasons": ["output off",
+    // "global", "auto", "window", "wallpaper", "setting"]}]}.
+    QString MuteStatus() const;
 
     // Activation
     Q_NOREPLY void ActivatePlaylist(const QString& id);

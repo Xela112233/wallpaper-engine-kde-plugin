@@ -51,6 +51,7 @@ Flickable {
     property alias cfg_ScreenSaverPolicy: cbScreenSaverPolicy.currentIndex
     property alias cfg_HdrOutput: ckbox_hdrOutput.checked
     property alias cfg_SystemAudioCapture: ckbox_systemAudioCapture.checked
+    property alias cfg_AudioOutput: ckbox_audioOutput.checked
     property alias cfg_MediaIntegration: ckbox_mediaIntegration.checked
     // Color drawn behind the wallpaper. Visible as letterbox/pillarbox
     // bars when display mode is "Keep Aspect Ratio" and the wallpaper
@@ -723,6 +724,26 @@ Flickable {
                     Text {
                         Layout.fillWidth: true
                         text: i18nc("@info system audio capture help text", "When enabled, audio-reactive wallpapers respond to all system audio (music, videos, games). When disabled, only the wallpaper's own background music is used.")
+                        color: Kirigami.Theme.disabledTextColor
+                        wrapMode: Text.WordWrap
+                        font.italic: true
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    }
+                }
+            }
+
+            // we-manager mute patch: Wallpaper Engine's Audio output.
+            OptionItem {
+                text: i18nc("@label settings option", "Audio output")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/volume-up.svg'
+                actor: Switch {
+                    id: ckbox_audioOutput
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        text: i18nc("@info audio output help text", "Off: wallpapers open no audio stream at all, whatever their own sound settings say, and scenes close their sound device. Audio-reactive wallpapers still follow the system audio capture.")
                         color: Kirigami.Theme.disabledTextColor
                         wrapMode: Text.WordWrap
                         font.italic: true

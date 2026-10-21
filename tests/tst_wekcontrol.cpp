@@ -41,7 +41,13 @@ using namespace wekde;
 // public-export layer).
 class PlaylistControllerStub : public QObject {
     Q_OBJECT
+    // The unsaved mutes (we-manager mute patch), as PlaylistController has them.
+    Q_PROPERTY(bool globalMute MEMBER globalMute)
+    Q_PROPERTY(bool autoMuted MEMBER autoMuted)
 public:
+    bool    globalMute { false };
+    bool    autoMuted { false };
+    QString muteJson;
     QString     lastMethod;
     QString     lastArg;
     QList<bool> stops; // remoteStop calls, in order
@@ -98,6 +104,18 @@ public slots:
     }
     // What PlaylistController.stopReasons answers: JSON text.
     QVariant stopReasons() const { return reasonsJson; }
+    // The mute patch's setGlobalMute(on), setAutoMuted(on), muteStatus().
+    void setGlobalMute(const QVariant& on) {
+        lastMethod = QStringLiteral("setGlobalMute");
+        lastArg    = on.toBool() ? QStringLiteral("true") : QStringLiteral("false");
+        globalMute = on.toBool();
+    }
+    void setAutoMuted(const QVariant& on) {
+        lastMethod = QStringLiteral("setAutoMuted");
+        lastArg    = on.toBool() ? QStringLiteral("true") : QStringLiteral("false");
+        autoMuted  = on.toBool();
+    }
+    QVariant muteStatus() const { return muteJson; }
     // WekControl.ReloadWallpaper (we-manager resume-reload patch): (screen, how).
     void reloadBackend(const QVariant& screen, const QVariant& how) {
         lastMethod = QStringLiteral("reloadBackend");
@@ -153,6 +171,12 @@ class TestWekControl : public QObject {
     Q_OBJECT
 
 private slots:
+    // The unsaved mutes are process-wide: every case starts with both off.
+    void cleanup() {
+        WekControl control;
+        control.SetGlobalMute(false);
+        control.SetAutoMuted(false, 0);
+    }
 
     // -- Routing tests (no bus required) -------------------------------------
     // These exercise the C++ adapter's QMetaObject::invokeMethod dispatch
@@ -205,6 +229,10 @@ private slots:
     void reloadWallpaper_reachesEveryControllerAndSaysWhoAsked();
     void requestStop_needsAReasonAndSecondsFromZero();
     void stopReasons_gathersEveryScreensJson();
+    void globalMute_isOneValue_andTheToggleSetsItsOppositeEverywhere();
+    void autoMuted_holdsForOneLease_andNeedsOneToMute();
+    void aScreenThatComesLater_startsWithTheUnsavedMutes();
+    void muteStatus_gathersEveryScreen_andTheUnsavedMutes();
     void vramStatus_isWhatTheReaderSays();
 
     // -- No-controller safety --------------------------------------------
@@ -623,6 +651,126 @@ void TestWekControl::stopReasons_gathersEveryScreensJson() {
     for (const QJsonValue& v : all) screens << v.toObject().value(QStringLiteral("screen")).toString();
     screens.sort();
     QCOMPARE(screens, (QStringList { QStringLiteral("DP-1"), QStringLiteral("DP-2") }));
+}
+
+void TestWekControl::globalMute_isOneValue_andTheToggleSetsItsOppositeEverywhere() {
+    PlaylistControllerStub stubA, stubB;
+    auto                   controlA = std::make_unique<WekControl>();
+    auto                   controlB = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlB->setPlaylistController(&stubB);
+    controlA->SetGlobalMute(true);
+    QTRY_COMPARE(stubB.globalMute, true);
+    QCOMPARE(stubA.globalMute, true);
+    QCOMPARE(stubB.lastMethod, QStringLiteral("setGlobalMute"));
+    stubB.globalMute = false;            // a screen out of step: the toggle still follows the one value
+    controlB->ToggleGlobalMute();
+    QTRY_COMPARE(stubA.globalMute, false);
+    QCOMPARE(stubB.globalMute, false);
+    QCOMPARE(stubA.lastArg, QStringLiteral("false"));
+    controlA->ToggleGlobalMute();
+    QTRY_COMPARE(stubA.globalMute, true);
+    QCOMPARE(stubB.globalMute, true);
+    QCOMPARE(QJsonDocument::fromJson(controlB->MuteStatus().toUtf8()).object().value(QStringLiteral("globalMute")),
+             QJsonValue(true));
+}
+
+static QJsonObject muteStatusOf(WekControl& control) {
+    return QJsonDocument::fromJson(control.MuteStatus().toUtf8()).object();
+}
+
+void TestWekControl::autoMuted_holdsForOneLease_andNeedsOneToMute() {
+    PlaylistControllerStub stubA, stubB;
+    auto                   controlA = std::make_unique<WekControl>();
+    auto                   controlB = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlB->setPlaylistController(&stubB);
+    controlA->SetAutoMuted(true, 999999);                     // at most a day
+    QTRY_COMPARE(stubB.autoMuted, true);
+    QCOMPARE(stubA.autoMuted, true);
+    const double day = muteStatusOf(*controlB).value(QStringLiteral("autoMuteSeconds")).toDouble();
+    QVERIFY2(day > 86000 && day <= 86400, qPrintable(QString::number(day)));
+    // One lease for the process, whichever instance is asked: a renewal on B
+    // replaces A's, and its expiry ends the mute on every screen.
+    controlA->SetAutoMuted(true, 2);
+    QTest::qWait(1000);
+    controlB->SetAutoMuted(true, 2);                          // renewed
+    QTest::qWait(1000);
+    QCOMPARE(stubA.autoMuted, true);
+    QCOMPARE(muteStatusOf(*controlA).value(QStringLiteral("autoMuted")), QJsonValue(true));
+    QTRY_COMPARE_WITH_TIMEOUT(stubA.autoMuted, false, 4000);
+    QCOMPARE(stubB.autoMuted, false);
+    QCOMPARE(muteStatusOf(*controlA).value(QStringLiteral("autoMuted")), QJsonValue(false));
+    QCOMPARE(muteStatusOf(*controlA).value(QStringLiteral("autoMuteSeconds")).toInt(-1), 0);
+    // A mute needs a lease; ending one does not.
+    controlA->SetAutoMuted(true, 60);
+    QTRY_COMPARE(stubB.autoMuted, true);
+    stubB.lastMethod.clear();
+    QTest::ignoreMessage(QtWarningMsg, QRegularExpression("SetAutoMuted: a mute needs a lease of 1 second or more"));
+    controlA->SetAutoMuted(true, 0);
+    QTest::ignoreMessage(QtWarningMsg, QRegularExpression("SetAutoMuted: a mute needs a lease of 1 second or more"));
+    controlA->SetAutoMuted(true, -5);
+    QCoreApplication::processEvents();
+    QCOMPARE(stubB.lastMethod, QString());                     // refused: nothing sent, nothing changed
+    QVERIFY(muteStatusOf(*controlA).value(QStringLiteral("autoMuteSeconds")).toDouble() > 50);
+    controlB->SetAutoMuted(false, 0);
+    QTRY_COMPARE(stubA.autoMuted, false);
+    QCOMPARE(muteStatusOf(*controlA).value(QStringLiteral("autoMuteSeconds")).toInt(-1), 0);
+}
+
+void TestWekControl::aScreenThatComesLater_startsWithTheUnsavedMutes() {
+    // The review's case: a monitor plugged in, the plugin chosen again on a
+    // screen, or a containment re-created after the mutes were set.
+    PlaylistControllerStub stubA, stubB, stubC;
+    auto                   controlA = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlA->SetGlobalMute(true);
+    controlA->SetAutoMuted(true, 60);
+    QTRY_COMPARE(stubA.autoMuted, true);
+    auto controlB = std::make_unique<WekControl>();
+    controlB->setPlaylistController(&stubB);
+    QCOMPARE(stubB.globalMute, true);                         // at once, before its wallpaper opens any sound
+    QCOMPARE(stubB.autoMuted, true);
+    controlB->ToggleGlobalMute();
+    QTRY_COMPARE(stubA.globalMute, false);
+    QCOMPARE(stubB.globalMute, false);
+    QCOMPARE(stubB.autoMuted, true);                          // the toggle is the global mute's only
+    controlA->ToggleGlobalMute();
+    QTRY_COMPARE(stubB.globalMute, true);
+    QCOMPARE(stubA.globalMute, true);
+    // Unmuted, a later screen gets nothing sent at all.
+    controlA->SetGlobalMute(false);
+    controlA->SetAutoMuted(false, 0);
+    QTRY_COMPARE(stubB.autoMuted, false);
+    auto controlC = std::make_unique<WekControl>();
+    controlC->setPlaylistController(&stubC);
+    QCOMPARE(stubC.lastMethod, QString());
+    const QJsonObject st = muteStatusOf(*controlC);
+    QCOMPARE(st.value(QStringLiteral("globalMute")), QJsonValue(false));
+    QCOMPARE(st.value(QStringLiteral("autoMuted")), QJsonValue(false));
+}
+
+void TestWekControl::muteStatus_gathersEveryScreen_andTheUnsavedMutes() {
+    PlaylistControllerStub stubA, stubB;
+    stubA.muteJson = QStringLiteral(R"({"screen":"DP-1","muted":true,"audioOutput":true,"reasons":["global"]})");
+    stubB.muteJson = QStringLiteral(R"({"screen":"DP-2","muted":true,"audioOutput":false,"reasons":["output off","global"]})");
+    stubB.globalMute = true;             // MuteStatus reports the process's value, not a screen's
+    auto controlA    = std::make_unique<WekControl>();
+    auto controlB    = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlB->setPlaylistController(&stubB);
+    QCOMPARE(QJsonDocument::fromJson(controlB->MuteStatus().toUtf8()).object().value(QStringLiteral("globalMute")),
+             QJsonValue(false));
+    controlA->SetGlobalMute(true);
+    const QJsonObject all = QJsonDocument::fromJson(controlB->MuteStatus().toUtf8()).object();
+    QCOMPARE(all.value(QStringLiteral("globalMute")).toBool(), true);
+    QCOMPARE(all.value(QStringLiteral("autoMuted")).toBool(), false);
+    const QJsonArray screens = all.value(QStringLiteral("screens")).toArray();
+    QCOMPARE(screens.size(), 2);
+    QStringList names;
+    for (const QJsonValue& v : screens) names << v.toObject().value(QStringLiteral("screen")).toString();
+    names.sort();
+    QCOMPARE(names, (QStringList { QStringLiteral("DP-1"), QStringLiteral("DP-2") }));
 }
 
 void TestWekControl::vramStatus_isWhatTheReaderSays() {

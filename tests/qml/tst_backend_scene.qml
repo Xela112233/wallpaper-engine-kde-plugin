@@ -57,6 +57,35 @@ TestCase {
         compare(p.pauseCount, n + 1);
     }
 
+    // we-manager mute patch: with sound, a pause fades out first; pause(true)
+    // (before a sleep) cuts at once.
+    function test_pause_fadesOutFirst_andPauseTrueCuts() {
+        const p = _findScenePlayer();
+        scene.play();
+        scene.volumeFade.state.volumeFade = 70;
+        const n = p.pauseCount;
+        scene.pause();
+        compare(p.pauseCount, n, "the renderer paused before the fade-out");
+        tryVerify(() => p.pauseCount === n + 1, 2000);
+        compare(p.volume, 0);
+        scene.play();
+        scene.volumeFade.state.volumeFade = 70;
+        scene.pause(true);
+        compare(p.pauseCount, n + 2, "pause(true) did not cut at once");
+        compare(p.volume, 0);
+        scene.play();
+    }
+
+    // AudioOutput (mute patch) reaches the renderer; off, it opens no device.
+    function test_audioOutput_reachesTheRenderer() {
+        const p = _findScenePlayer();
+        compare(p.audioOutput, true);
+        background.audioOutput = false;
+        compare(p.audioOutput, false);
+        background.audioOutput = true;
+        compare(p.audioOutput, true);
+    }
+
     function test_getMouseTarget_returnsBinding() {
         const t = scene.getMouseTarget();
         verify(t !== undefined);

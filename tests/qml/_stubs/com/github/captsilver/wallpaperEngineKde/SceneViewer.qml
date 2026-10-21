@@ -30,6 +30,7 @@ Item {
     property int    vramMiB:        0      // what the scene holds after its first frame; tests set it
     property real   renderScale:    1.0  // fraction of native resolution to render at
     property bool   systemAudioCapture: false
+    property bool   audioOutput:        true    // mute patch: AudioOutput
     property bool   videoHwdec:     true   // false: the scene's video layers decode on the CPU
     property string language:       ""   // applyGeneralSettings' language (we-manager's language patch)
     property int    presentMode:    0    // Swapchain present-mode policy (Auto=0)

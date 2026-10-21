@@ -112,7 +112,7 @@ void TestWekShortcuts::dispatchTable_matchesExpectedDBusMembers() {
         { QStringLiteral("next_wallpaper"), QStringLiteral("Next") },
         { QStringLiteral("previous_wallpaper"), QStringLiteral("Previous") },
         { QStringLiteral("toggle_pause"), QStringLiteral("Toggle") },
-        { QStringLiteral("toggle_mute"), QStringLiteral("ToggleMute") },
+        { QStringLiteral("toggle_mute"), QStringLiteral("ToggleGlobalMute") },
         { QStringLiteral("reload_wallpaper"), QStringLiteral("ReloadWallpaperShortcut") },
         { QStringLiteral("toggle_wallpaper_keyboard"), QStringLiteral("ToggleKeyboard") },
         { QStringLiteral("save_screenshot"), QStringLiteral("SaveScreenshots") },

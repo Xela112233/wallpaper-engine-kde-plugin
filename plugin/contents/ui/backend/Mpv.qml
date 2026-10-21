@@ -17,11 +17,12 @@ Item{
     // plays the file. The wallpaper settings hide those controls for video
     // wallpapers to match; wiring one here means going back and re-enabling
     // them.
-    property var volumeFade: Common.createVolumeFade(
-        videoItem, 
-        Qt.binding(function() { return background.mute ? 0 : background.volume; }),
-        (volume) => { player.volume = volume; }
-    )
+    // A mute fades out before mpv drops the audio track (aid=no), and a
+    // pause before mpv pauses (we-manager mute patch: Common.createVolumeFade).
+    // Made in Component.onCompleted, not in a binding here: the fade reads its
+    // own properties as it starts, and inside a binding that would make it
+    // again at every change of the mute.
+    property var volumeFade: null
     
     onDisplayModeChanged: {
         if(videoItem.displayMode == Common.DisplayMode.Crop) {
@@ -64,7 +65,8 @@ Item{
     Mpv {
         id: player
         anchors.fill: parent
-        mute: background.mute
+        // The fade's hard mute (background.mute until the fade exists).
+        mute: videoItem.volumeFade ? videoItem.volumeFade.state.hardMuted : background.mute
         volume: 0
         // Opt-in power saving: cheap scalers, the video's own frame rate, and
         // at most as many redraws per second as scenes get (Fps setting).
@@ -135,14 +137,18 @@ Item{
     }
     Component.onCompleted:{
         background.nowBackend = 'mpv';
+        videoItem.volumeFade = Common.createVolumeFade(
+            videoItem,
+            Qt.binding(function() { return background.volume; }),
+            (volume) => { player.volume = volume; },
+            Qt.binding(function() { return background.mute; }));
         videoItem.displayModeChanged();
     }
 
     function play(){
-        // stop pause time to avoid quick switch which cause keep pause 
-        pauseTimer.stop();
+        // A play during a pause's fade-out cancels the pause.
         player.play();
-        volumeFade.start();
+        if (volumeFade) volumeFade.start();
     }
     // main.qml calls this when the backend becomes the outgoing layer of a
     // handoff: background.* then describes the next wallpaper, so pin the
@@ -156,7 +162,7 @@ Item{
         player.interpolation = player.interpolation;
         for (const name of ["hwdec", "loadInMemory", "videoSync"])
             if (name in player) player[name] = player[name];
-        volumeFade.freeze();
+        if (volumeFade) volumeFade.freeze();
     }
     // Called by main.qml once this backend has faded out, some time before
     // destroying it: mpv drops its video output off the render thread, so
@@ -164,16 +170,12 @@ Item{
     function prepareDestroy() {
         player.stopAsync();
     }
-    function pause(){
-        volumeFade.stop();
-        pauseTimer.start();
-    }
-    Timer{
-        id: pauseTimer
-        running: false
-        repeat: false
-        interval: 200
-        onTriggered: {
+    // The sound fades out (Common.fadeOutMs), then mpv pauses; pause(true)
+    // cuts at once (before a sleep).
+    function pause(now){
+        if (volumeFade && !now) volumeFade.fadeOut(() => player.pause());
+        else {
+            if (volumeFade) volumeFade.stop();
             player.pause();
         }
     }

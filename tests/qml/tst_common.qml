@@ -512,6 +512,125 @@ TestCase {
         handle.stop();
     }
 
+    // ── createVolumeFade — fade-out, hard mute (we-manager mute patch) ───────
+    // Each case has its own inputs and recorder, and destroys its fades: a
+    // fade left alive would keep answering the next case's inputs.
+    Component {
+        id: fadeInputs
+        QtObject {
+            property real volume: 60
+            property bool muted: false
+            property real level: -1
+            property int  pauses: 0
+        }
+    }
+    function _fade(inp) {
+        const f = Plugin.Common.createVolumeFade(testCaseRoot, Qt.binding(() => inp.volume),
+                                                 (v) => { inp.level = v; }, Qt.binding(() => inp.muted));
+        return f;
+    }
+
+    function test_createVolumeFade_fadeOutReachesZeroThenPausesOnce() {
+        compare(Plugin.Common.fadeOutMs, 500);
+        const inp = fadeInputs.createObject(testCaseRoot);
+        const f = _fade(inp);
+        f.start();
+        f.state.volumeFade = 60;
+        const t0 = Date.now();
+        f.fadeOut(() => { inp.pauses += 1; });
+        compare(inp.pauses, 0, "paused before the fade-out");
+        tryVerify(() => inp.pauses === 1, 2000);
+        const took = Date.now() - t0;
+        compare(inp.level, 0);
+        verify(took >= 400 && took < 1500, "the fade-out took " + took + " ms");
+        wait(200);
+        compare(inp.pauses, 1, "done called more than once");
+        // Paused: a volume change stays at 0 until the next play.
+        inp.volume = 90;
+        compare(inp.level, 0);
+        f.start();
+        tryVerify(() => inp.level > 0, 2000, "play did not fade in again");
+        f.state.destroy();
+        inp.destroy();
+    }
+
+    function test_createVolumeFade_aStartDuringTheFadeOutCancelsThePause() {
+        const inp = fadeInputs.createObject(testCaseRoot);
+        const f = _fade(inp);
+        f.start();
+        f.state.volumeFade = 60;
+        f.fadeOut(() => { inp.pauses += 1; });
+        wait(150);
+        const reached = inp.level;
+        verify(reached > 0 && reached < 60, "no fade-out under way: " + reached);
+        f.start();
+        wait(Plugin.Common.fadeOutMs + 300);
+        compare(inp.pauses, 0, "a play during the fade-out still paused");
+        verify(inp.level >= reached, "the fade did not go up again from where it was: " + inp.level);
+        f.state.destroy();
+        inp.destroy();
+    }
+
+    // The review's mutation (start() leaving a fade-out's pause behind): the
+    // pause a play cancelled must not come back with the next mute, which
+    // would pause the player and keep the unmute from fading in.
+    function test_createVolumeFade_aPauseThatPlayCancelled_doesNotComeBackWithAMute() {
+        const inp = fadeInputs.createObject(testCaseRoot);
+        const f = _fade(inp);
+        f.start();
+        f.state.volumeFade = 60;
+        f.fadeOut(() => { inp.pauses += 1; });
+        wait(150);
+        verify(inp.level > 0 && inp.level < 60, "no fade-out under way: " + inp.level);
+        f.start();                                            // play during the pause's fade-out
+        tryVerify(() => inp.level === 60, 3000, "play did not fade back up to the volume");
+        inp.muted = true;
+        tryVerify(() => f.state.hardMuted === true, 2000, "the mute never hard-muted");
+        compare(inp.level, 0);
+        inp.muted = false;
+        tryVerify(() => inp.level === 60, 6000, "the unmute did not fade in to the volume: " + inp.level);
+        compare(inp.pauses, 0, "the cancelled pause paused the player");
+        compare(f.state._paused, false, "left paused");
+        compare(f.state.hardMuted, false);
+        f.state.destroy();
+        inp.destroy();
+    }
+
+    function test_createVolumeFade_aMuteFadesOutBeforeTheHardMute_andAnUnmuteLiftsItFirst() {
+        const inp = fadeInputs.createObject(testCaseRoot);
+        const f = _fade(inp);
+        compare(f.state.hardMuted, false);
+        f.start();
+        f.state.volumeFade = 60;
+        inp.muted = true;
+        compare(f.state.hardMuted, false, "hard-muted before the fade-out");
+        tryVerify(() => f.state.hardMuted === true, 2000);
+        compare(inp.level, 0);
+        inp.muted = false;
+        compare(f.state.hardMuted, false, "an unmute did not lift the hard mute at once");
+        tryVerify(() => inp.level > 0, 2000, "an unmute did not fade in");
+        f.state.destroy();
+        // Made muted: hard-muted from the start, without a fade.
+        inp.muted = true;
+        const g = _fade(inp);
+        compare(g.state.hardMuted, true);
+        g.state.destroy();
+        inp.destroy();
+    }
+
+    function test_createVolumeFade_stopCutsAtOnce() {
+        const inp = fadeInputs.createObject(testCaseRoot);
+        const f = _fade(inp);
+        f.start();
+        f.state.volumeFade = 60;
+        f.stop();
+        compare(inp.level, 0);
+        inp.volume = 80;
+        compare(inp.level, 0, "a cut pause took a volume change");
+        f.state.destroy();
+        inp.destroy();
+    }
+
     // ── listProperty — iterates every enumerable property ────────────────────
     function test_listProperty_iteratesAllProperties() {
         // listProperty walks `for (var p in obj)` and console.errors each

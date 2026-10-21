@@ -66,6 +66,22 @@ TEST_SUITE("SoundManager") {
         CHECK_FALSE(WantsOutputDevice(true, 0));
     }
 
+    // we-manager mute patch: AudioOutput off, and a muted scene whose
+    // spectrum comes from the system capture, hold no device.
+    TEST_CASE("WantsOutputDevice: not with the output unwanted") {
+        CHECK_FALSE(WantsOutputDevice(false, 1, /*outputWanted=*/false));
+        CHECK(WantsOutputDevice(false, 1, true));
+        CHECK_FALSE(WantsOutputDevice(true, 1, true));
+    }
+    TEST_CASE("OutputWanted: off, or muted with the system capture, wants none") {
+        CHECK(OutputWanted(/*audioOutput=*/true, /*muted=*/false, /*fromSystemCapture=*/true));
+        CHECK(OutputWanted(true, false, false));
+        CHECK_FALSE(OutputWanted(true, true, true));   // muted, spectrum from the capture: close
+        CHECK(OutputWanted(true, true, false));        // muted, the playback tap feeds the visualiser: keep
+        CHECK_FALSE(OutputWanted(false, false, false)); // AudioOutput off
+        CHECK_FALSE(OutputWanted(false, true, false));
+    }
+
     TEST_CASE("Close() on an unopened device is a no-op") {
         SoundManager sm;
         sm.Close();

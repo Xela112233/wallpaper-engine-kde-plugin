@@ -71,6 +71,7 @@ ColumnLayout {
     property alias  cfg_PauseBatPercent:     settingPage.cfg_PauseBatPercent
     property alias  cfg_HdrOutput:           settingPage.cfg_HdrOutput
     property alias  cfg_SystemAudioCapture:  settingPage.cfg_SystemAudioCapture
+    property alias  cfg_AudioOutput:         settingPage.cfg_AudioOutput
     property alias  cfg_MediaIntegration:    settingPage.cfg_MediaIntegration
     property alias  cfg_BackgroundColor:     settingPage.cfg_BackgroundColor
     // These four have a matching `property alias` on SettingPage already

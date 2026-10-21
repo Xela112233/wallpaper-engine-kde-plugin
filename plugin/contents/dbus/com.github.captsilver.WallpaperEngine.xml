@@ -15,13 +15,15 @@
 
   Multi-monitor: first-plasmoid-wins service ownership. The second
   plasmoid logs "service already registered" and goes silent, but every
-  write method below (Next/Previous/Pause/Resume/Toggle/Mute/Unmute/
-  ToggleMute/ActivatePlaylist/Reload) reaches every screen: the owning
-  plasmoid broadcasts to every registered controller in the process.
-  CurrentWorkshopId/CurrentPlaylistId/CurrentItemIndex/IsPaused and
-  WallpaperChanged answer for the owning plasmoid's own screen only.
+  write method below reaches every screen: the owning plasmoid broadcasts
+  to every registered controller in the process.  StopReasons and
+  MuteStatus collect every screen's answer.  CurrentWorkshopId/
+  CurrentPlaylistId/CurrentItemIndex/IsPaused and WallpaperChanged answer
+  for the owning plasmoid's own screen only.
 
-  See src/WekControl.{hpp,cpp} for the C++ implementation.
+  See src/WekControl.{hpp,cpp} for the C++ implementation.  WekControl
+  exports all its slots; this file documents them, and
+  tests/test_w3_mute.py in we-manager checks that it names every one.
 -->
 <node>
   <interface name="com.github.captsilver.WallpaperEngine">
@@ -30,13 +32,44 @@
     <method name="Pause"/>
     <method name="Resume"/>
     <method name="Toggle"/>
+    <!-- Mute, Unmute and ToggleMute write MuteAudio: the mute is saved. -->
     <method name="Mute"/>
     <method name="Unmute"/>
     <method name="ToggleMute"/>
+    <!-- A mute that is not saved (the we-manager build's mute patch), on
+         every screen, over each wallpaper's own sound setting, until set
+         off or plasmashell restarts: the tray's Mute and the mute shortcut. -->
+    <method name="SetGlobalMute">
+      <arg name="on" type="b" direction="in"/>
+    </method>
+    <method name="ToggleGlobalMute"/>
+    <!-- A watcher's mute, not saved: held for `seconds` (at most a day; one
+         lease for the process) unless set again; on=false ends it; a mute
+         needs seconds >= 1 (on=true with 0 or less is refused). -->
+    <method name="SetAutoMuted">
+      <arg name="on" type="b" direction="in"/>
+      <arg name="seconds" type="i" direction="in"/>
+    </method>
+    <!-- JSON: {"globalMute", "autoMuted", "autoMuteSeconds" (left of the
+         lease, 0 without one), "screens": [{"screen", "muted",
+         "audioOutput", "reasons": [...]}]}; a reason is one of "output off",
+         "global", "auto", "window", "wallpaper", "setting". -->
+    <method name="MuteStatus">
+      <arg name="value" type="s" direction="out"/>
+    </method>
     <method name="ActivatePlaylist">
       <arg name="id" type="s" direction="in"/>
     </method>
+    <!-- Re-reads the plugin's playlists.json only. -->
     <method name="Reload"/>
+    <!-- A fresh backend on the screen named (its connector; "" every screen),
+         as after a sleep (the we-manager build's resume-reload patch); a
+         stopped screen or one held back by safe start is left as it is. -->
+    <method name="ReloadWallpaper">
+      <arg name="screen" type="s" direction="in"/>
+    </method>
+    <!-- The same on every screen: the "Reload current wallpaper" shortcut. -->
+    <method name="ReloadWallpaperShortcut"/>
     <!-- Keyboard mode for web wallpapers: off everywhere when a screen has
          it, else on for one screen (the one under the pointer, else the one
          whose desktop window is active, else the first that can). -->
@@ -66,6 +99,23 @@
     <!-- Every screen, into ~/Pictures/Wallpapers/wallpaper-<date>-<screen>.png;
          returns the path before the screens' names (the shortcut's action). -->
     <method name="SaveScreenshots">
+      <arg name="value" type="s" direction="out"/>
+    </method>
+    <!-- Stop (unload) the screen named, or every screen for "", for
+         `seconds` unless asked again; 0 ends the request (the we-manager
+         build's vram patch).  The screen shows "Stopped:" and the reason. -->
+    <method name="RequestStop">
+      <arg name="reason" type="s" direction="in"/>
+      <arg name="screen" type="s" direction="in"/>
+      <arg name="seconds" type="d" direction="in"/>
+    </method>
+    <!-- JSON: [{"screen", "stopped", "reasons": [{"reason", "detail",
+         "ignored", "leftMs"}]}]. -->
+    <method name="StopReasons">
+      <arg name="value" type="s" direction="out"/>
+    </method>
+    <!-- The video memory monitor, as JSON; "" without a reader. -->
+    <method name="VramStatus">
       <arg name="value" type="s" direction="out"/>
     </method>
     <method name="CurrentWorkshopId">

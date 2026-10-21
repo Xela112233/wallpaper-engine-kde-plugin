@@ -252,6 +252,10 @@
       <label>System Audio Capture</label>
       <default>true</default>
     </entry>
+    <entry name="AudioOutput" type="Bool">
+      <label>Audio output: off, wallpapers open no audio stream at all, whatever their own sound settings say (a scene also closes its sound device)</label>
+      <default>true</default>
+    </entry>
     <entry name="AudioConfigFile" type="Bool">
       <label>Marker, never read: this build takes the audio capture source, sensitivity, noise floor, attack and decay from ~/.config/wekde/audio.json (one file for every screen), reloaded by the ReloadAudioConfig D-Bus method; tools tell it from other builds by this entry</label>
       <default>true</default>

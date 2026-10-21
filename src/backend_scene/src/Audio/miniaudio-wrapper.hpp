@@ -342,6 +342,10 @@ private:
         config.playback.channels = d.phyChannels;
         config.dataCallback      = data_callback;
         config.pUserData         = (void*)this;
+        // The stream's name on PulseAudio/PipeWire (media.name; we-manager
+        // mute patch), so tools that watch other applications' audio can
+        // tell the wallpaper's own sound apart.
+        config.pulse.pStreamNamePlayback = "Wallpaper Engine (scene sound)";
         return config;
     }
 

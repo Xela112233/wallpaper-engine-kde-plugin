@@ -406,38 +406,132 @@ QtObject {
         Timer {
             property real volume
             property real volumeFade: 0.0
+            // The we-manager mute patch: the mute this fade follows, and the
+            // one the player's own mute binds to (state.hardMuted), set only
+            // once a mute's fade-out has reached 0 and lifted before an
+            // unmute's fade-in.
+            property bool muted: false
+            property bool hardMuted: false
+            property bool _down: false       // a fade-out runs
+            property real _downStep: 0
+            property bool _paused: false     // a pause's fade-out has ended
+            property var  _pauseDone: null   // what a pause does at 0
+            property bool _muteDone: false   // hard-mute at 0
         }
     }
 
-    function createVolumeFade(qobj, volume, changePlayerVolum) {
+    // How long a pause or a mute takes to fade the sound out (we-manager mute
+    // patch), in this many steps.  One constant, to change after listening.
+    readonly property int fadeOutMs: 500
+    readonly property int fadeOutSteps: 10
+
+    // The player's volume, faded.  `volume` (0-100) is the target, `muted`
+    // (optional, a bool or a Qt.binding) the mute: a mute fades the volume to
+    // 0 in fadeOutMs and only then sets state.hardMuted, which the player's
+    // own mute (mpv's aid=no, AudioOutput.muted, SceneViewer.muted) binds to;
+    // an unmute lifts it first, then fades in.  start(): fade in (play).
+    // fadeOut(done): fade out, then done() (pause); a start() before the end
+    // cancels done().  stop(): 0 at once (a pause that cuts, before a
+    // sleep).  freeze(): stop following the
+    // bindings (the outgoing layer of a handoff).
+    function createVolumeFade(qobj, volume, changePlayerVolum, muted) {
         const timer = _volumeFadeTimerComponent.createObject(qobj);
-        timer.interval = 300;
+        const upMs = 300;
+        timer.interval = upMs;
         timer.repeat = true;
         timer.volume = volume;
+        if (muted !== undefined) timer.muted = muted;
+        timer.hardMuted = timer.muted;
+        const target = () => timer.muted ? 0 : timer.volume;
+        const fadeDown = () => {
+            if (timer.volumeFade <= 0) {
+                finishDown();
+                return;
+            }
+            timer._downStep = Math.max(0.5, timer.volumeFade / fadeOutSteps);
+            timer._down = true;
+            timer.interval = Math.max(1, Math.round(fadeOutMs / fadeOutSteps));
+            if (!timer.running) timer.start();
+        };
+        const finishDown = () => {
+            timer._down = false;
+            timer.stop();
+            timer.interval = upMs;
+            if (timer._muteDone) {
+                timer._muteDone = false;
+                timer.hardMuted = true;
+            }
+            const done = timer._pauseDone;
+            timer._pauseDone = null;
+            if (done) {
+                timer._paused = true;
+                done();
+            }
+        };
+        const fadeUp = () => {
+            timer._down = false;
+            timer.interval = upMs;
+            timer.start();
+        };
         timer.triggered.connect(function() {
-            if(this.volumeFade >= this.volume) {
-                this.volumeFade = this.volume;
+            if (timer._down) {
+                timer.volumeFade = Math.max(0, timer.volumeFade - timer._downStep);
+                if (timer.volumeFade <= 0) finishDown();
+                return;
+            }
+            const t = target();
+            if (timer.volumeFade >= t) {
+                timer.volumeFade = t;
                 timer.stop();
             } else
-                this.volumeFade += 5;
-        }.bind(timer));
+                timer.volumeFade = Math.min(t, timer.volumeFade + 5);
+        });
         timer.onVolumeChanged.connect(function() {
-            if(!this.running) this.volumeFade = this.volume;
-        }.bind(timer));
+            if (timer.muted || timer._down || timer._paused) return;   // stays at 0
+            if (!timer.running) timer.volumeFade = timer.volume;
+        });
+        timer.onMutedChanged.connect(function() {
+            if (timer.muted) {
+                timer._muteDone = true;
+                fadeDown();
+            } else {
+                timer._muteDone = false;
+                timer.hardMuted = false;
+                // Fade in again, unless a pause holds (play() fades in then).
+                if (!timer._paused && !timer._pauseDone) fadeUp();
+            }
+        });
         timer.onVolumeFadeChanged.connect(function() {
-            changePlayerVolum(this.volumeFade);
-        }.bind(timer));
+            changePlayerVolum(timer.volumeFade);
+        });
         return {
+            state: timer,
             start: () => {
-                timer.start();
+                timer._paused = false;
+                timer._pauseDone = null;
+                if (timer.muted && timer._down) return;   // the mute's fade-out goes on
+                fadeUp();
+            },
+            fadeOut: (done) => {
+                timer._pauseDone = done || function() {};
+                fadeDown();
             },
             stop: () => {
+                timer._down = false;
+                timer._pauseDone = null;
+                timer._paused = true;
                 timer.volumeFade = 0.0;
                 timer.stop();
+                timer.interval = upMs;
+                if (timer._muteDone) {
+                    timer._muteDone = false;
+                    timer.hardMuted = true;
+                }
             },
-            // Stop following the volume binding; keep the current target.
+            // Stop following the bindings; keep the current target and mute.
             freeze: () => {
                 timer.volume = timer.volume;
+                timer.muted = timer.muted;
             }
         };
     }

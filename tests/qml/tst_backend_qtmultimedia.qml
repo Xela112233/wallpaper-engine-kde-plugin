@@ -34,21 +34,42 @@ TestCase {
     // instance — `qm` is shared and the first-frame announcement latches.
     Component { id: qmComp; Backend.QtMultimedia { source: "stub://fresh.mp4" } }
 
+    function _findAudioOutput() {
+        return qm.data.find(o => o && typeof o.muted !== "undefined" && typeof o.volume !== "undefined"
+                                 && typeof o.play !== "function") || null;
+    }
+
     function test_backendNameSetByCompleted() {
         compare(background.nowBackend, "QtMultimedia");
     }
 
-    // pause() only arms the 300ms fade-out timer; play() disarms it and starts
-    // the player straight away.
-    function test_play_pause_togglesPauseTimerAndPlayerState() {
-        const timer = _findPauseTimer();
+    // we-manager mute patch: pause() fades the sound out first; play()
+    // starts the player straight away and cancels a pause still fading.
+    function test_play_pause_fadeOutAndCancel() {
         const player = _findPlayer();
-        verify(timer !== null);
         verify(player !== null);
-        qm.pause();
-        compare(timer.running, true);
         qm.play();
-        compare(timer.running, false);
+        qm.volumeFade.state.volumeFade = 80;
+        qm.pause();
+        compare(player.playbackState, MediaPlayer.PlayingState, "paused before the fade-out");
+        qm.play();
+        wait(Plugin.Common.fadeOutMs + 200);
+        compare(player.playbackState, MediaPlayer.PlayingState, "a play did not cancel the fading pause");
+    }
+
+    // Audio output off: the player has no output, so no audio stream stays
+    // open; on again, it gets its output back and plays on.
+    function test_audioOutputOff_leavesThePlayerWithoutAnOutput() {
+        const player = _findPlayer();
+        const out = _findAudioOutput();
+        verify(player !== null && out !== null);
+        qm.play();
+        compare(player.audioOutput, out);
+        background.audioOutput = false;
+        compare(player.audioOutput, null, "a muted output stays on the player with Audio output off");
+        compare(player.playbackState, MediaPlayer.PlayingState, "turning the output off stopped the video");
+        background.audioOutput = true;
+        compare(player.audioOutput, out, "the output did not come back");
         compare(player.playbackState, MediaPlayer.PlayingState);
     }
 
@@ -90,17 +111,24 @@ TestCase {
         verify(lastLoadInfoMsg.indexOf("stub failure") !== -1);
     }
 
-    // The 300ms delay lets the volume fade finish before the picture stops;
-    // when it expires the player really has to pause.
-    function test_pauseTimerExpiry_pausesThePlayer() {
-        const timer = _findPauseTimer();
+    // The fade-out ends in a real pause, at volume 0; a mute fades out, then
+    // mutes the AudioOutput, and an unmute lifts that first.
+    function test_fadeOut_pausesThePlayer_andMuteWaitsForIt() {
         const player = _findPlayer();
-        verify(timer !== null);
-        verify(player !== null);
-        compare(timer.interval, 300);
+        const out = _findAudioOutput();
+        verify(player !== null && out !== null);
         player.play();
-        timer.triggered();
-        compare(player.playbackState, MediaPlayer.PausedState);
+        qm.volumeFade.state.volumeFade = 80;
+        qm.pause();
+        tryCompare(player, "playbackState", MediaPlayer.PausedState, 2000);
+        compare(out.volume, 0);
+        qm.play();
+        qm.volumeFade.state.volumeFade = 80;
+        background.mute = true;
+        compare(out.muted, false, "muted before the fade-out");
+        tryCompare(out, "muted", true, 2000);
+        background.mute = false;
+        compare(out.muted, false);
     }
 
     // Every backend announces its first frame to main.qml; that emit is what
@@ -157,19 +185,6 @@ TestCase {
         for (const b of buckets) {
             for (let i = 0; i < b.length; i++) {
                 if (b[i] && typeof b[i].fillMode !== "undefined") return b[i];
-            }
-        }
-        return null;
-    }
-
-    function _findPauseTimer() {
-        const buckets = [qm.children || [], qm.data || []];
-        for (const b of buckets) {
-            for (let i = 0; i < b.length; i++) {
-                const t = b[i];
-                if (t && typeof t.start === "function" &&
-                    typeof t.interval !== "undefined" &&
-                    t.interval >= 250 && t.interval <= 350) return t;
             }
         }
         return null;

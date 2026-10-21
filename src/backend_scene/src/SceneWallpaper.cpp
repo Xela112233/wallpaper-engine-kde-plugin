@@ -372,15 +372,33 @@ private:
     // Open the output stream only while there is something to play and close
     // it otherwise (see audio::WantsOutputDevice).  Mounted streams survive a
     // Close(); called after (un)mounting and on every STOP / resume.
+    // Called after a mute, an AudioOutput change and a capture change too
+    // (we-manager mute patch): a muted scene whose spectrum comes from the
+    // system capture, and one with the output off, hold no device.  A device
+    // that will not open leaves the scene silent with one log line until it
+    // opens again; nothing retries in a loop (the next change tries again).
     void syncSoundDevice() {
-        if (audio::WantsOutputDevice(m_playback_stopped, m_sound_manager->MountedChannelCount())) {
-            if (! m_sound_manager->IsInited() && ! m_sound_manager->Init()) return;
+        const bool outputWanted = audio::OutputWanted(m_audio_output, m_sound_manager->Muted(),
+                                                      m_system_audio_capture && audio::AudioBus::HasSystemCapture());
+        if (audio::WantsOutputDevice(m_playback_stopped, m_sound_manager->MountedChannelCount(), outputWanted)) {
+            if (! m_sound_manager->IsInited()) {
+                if (! m_sound_manager->Init()) {
+                    if (! m_sound_device_failed)
+                        LOG_ERROR("sound device failed to open: the scene stays silent until it opens");
+                    m_sound_device_failed = true;
+                    return;
+                }
+                if (m_sound_device_failed) LOG_INFO("sound device open again");
+                m_sound_device_failed = false;
+            }
             m_sound_manager->Play();
         } else {
             m_sound_manager->Pause();
             m_sound_manager->Close();
         }
     }
+    bool m_audio_output { true };
+    bool m_sound_device_failed { false };
     std::shared_ptr<audio::AudioAnalyzer> m_audio_analyzer;
     // Live "this scene reads the spectrum" declaration handed to the AudioBus;
     // the bus thread runs the FFT only while it is held.  Taken/dropped from
@@ -2829,6 +2847,15 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             bool muted { false };
             msg->findBool("value", &muted);
             m_sound_manager->SetMuted(muted);
+            syncSoundDevice();   // a muted scene may drop its device (mute patch)
+        } else if (property == PROPERTY_AUDIO_OUTPUT) {
+            bool on { true };
+            msg->findBool("value", &on);
+            if (on != m_audio_output) {
+                m_audio_output = on;
+                LOG_INFO("audio output %s", on ? "on" : "off: no sound device");
+                syncSoundDevice();
+            }
         } else if (property == PROPERTY_SYSTEM_AUDIO_CAPTURE) {
             bool enabled { false };
             msg->findBool("value", &enabled);
@@ -2850,6 +2877,7 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                     m_sound_manager->SetAudioAnalyzer(m_audio_analyzer);
                     LOG_INFO("Audio spectrum: switched to playback tap (wallpaper BGM)");
                 }
+                syncSoundDevice();   // a muted scene's device follows the tap's need (mute patch)
             }
         } else if (property == PROPERTY_VOLUME) {
             float volume { 1.0f };

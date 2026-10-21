@@ -694,6 +694,14 @@ void SceneObject::setSystemAudioCapture(bool value) {
     SET_PROPERTY(Bool, wallpaper::PROPERTY_SYSTEM_AUDIO_CAPTURE, value);
 }
 
+bool SceneObject::audioOutput() const { return m_audioOutput; }
+
+void SceneObject::setAudioOutput(bool value) {
+    if (m_audioOutput == value) return;
+    m_audioOutput = value;
+    SET_PROPERTY(Bool, wallpaper::PROPERTY_AUDIO_OUTPUT, value);
+}
+
 QString SceneObject::language() const { return m_language; }
 
 void SceneObject::setLanguage(const QString& value) {

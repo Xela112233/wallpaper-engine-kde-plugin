@@ -1,5 +1,6 @@
 #include "WekControl.hpp"
 
+#include <QCoreApplication>
 #include <QCursor>
 #include <QDBusConnection>
 #include <QDBusMessage>
@@ -8,6 +9,7 @@
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QList>
+#include <QTimer>
 #include <QMetaObject>
 #include <QVariant>
 #include <QJsonObject>
@@ -73,10 +75,46 @@ void broadcast(const char* method, const QVariant& a, const QVariant& b, const Q
                 ctrl, method, Qt::QueuedConnection, Q_ARG(QVariant, a), Q_ARG(QVariant, b), Q_ARG(QVariant, c));
 }
 
+void broadcast(const char* method, const QVariant& a) {
+    for (const QPointer<QObject>& ctrl : controllerRegistry())
+        if (ctrl) QMetaObject::invokeMethod(ctrl, method, Qt::QueuedConnection, Q_ARG(QVariant, a));
+}
+
 void broadcast(const char* method, const QString& arg) {
     for (const QPointer<QObject>& ctrl : controllerRegistry())
         if (ctrl)
             QMetaObject::invokeMethod(ctrl, method, Qt::QueuedConnection, Q_ARG(QString, arg));
+}
+
+// The unsaved mutes (we-manager mute patch), process-wide like the registry:
+// one value for every screen, so a controller that registers later (a monitor
+// plugged in, the plugin chosen again on a screen, a containment re-created)
+// starts with it, and the toggle flips this one value, never each screen's.
+// The automatic mute's lease is this one single-shot timer: one expiry for
+// the process.
+struct UnsavedMutes {
+    bool             global { false };
+    bool             autoMuted { false };
+    QPointer<QTimer> lease;
+};
+
+UnsavedMutes& unsavedMutes() {
+    static UnsavedMutes mutes;
+    return mutes;
+}
+
+QTimer* autoMuteLease() {
+    UnsavedMutes& m = unsavedMutes();
+    if (! m.lease) {
+        // Parented to the application, so it goes before the statics do.
+        m.lease = new QTimer(QCoreApplication::instance());
+        m.lease->setSingleShot(true);
+        QObject::connect(m.lease, &QTimer::timeout, [] {
+            unsavedMutes().autoMuted = false;
+            broadcast("setAutoMuted", QVariant(false));
+        });
+    }
+    return m.lease;
 }
 } // namespace
 
@@ -164,7 +202,16 @@ bool WekControl::registerOn(QDBusConnection& bus) {
 void WekControl::setPlaylistController(QObject* controller) {
     if (m_controller) controllerRegistry().removeAll(m_controller);
     m_controller = controller;
-    if (m_controller) controllerRegistry().append(m_controller);
+    if (! m_controller) return;
+    controllerRegistry().append(m_controller);
+    // A screen that comes later starts with the unsaved mutes the others have
+    // (directly: before its wallpaper opens any sound).  Only what is on is
+    // sent; a controller starts with both off.
+    const UnsavedMutes& m = unsavedMutes();
+    if (m.global)
+        QMetaObject::invokeMethod(m_controller, "setGlobalMute", Qt::DirectConnection, Q_ARG(QVariant, QVariant(true)));
+    if (m.autoMuted)
+        QMetaObject::invokeMethod(m_controller, "setAutoMuted", Qt::DirectConnection, Q_ARG(QVariant, QVariant(true)));
 }
 
 // -- Playlist navigation --
@@ -180,6 +227,47 @@ void WekControl::Toggle() { broadcast("togglePause"); }
 void WekControl::Mute() { broadcast("mute"); }
 void WekControl::Unmute() { broadcast("unmute"); }
 void WekControl::ToggleMute() { broadcast("toggleMute"); }
+void WekControl::SetGlobalMute(bool on) {
+    unsavedMutes().global = on;
+    broadcast("setGlobalMute", QVariant(on));
+}
+void WekControl::ToggleGlobalMute() { SetGlobalMute(! unsavedMutes().global); }
+void WekControl::SetAutoMuted(bool on, int seconds) {
+    if (on && seconds <= 0) {
+        qWarning().noquote() << "wek-dbus: SetAutoMuted: a mute needs a lease of 1 second or more, not" << seconds;
+        return;
+    }
+    if (on)
+        autoMuteLease()->start(qMin(seconds, 86400) * 1000);   // a renewal restarts it
+    else if (unsavedMutes().lease)
+        unsavedMutes().lease->stop();
+    unsavedMutes().autoMuted = on;
+    broadcast("setAutoMuted", QVariant(on));
+}
+
+QString WekControl::MuteStatus() const {
+    QJsonArray screens;
+    for (const QPointer<QObject>& ctrl : controllerRegistry()) {
+        if (! ctrl) continue;
+        QVariant v;
+        // The controller answers JSON text (PlaylistController.qml muteStatus).
+        if (! QMetaObject::invokeMethod(ctrl, "muteStatus", Qt::DirectConnection, Q_RETURN_ARG(QVariant, v)))
+            continue;
+        const QJsonDocument doc = QJsonDocument::fromJson(v.toString().toUtf8());
+        if (doc.isObject()) screens.append(doc.object());
+    }
+    QJsonObject out;
+    out.insert(QStringLiteral("globalMute"), unsavedMutes().global);
+    out.insert(QStringLiteral("autoMuted"), unsavedMutes().autoMuted);
+    const QTimer* lease  = unsavedMutes().lease;
+    // remainingTime() of a coarse timer can run a little past its interval.
+    const int leftMs = unsavedMutes().autoMuted && lease && lease->isActive()
+                           ? qMin(lease->remainingTime(), lease->interval())
+                           : 0;
+    out.insert(QStringLiteral("autoMuteSeconds"), (leftMs + 999) / 1000);
+    out.insert(QStringLiteral("screens"), screens);
+    return QString::fromUtf8(QJsonDocument(out).toJson(QJsonDocument::Compact));
+}
 
 // -- Activation --
 

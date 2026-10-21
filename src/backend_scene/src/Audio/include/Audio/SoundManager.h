@@ -39,8 +39,19 @@ std::unique_ptr<SoundStream> CreateSoundStream(std::shared_ptr<fs::IBinaryStream
 // Intel laptop, codec runtime-PM status stuck at "active"), and most scenes
 // mount no sound at all.  With nothing mounted there is also nothing for the
 // playback tap to analyse: the spectrum is zero either way.
-inline bool WantsOutputDevice(bool playbackStopped, std::size_t mountedChannels) {
-    return ! playbackStopped && mountedChannels > 0;
+//
+// `outputWanted` (we-manager mute patch) is false with the plugin's
+// AudioOutput off, and while the scene is muted and its visualiser takes the
+// system capture rather than this device's own playback tap: then nothing
+// would come out of the device and nothing reads what goes in.
+inline bool WantsOutputDevice(bool playbackStopped, std::size_t mountedChannels, bool outputWanted = true) {
+    return outputWanted && ! playbackStopped && mountedChannels > 0;
+}
+// That `outputWanted`: the output is on, and the scene is not muted while its
+// spectrum comes from the system capture (when the capture is off, or failed,
+// the visualiser reads this device's playback tap, so a muted scene keeps it).
+inline bool OutputWanted(bool audioOutput, bool muted, bool spectrumFromSystemCapture) {
+    return audioOutput && ! (muted && spectrumFromSystemCapture);
 }
 
 class SoundManager : NoCopy, NoMove {

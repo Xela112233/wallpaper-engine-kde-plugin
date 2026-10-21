@@ -79,6 +79,7 @@ Item {
         "SceneOptions":        true,     // marker key, never read
         "PostProcessing":      "",
         "SystemAudioCapture":  true,      // matches main.xml default
+        "AudioOutput":         true,      // matches main.xml default (mute patch)
         "MediaIntegration":    true,      // matches main.xml default
         "MediaBlocklist":      "",        // matches main.xml default (media-blocklist patch)
         "VideoFolderPath":     "",

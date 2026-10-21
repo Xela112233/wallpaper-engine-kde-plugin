@@ -106,9 +106,12 @@ WekShortcuts::WekShortcuts(QObject* parent)
                    i18nc("@action shortcut label", "Pause / resume wallpaper"),
                    QStringLiteral("Toggle"));
 
+    // The unsaved global mute (we-manager mute patch): a key press no longer
+    // rewrites MuteAudio, and it silences a wallpaper whose own options
+    // unmute it too.
     registerAction(QStringLiteral("toggle_mute"),
                    i18nc("@action shortcut label", "Toggle wallpaper audio mute"),
-                   QStringLiteral("ToggleMute"));
+                   QStringLiteral("ToggleGlobalMute"));
 
     // Reloads the wallpaper on every screen (we-manager resume-reload patch);
     // the playlists alone were re-read before, whatever the label said.

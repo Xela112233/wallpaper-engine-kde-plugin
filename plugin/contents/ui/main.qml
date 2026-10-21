@@ -145,8 +145,28 @@ Rectangle {
     property int    displayMode: get_opt_value('display_mode', wallpaper.configuration.DisplayMode)
     property string backgroundColor: get_opt_value('background_color', wallpaper.configuration.BackgroundColor)
     // A window condition set to Mute (FocusAction, MaximizedAction,
-    // FullscreenAction) silences the wallpaper over its own setting.
-    property bool   mute: windowModel.reqMute || get_opt_value('mute_audio', wallpaper.configuration.MuteAudio)
+    // FullscreenAction) silences the wallpaper over its own setting.  So do
+    // the unsaved mutes (we-manager mute patch: PlaylistController's
+    // globalMute and autoMuted) and AudioOutput off, which also keeps every
+    // backend from opening an audio stream at all.
+    readonly property bool audioOutput: wallpaper.configuration.AudioOutput ?? true
+    property bool   mute: !audioOutput || playlistController.globalMute || playlistController.autoMuted
+                          || windowModel.reqMute || get_opt_value('mute_audio', wallpaper.configuration.MuteAudio)
+    // WekControl.MuteStatus, through PlaylistController.muteStatus(): why this
+    // screen is silent.
+    function muteStatusReport() {
+        const reasons = [];
+        if (!background.audioOutput) reasons.push("output off");
+        if (playlistController.globalMute) reasons.push("global");
+        if (playlistController.autoMuted) reasons.push("auto");
+        if (windowModel.reqMute) reasons.push("window");
+        if (background.curOpt.hasOwnProperty('mute_audio')) {
+            if (background.curOpt['mute_audio']) reasons.push("wallpaper");
+        } else if (wallpaper.configuration.MuteAudio) {
+            reasons.push("setting");
+        }
+        return { muted: background.mute, audioOutput: background.audioOutput, reasons: reasons };
+    }
     property int    volume: get_opt_value('volume', wallpaper.configuration.Volume)
     property real   speed: get_opt_value('speed', wallpaper.configuration.Speed)
     // User properties for scene wallpapers (JSON string format)
@@ -602,7 +622,9 @@ Rectangle {
             if (sleep) {
                 console.log("Preparing for sleep (possibly a VT switch)");
                 diagnostics.logPauseTransition("tty", false);
-                if (backendLoader.item) backendLoader.item.pause();
+                // At once, no fade-out (mute patch): the machine may be about
+                // to sleep, and nobody hears the last half second anyway.
+                if (backendLoader.item) backendLoader.item.pause(true);
             } else {
                 console.log("Waking up (VT switch back)");
                 diagnostics.logPauseTransition("tty", true);
@@ -1165,6 +1187,7 @@ Rectangle {
         screenName: background.Screen.name
         saveScreenshot: function(path) { return background.saveWallpaperScreenshot(path); }
         stopReasonsReader: function() { return background.stopReasonsReport(); }
+        muteStatusReader: function() { return background.muteStatusReport(); }
         onExternalStopRequested: (reason, seconds) => background.requestExternalStop(reason, seconds)
         onReloadRequested: how => background.reloadWallpaper("reload", how, "", 0)
     }

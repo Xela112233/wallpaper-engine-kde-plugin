@@ -61,6 +61,9 @@ class SceneObject : public QQuickItem {
                    userPropertiesChanged)
     Q_PROPERTY(bool hdrOutput READ hdrOutput WRITE setHdrOutput)
     Q_PROPERTY(bool systemAudioCapture READ systemAudioCapture WRITE setSystemAudioCapture)
+    // The KDE plugin's AudioOutput (we-manager mute patch): false, the scene
+    // opens no sound device at all, whatever its mute says.
+    Q_PROPERTY(bool audioOutput READ audioOutput WRITE setAudioOutput)
     // Hardware decoding for the scene's video layers (the KDE plugin's
     // MpvHwdec): true tries VA-API first, as before; false decodes them on the
     // CPU.  The decoders are made at scene load, so a change reloads it.
@@ -151,6 +154,7 @@ public:
     bool    muted() const;
     bool    hdrOutput() const;
     bool    systemAudioCapture() const;
+    bool    audioOutput() const;
     bool    videoHwdec() const;
     QString language() const;
     QString userProperties() const;
@@ -173,6 +177,7 @@ public:
     void setUserProperties(const QString&);
     void setHdrOutput(bool);
     void setSystemAudioCapture(bool);
+    void setAudioOutput(bool);
     void setVideoHwdec(bool);
     void setLanguage(const QString&);
     void setPostprocessingOverride(const QString&);
@@ -443,6 +448,7 @@ private:
     bool        m_deterministic { false };
     std::string m_cache_path_override; // empty = use GetDefaultCachePath()
     bool        m_systemAudioCapture { false };
+    bool        m_audioOutput { true };
     bool        m_videoHwdec { true };
     QString     m_language;
     QString     m_postprocessingOverride;

@@ -25,6 +25,7 @@ QtObject {
     property bool   hdrOutput:   false
     property string postProcessing: ""    // empty = wallpaper-default; matches main.qml
     property bool   systemAudioCapture: true // matches main.xml default
+    property bool   audioOutput: true        // matches main.xml default (mute patch)
     property bool   verboseLogging: false    // matches main.xml default (VerboseLogging)
     property bool   mediaIntegration: true   // matches main.xml default
     property string mediaBlocklist:   ""     // matches main.xml default (media-blocklist patch)

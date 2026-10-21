@@ -209,29 +209,40 @@ TestCase {
         verify(lastLoadInfoMsg.indexOf("no frame") !== -1);
     }
 
-    function test_pauseTimerTriggeredEventuallyPausesPlayer() {
-        // pause() starts pauseTimer (interval 200ms). We don't wait — fire
-        // the timer's triggered() directly to exercise the inner handler,
-        // which calls player.pause() (Mpv.qml:107-109). Assert via the
-        // stub's pauseCount recorder.
-        function findTimer(parent) {
-            const buckets = [parent.children || [], parent.data || []];
-            for (const b of buckets) {
-                for (let i = 0; i < b.length; i++) {
-                    const t = b[i];
-                    if (t && typeof t.start === "function" &&
-                        typeof t.interval !== "undefined" &&
-                        t.interval >= 200 && t.interval < 250) return t;
-                }
-            }
-            return null;
-        }
-        const timer = findTimer(mpv);
-        verify(timer !== null);
+    // we-manager mute patch: a pause fades the sound out (Common.fadeOutMs),
+    // then pauses mpv; a play during the fade cancels it.  A mute fades out,
+    // then drops the audio track (the stub's mute); an unmute lifts it first.
+    function test_pause_fadesOutThenPauses_andAPlayCancelsIt() {
         const p = _findMpvPlayer();
+        mpv.play();
+        mpv.volumeFade.state.volumeFade = 80;      // sounding
         const n = p.pauseCount;
-        timer.triggered();
-        compare(p.pauseCount, n + 1);
+        mpv.pause();
+        compare(p.pauseCount, n, "paused before the fade-out");
+        verify(p.volume > 0);
+        tryVerify(() => p.pauseCount === n + 1, 2000, "the fade-out never paused");
+        compare(p.volume, 0, "paused before the sound reached 0");
+        mpv.play();
+        mpv.volumeFade.state.volumeFade = 80;
+        mpv.pause();
+        wait(100);
+        mpv.play();                                // back before the fade ends
+        wait(Plugin.Common.fadeOutMs + 200);
+        compare(p.pauseCount, n + 1, "a play during the fade-out did not cancel the pause");
+    }
+
+    function test_mute_fadesOutThenDropsTheTrack_andUnmuteLiftsItFirst() {
+        const p = _findMpvPlayer();
+        background.mute = false;
+        tryVerify(() => p.mute === false, 2000);
+        mpv.play();
+        mpv.volumeFade.state.volumeFade = 80;
+        background.mute = true;
+        compare(p.mute, false, "the track went before the fade-out");
+        tryVerify(() => p.mute === true, 2000, "the mute never reached mpv");
+        compare(p.volume, 0);
+        background.mute = false;
+        compare(p.mute, false, "an unmute did not lift the hard mute at once");
     }
 
     // sourceLoadFailed routes to loadInfoShow AND stops the 15s watchdog

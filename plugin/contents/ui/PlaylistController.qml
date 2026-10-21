@@ -169,6 +169,26 @@ Item {
         }
     }
 
+    // Mutes that are not saved (we-manager mute patch): in memory only, never
+    // in Plasma's config, so a plasmashell restart clears them; main.qml ORs
+    // them into its mute, over a wallpaper's own sound setting.  WekControl
+    // keeps the one value of each for the whole process and sets it here, on
+    // every screen and on a screen that registers later: globalMute from
+    // SetGlobalMute (the tray's Mute) and ToggleGlobalMute (the mute
+    // shortcut), autoMuted from SetAutoMuted, whose lease (renewed by its
+    // caller, so a watcher that dies cannot leave the wallpapers silent) is
+    // WekControl's one timer.
+    property bool globalMute: false
+    property bool autoMuted: false
+    function setGlobalMute(on) { root.globalMute = (on === true || on === "true"); }
+    function setAutoMuted(on) { root.autoMuted = (on === true || on === "true"); }
+    // WekControl.MuteStatus: this screen's mute and why (main.qml sets it).
+    property var muteStatusReader: null
+    function muteStatus() {
+        const r = typeof root.muteStatusReader === "function" ? root.muteStatusReader() : ({});
+        return JSON.stringify(Object.assign({ screen: root.screenName }, r));
+    }
+
     function activatePlaylistById(id) {
         root.setActivePlaylistId(id);
     }
