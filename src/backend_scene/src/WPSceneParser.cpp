@@ -1,6 +1,7 @@
 #include "WPSceneParser.hpp"
 #include "ColorBlendOverride.hpp"
 #include "EffectFeedback.hpp"
+#include "EffectFluid.hpp"
 #include "TextCanvasSize.hpp"
 #include "CardMesh.hpp"
 #include "CameraLayer.hpp"
@@ -118,7 +119,20 @@ EffectBuildPlan computeWouldBuildEffects(const std::vector<wpscene::WPImageEffec
     return plan;
 }
 
+// Fluid simulation (fluid-effect patch): what readFluidEffects found in one
+// effect of the scene file, see EffectFluid.hpp.  scenePasses: the scene's
+// per-pass overrides of the effect, kept only when the renderer's own rule
+// took none of them (more entries than material passes).
+struct FluidEffectSource {
+    fluid::Extras  extras;
+    nlohmann::json scenePasses;
+};
+
 struct ParseContext {
+    // Fluid simulation (fluid-effect patch): by object id and the effect's
+    // place in the object's "effects".  Empty unless SceneQuality::fluid.
+    std::map<std::pair<i32, usize>, FluidEffectSource> fluid_effects;
+
     std::shared_ptr<Scene> scene;
     WPShaderValueUpdater*  shader_updater;
     i32                    ortho_w;
@@ -2486,6 +2500,164 @@ std::optional<FeedbackEffect> rewriteFeedbackEffect(const wpscene::WPImageEffect
     return out;
 }
 
+// Fluid simulation (fluid-effect patch, SceneQuality::fluid, see
+// EffectFluid.hpp).  Reads, for every effect the scene file gives an object,
+// the parts of the effect file that only this patch uses.  The object parser
+// (wpscene) is not touched: it reads what it always read, and this reads the
+// file a second time.  Effects the parser adds itself, and those of layers a
+// script makes from a pool, are not in the scene file's lists and get none.
+void readFluidEffects(ParseContext& context, const nlohmann::json& json, fs::VFS& vfs) {
+    if (! json.contains("objects") || ! json.at("objects").is_array()) return;
+    for (const auto& obj : json.at("objects")) {
+        if (! obj.is_object() || ! obj.contains("effects") || ! obj.at("effects").is_array())
+            continue;
+        if (! obj.contains("id") || ! obj.at("id").is_number_integer()) continue;
+        const i32 id    = obj.at("id").get<i32>();
+        usize     index = 0;
+        for (const auto& jE : obj.at("effects")) {
+            const usize at = index++;
+            if (! jE.is_object() || ! jE.contains("file") || ! jE.at("file").is_string()) continue;
+            const std::string file = jE.at("file").get<std::string>();
+            if (! vfs.Contains("/assets/" + file)) continue;
+            nlohmann::json jEffect;
+            if (! PARSE_JSON(fs::GetFileContentBounded(vfs, "/assets/" + file, kMaxJsonBytes),
+                             jEffect))
+                continue;
+            FluidEffectSource source;
+            // The shape of these parts is known second-hand.  A file that
+            // has them otherwise costs the effect these parts, not the scene
+            // its load: the effect is then built as without the setting's
+            // additions.
+            try {
+                source.extras = fluid::Read(jEffect);
+            } catch (const nlohmann::json::exception& e) {
+                LOG_ERROR("fluid simulation: '%s' not read for its conditions, sizes and functions: %s",
+                          file.c_str(),
+                          e.what());
+                continue;
+            }
+            if (! source.extras.functionsNotRead.empty()) {
+                std::string names;
+                for (const auto& n : source.extras.functionsNotRead)
+                    names += (names.empty() ? "" : ", ") + n;
+                LOG_NOTICE("fluid simulation: '%s': function(s) not taken: %s", file.c_str(), names.c_str());
+            }
+            if (jE.contains("passes") && jE.at("passes").is_array() &&
+                ! fluid::SceneEntryOfPass(source.extras, jE.at("passes").size()).empty())
+                source.scenePasses = jE.at("passes");
+            context.fluid_effects.emplace(std::make_pair(id, at), std::move(source));
+        }
+    }
+}
+
+// A pass's shader combos as far as they are known before the material is
+// loaded: the defaults its shader declares ("// [COMBO]", included files
+// too), then the material's, then the effect pass's and the scene's.  The
+// combos a bound texture switches on are not among them.
+fluid::Combos fluidPassCombos(fs::VFS& vfs, const wpscene::WPMaterial& material,
+                              const wpscene::WPMaterialPass& pass) {
+    fluid::Combos     combos;
+    WPShaderInfo      info;
+    const std::string path = "/assets/shaders/" + material.shader;
+    for (const char* stage : { ".vert", ".frag" }) {
+        if (! vfs.Contains(path + stage)) continue;
+        (void)WPShaderParser::PreShaderSrc(vfs, fs::GetFileContent(vfs, path + stage), &info, {});
+    }
+    for (const auto& [name, value] : info.combos) {
+        char*           end = nullptr;
+        const long long v   = std::strtoll(value.c_str(), &end, 10);
+        if (end != value.c_str()) combos[name] = v;
+    }
+    for (const auto& [name, value] : material.combos) combos[name] = value;
+    for (const auto& [name, value] : pass.combos) combos[name] = value;
+    return combos;
+}
+
+// The effect as the fluid-effect patch has it built: the scene's per-pass
+// overrides taken by the line they stand at where the renderer took none,
+// and the passes and binds whose conditions do not hold left out (a command
+// stays after the passes it stood after).  nullopt for an effect the scene
+// file does not list; `changed` false when the effect is the authored one.
+struct FluidEffect {
+    wpscene::WPImageEffect effect;
+    const fluid::Extras*   extras { nullptr };
+    bool                   changed { false };
+};
+
+std::optional<FluidEffect> fluidEffect(ParseContext& context, const wpscene::WPImageEffect& authored,
+                                       i32 layer_id, usize index) {
+    const auto it = context.fluid_effects.find({ layer_id, index });
+    if (it == context.fluid_effects.end()) return std::nullopt;
+    const FluidEffectSource& source = it->second;
+    FluidEffect              out;
+    out.effect = authored;
+    out.extras = &source.extras;
+    auto& eff  = out.effect;
+
+    if (source.scenePasses.is_array()) {
+        const auto entry = fluid::SceneEntryOfPass(source.extras, source.scenePasses.size());
+        for (usize p = 0; p < entry.size() && p < eff.passes.size(); p++) {
+            wpscene::WPMaterialPass pass;
+            pass.FromJson(source.scenePasses.at((usize)entry[p]));
+            eff.passes[p].Update(pass);
+            out.changed = true;
+        }
+    }
+
+    if (source.extras.Conditional() && eff.passes.size() == eff.materials.size()) {
+        const auto kept = fluid::Apply(source.extras, eff.passes.size(), [&](usize p) {
+            return fluidPassCombos(*context.vfs, eff.materials[p], eff.passes[p]);
+        });
+        if (! kept.all) {
+            out.changed = true;
+            std::vector<wpscene::WPMaterial>     materials;
+            std::vector<wpscene::WPMaterialPass> passes;
+            std::vector<i32>                     keptBefore(eff.passes.size() + 1, 0);
+            for (usize p = 0; p < eff.passes.size(); p++) {
+                keptBefore[p + 1] = keptBefore[p] + (kept.pass[p] ? 1 : 0);
+                if (! kept.pass[p]) continue;
+                auto pass = std::move(eff.passes[p]);
+                // Binds the effect file does not list (the parser's own, for
+                // "compose") come after those it lists and always stay.
+                std::vector<wpscene::WPMaterialPassBindItem> binds;
+                for (usize b = 0; b < pass.bind.size(); b++)
+                    if (b >= kept.bind[p].size() || kept.bind[p][b]) binds.push_back(pass.bind[b]);
+                pass.bind = std::move(binds);
+                passes.push_back(std::move(pass));
+                materials.push_back(std::move(eff.materials[p]));
+            }
+            for (auto& cmd : eff.commands) {
+                const usize pos = std::min<usize>((usize)std::max<i32>(cmd.afterpos, 0),
+                                                  keptBefore.size() - 1);
+                cmd.afterpos    = keptBefore[pos];
+            }
+            eff.passes    = std::move(passes);
+            eff.materials = std::move(materials);
+        }
+    }
+    return out;
+}
+
+bool fluidScenePassesByLine(const ParseContext& context, i32 layer_id, usize index) {
+    const auto it = context.fluid_effects.find({ layer_id, index });
+    return it != context.fluid_effects.end() && it->second.scenePasses.is_array();
+}
+
+// The name `fbo` of a fluid effect's file has after rewriteFeedbackEffect:
+// its own, or with the effect's tag, each also as the twin.
+std::vector<std::string> fluidTargetNames(const wpscene::WPImageEffect& built, const std::string& fbo,
+                                          usize index) {
+    const std::string        tag = "_fb" + std::to_string(index);
+    std::vector<std::string> out;
+    for (const auto& name : { fbo, fbo + tag, fbo + "_twin", fbo + tag + "_twin" })
+        for (const auto& f : built.fbos)
+            if (f.name == name) {
+                out.push_back(name);
+                break;
+            }
+    return out;
+}
+
 // The parts of an effect chain that genuinely differ between an image layer
 // and a text layer.  Everything else about assembling one is identical, so
 // both go through assembleEffects below.
@@ -2547,8 +2719,20 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
         std::optional<FeedbackEffect> feedback_effect;
         if (context.quality.feedback)
             feedback_effect = rewriteFeedbackEffect(wpeffobj_authored, raw_idx - 1);
-        const wpscene::WPImageEffect& wpeffobj =
-            feedback_effect ? feedback_effect->effect : wpeffobj_authored;
+        // Fluid simulation (fluid-effect patch): off, or an effect that
+        // carries nothing over, and nothing here runs.  Else the effect is
+        // first what fluidEffect makes of the authored one, and the feedback
+        // rewrite is that of the result (which may carry nothing over once
+        // its conditions are applied; it is then built as it stands).
+        std::optional<FluidEffect> fluid_effect;
+        if (feedback_effect && context.quality.fluid) {
+            fluid_effect = fluidEffect(context, wpeffobj_authored, opts.layer_id, raw_idx - 1);
+            if (fluid_effect && fluid_effect->changed)
+                feedback_effect = rewriteFeedbackEffect(fluid_effect->effect, raw_idx - 1);
+        }
+        const wpscene::WPImageEffect& wpeffobj = feedback_effect ? feedback_effect->effect
+                                                 : fluid_effect  ? fluid_effect->effect
+                                                                 : wpeffobj_authored;
 
         auto imgEffect = std::make_shared<SceneImageEffect>();
 
@@ -2596,6 +2780,24 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
                     scene.renderTargets.at(fboMap.at(wpfbo.name)).format = TextureFormat::RGBA16F;
             }
             imgEffect->feedback = true;
+        }
+        if (fluid_effect) {
+            // "fit": the target's larger side in pixels.  A layer with a size
+            // of its own gets it here; a full-screen layer's targets follow
+            // the output, so the renderer sizes them (Scene::fluidFit).
+            for (const auto& x : fluid_effect->extras->fbos) {
+                if (x.fit <= 0) continue;
+                for (const auto& name : fluidTargetNames(wpeffobj, x.name, raw_idx - 1)) {
+                    const std::string& rtname = fboMap.at(name);
+                    if (opts.fullscreen) {
+                        scene.fluidFit[rtname] = x.fit;
+                    } else {
+                        const auto [w, h] = fluid::FitSize(opts.base_width, opts.base_height, x.fit);
+                        scene.renderTargets.at(rtname).width  = w;
+                        scene.renderTargets.at(rtname).height = h;
+                    }
+                }
+            }
         }
         // load! effect commands
         {
@@ -2730,6 +2932,9 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
                 }
             }
 
+            // Fluid simulation (fluid-effect patch): the effect's shaders
+            // read the cursor itself and its button (WPShaderValueUpdater).
+            if (fluid_effect) svData.fluidPointer = true;
             context.shader_updater->SetNodeData(spEffNode.get(), svData);
             spEffNode->SetVisibilityOwner(visibility_owner);
             imgEffect->nodes.push_back({ matOutRT, spEffNode });
@@ -2760,6 +2965,51 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
                            opts.layer_id,
                            feedback_effect->persistent.size(),
                            feedback_effect->moves.size());
+            }
+            if (fluid_effect) {
+                // Kept targets only: any other is drawn anew every frame.
+                const auto kept = [&](const std::string& name) {
+                    return feedback_effect &&
+                           std::find(feedback_effect->persistent.begin(),
+                                     feedback_effect->persistent.end(),
+                                     name) != feedback_effect->persistent.end();
+                };
+                const auto&                     extras = *fluid_effect->extras;
+                const Scene::FluidColour        black { 0.0f, 0.0f, 0.0f, 0.0f };
+                usize                           fitted = 0, started = 0;
+                for (const auto& x : extras.fbos) {
+                    if (x.fit > 0) fitted++;
+                    if (! x.has_clear || x.clear == black) continue;
+                    for (const auto& name : fluidTargetNames(wpeffobj, x.name, raw_idx - 1)) {
+                        if (! kept(name)) continue;
+                        scene.fluidStart[fboMap.at(name)] = x.clear;
+                        started++;
+                    }
+                }
+                for (const auto& fn : extras.functions) {
+                    SceneImageEffect::FluidFunction built;
+                    built.name = fn.name;
+                    for (const auto& fbo : fn.fbos) {
+                        const auto* x = extras.FindFbo(fbo);
+                        for (const auto& name : fluidTargetNames(wpeffobj, fbo, raw_idx - 1))
+                            if (kept(name))
+                                built.clears.emplace_back(fboMap.at(name), x ? x->clear : black);
+                    }
+                    imgEffect->fluidFunctions.push_back(std::move(built));
+                }
+                LOG_NOTICE("fluid simulation: effect '%s' of layer %d: %zu of %zu pass(es) drawn, "
+                           "%zu target(s) with a fixed size, %zu with a start colour, "
+                           "%zu function(s)%s",
+                           wpeffobj.name.c_str(),
+                           opts.layer_id,
+                           wpeffobj.passes.size(),
+                           wpeffobj_authored.passes.size(),
+                           fitted,
+                           started,
+                           imgEffect->fluidFunctions.size(),
+                           fluidScenePassesByLine(context, opts.layer_id, raw_idx - 1)
+                               ? ", the scene's pass settings taken by line"
+                               : "");
             }
             // Every built-hidden effect starts hidden, bound or not: a script-targeted
             // layer builds literal-hidden effects that have no binding at all.
@@ -6110,6 +6360,23 @@ void finalizeParse(ParseContext& context) {
         context.scene->layerEffectVisible[layerName] = std::move(effVisible);
     }
 
+    // Fluid simulation (fluid-effect patch): the functions a script may run,
+    // per effect in the order getEffect() counts them.
+    if (context.quality.fluid) {
+        for (const auto& [layerName, layer] : context.effect_list_layers) {
+            std::vector<std::vector<std::string>> names;
+            bool                                  any = false;
+            for (size_t i = 0; i < layer->EffectCount(); i++) {
+                names.emplace_back();
+                for (const auto& fn : layer->GetEffect(i)->fluidFunctions) {
+                    names.back().push_back(fn.name);
+                    any = true;
+                }
+            }
+            if (any) context.scene->layerEffectFunctions[layerName] = std::move(names);
+        }
+    }
+
     wek::resolvePendingUserPropEffectVis(context.pending_user_prop_effect_vis,
                                          context.scene->nodeEffectLayerMap,
                                          context.scene->userPropEffectVisBindings);
@@ -6289,6 +6556,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     prescanScripts(context, json);
 
     prescanGroups(context, json, vfs, wp_objs, group_infos, json_order, obj_idx);
+    if (context.quality.fluid) readFluidEffects(context, json, vfs);
 
     // Create the image parser before the autosize ortho pre-pass so the
     // pre-pass populates its header cache, and subsequent ParseImageObj /
@@ -6308,6 +6576,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     InitContext(context, vfs, sc, std::move(imageParser));
     if (context.quality.feedback) context.shader_updater->SetPointerFeedback(true);
+    if (context.quality.fluid) context.shader_updater->SetFluidPointer(true);
     ParseCamera(context, sc, json);
 
     prescanDependencies(context, wp_objs);

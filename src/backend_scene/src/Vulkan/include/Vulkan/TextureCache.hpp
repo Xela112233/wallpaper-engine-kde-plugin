@@ -71,6 +71,11 @@ VkClearColorValue GenInitialClearColor(const TextureKey& key);
 void RecClearNewImage(const vvk::CommandBuffer& cmd, VkImage image, const VkClearColorValue& color,
                       VkImageLayout final_layout);
 
+// Fluid simulation (fluid-effect patch): clears whole an image that is in
+// use, between two frames' passes (it is in SHADER_READ_ONLY_OPTIMAL before
+// and after).
+void RecClearLiveImage(const vvk::CommandBuffer& cmd, VkImage image, const VkClearColorValue& color);
+
 // Leaves a fresh image in `final_layout` without touching its contents.  A
 // fresh image has nothing to wait for; the first writer's render pass starts
 // from UNDEFINED (clear) or from this layout (load).

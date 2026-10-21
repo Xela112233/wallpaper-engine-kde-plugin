@@ -201,6 +201,17 @@ public:
     bool isAborted() const;
 
     void mouseInput(double x, double y);
+    // Fluid simulation (fluid-effect patch).  A host calls these only with
+    // the screen's FluidSimulation on; a scene loaded without it takes no
+    // notice.  mouseLeftButton: the left button went down or up on the
+    // wallpaper.  mouseLeft: the cursor left the wallpaper; the next
+    // position that differs from its last one starts a new stroke and is not
+    // a move from there.  runEffectFunction: a
+    // script's IEffect.executeMaterialFunction(name) on effect effectIndex of
+    // layer nodeId.
+    void mouseLeftButton(bool down);
+    void mouseLeft();
+    void runEffectFunction(int32_t nodeId, int32_t effectIndex, const std::string& name);
     void updateText(int32_t id, const std::string& text);
     // GUI-thread-resolved "Now Playing" system-texture reupload (already
     // resized/crossfade-decided by the caller) -- enqueues onto the render

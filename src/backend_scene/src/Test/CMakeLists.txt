@@ -89,6 +89,8 @@ add_executable(backend_scene_tests
     test_SceneToRenderGraph_SelfWrite.cpp
     test_EffectFeedbackDefaults.cpp
     test_EffectFeedback.cpp
+    test_EffectFluidDefaults.cpp
+    test_EffectFluid.cpp
     test_SceneToRenderGraph_SelfWriteHazardScale.cpp
     test_SceneToRenderGraph_ReflectionTextureRead.cpp
     test_SceneToRenderGraph_TerminalPassthrough.cpp
@@ -464,6 +466,7 @@ if(Qt6_FOUND)
         test_SceneLocalStorageLayout.cpp
         test_SceneLocalStoragePerWallpaper.cpp
         test_SceneBackendEffectFeedback.cpp
+        test_SceneBackendEffectFluid.cpp
         test_SceneGraphApi.cpp
         # Not SceneScript-related, but this is the only test binary that links
         # wescene-renderer (SceneWallpaper.cpp's library) headlessly, and the

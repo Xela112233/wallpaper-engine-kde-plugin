@@ -39,6 +39,11 @@ struct IPropertyDispatchSink {
     virtual void
     applyLayerBatch(const std::vector<wallpaper::SceneWallpaper::LayerBatchUpdate>& batch) = 0;
     virtual void updateEffectVisible(int32_t nodeId, int32_t effectIndex, bool visible)    = 0;
+    // Fluid simulation (fluid-effect patch): a script's
+    // IEffect.executeMaterialFunction(name).  Not pure: a sink that does not
+    // know it drops the call.
+    virtual void runEffectFunction(int32_t /*nodeId*/, int32_t /*effectIndex*/,
+                                   std::string /*name*/) {}
     virtual void updateMaterialValue(int32_t nodeId, std::string name,
                                      std::vector<float> floats)                            = 0;
     virtual void updateEffectMaterialValue(int32_t nodeId, int32_t effectIdx, std::string name,
@@ -96,6 +101,9 @@ struct SceneWallpaperDispatchSink final : IPropertyDispatchSink {
     }
     void updateEffectVisible(int32_t nodeId, int32_t effectIndex, bool visible) override {
         m_scene->updateEffectVisible(nodeId, effectIndex, visible);
+    }
+    void runEffectFunction(int32_t nodeId, int32_t effectIndex, std::string name) override {
+        m_scene->runEffectFunction(nodeId, effectIndex, name);
     }
     void updateMaterialValue(int32_t nodeId, std::string name, std::vector<float> floats) override {
         m_scene->updateMaterialValue(nodeId, std::move(name), std::move(floats));

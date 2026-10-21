@@ -178,6 +178,19 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
         info.has_POINTERPOSITIONLAST = existsOp(G_POINTERPOSITIONLAST);
         info.has_FRAMETIME           = existsOp(G_FRAMETIME);
     }
+    if (m_fluidPointer) {
+        // The passes of a fluid effect read the cursor itself.
+        const auto data = m_nodeDataMap.find(pNode);
+        if (data != m_nodeDataMap.end() && data->second.fluidPointer) {
+            info.has_POINTERRAW          = info.has_POINTERPOSITION;
+            info.has_POINTERRAWLAST      = info.has_POINTERPOSITIONLAST;
+            info.has_POINTERSTATE        = existsOp(G_POINTERSTATE);
+            info.has_POINTERPOSITION     = false;
+            info.has_POINTERPOSITIONLAST = false;
+            info.fluid_pointer =
+                info.has_POINTERRAW || info.has_POINTERRAWLAST || info.has_POINTERSTATE;
+        }
+    }
 
     info.has_AUDIOSPECTRUM16LEFT  = existsOp(G_AUDIOSPECTRUM16LEFT);
     info.has_AUDIOSPECTRUM16RIGHT = existsOp(G_AUDIOSPECTRUM16RIGHT);
@@ -604,6 +617,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (info.has_POINTERPOSITION) updateOp(G_POINTERPOSITION, m_mousePos);
 
     if (info.has_POINTERPOSITIONLAST) updateOp(G_POINTERPOSITIONLAST, m_mousePosLast);
+
+    if (info.fluid_pointer) {
+        if (info.has_POINTERRAW) updateOp(G_POINTERPOSITION, m_pointerRaw);
+        if (info.has_POINTERRAWLAST) updateOp(G_POINTERPOSITIONLAST, m_pointerRawLast);
+        if (info.has_POINTERSTATE) updateOp(G_POINTERSTATE, m_pointerState);
+    }
 
     if (info.has_FRAMETIME)
         updateOp(G_FRAMETIME, (float)std::max(0.0, m_scene->elapsingTime - m_frameStartTime));

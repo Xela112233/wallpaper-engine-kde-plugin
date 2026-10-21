@@ -526,6 +526,22 @@ public:
 
     void setMousePos(double x, double y) { m_mouse_pos.store(std::array { (float)x, (float)y }); }
 
+    // Fluid simulation (fluid-effect patch).  The three are called only by a
+    // host that has the setting on; the frame reads what they left only when
+    // the loaded scene's value updater has it on (FluidPointer()).
+    void setMouseLeftDown(bool down) { m_mouse_left_down.store(down); }
+    // The position the cursor had when it left goes with the leave: the
+    // frame tells by it whether a position was told after the leave.
+    void setMouseLeft() {
+        m_mouse_left_at.store(m_mouse_pos.load());
+        m_mouse_left.store(true);
+    }
+    void runEffectFunction(i32 nodeId, i32 effectIndex, std::string name) {
+        std::lock_guard<std::mutex> lock(m_fluid_calls_mutex);
+        m_fluid_calls.emplace_back(nodeId, effectIndex, std::move(name));
+        m_fluid_calls_pending.store(true);
+    }
+
     void setTextUpdate(i32 id, const std::string& text) { m_queues.setTextUpdate(id, text); }
 
     void setSystemTextureUpdate(std::string key, std::shared_ptr<Image> image) {
@@ -838,6 +854,18 @@ private:
                 auto mousePos = wpUpdater->GetMousePosition();
                 scene->paritileSys->UpdateMouseControlPoints(mousePos,
                                                              { scene->ortho[0], scene->ortho[1] });
+                // Fluid simulation (fluid-effect patch): the cursor itself
+                // and its button for the fluid's shaders, and what scripts
+                // asked of an effect since the last frame.
+                if (wpUpdater->FluidPointer()) {
+                    // The leave first, then the position: a position told
+                    // after the leave is then never taken for one before it.
+                    const bool left   = m_mouse_left.exchange(false);
+                    const auto leftAt = m_mouse_left_at.load();
+                    wpUpdater->FluidPointerInput(
+                        m_mouse_pos.load(), m_mouse_left_down.load(), left, leftAt);
+                    if (m_fluid_calls_pending.exchange(false)) applyFluidCalls(*scene);
+                }
             }
 
             // Per-frame volumetric tick: recompute is_inside_this_frame from
@@ -2296,6 +2324,39 @@ private:
 
     RenderInitInfo                    m_init_info;
     std::atomic<std::array<float, 2>> m_mouse_pos { std::array { 0.5f, 0.5f } };
+    // Fluid simulation (fluid-effect patch), see setMouseLeftDown.
+    std::atomic<bool>                             m_mouse_left_down { false };
+    std::atomic<bool>                             m_mouse_left { false };
+    std::atomic<std::array<float, 2>>             m_mouse_left_at { std::array { 0.5f, 0.5f } };
+    std::atomic<bool>                             m_fluid_calls_pending { false };
+    std::mutex                                    m_fluid_calls_mutex;
+    std::vector<std::tuple<i32, i32, std::string>> m_fluid_calls;
+    // A script's IEffect.executeMaterialFunction: the kept targets the
+    // function lists go on the scene's list, which the renderer empties
+    // before the frame's passes.
+    void applyFluidCalls(Scene& scene) {
+        std::vector<std::tuple<i32, i32, std::string>> calls;
+        {
+            std::lock_guard<std::mutex> lock(m_fluid_calls_mutex);
+            calls.swap(m_fluid_calls);
+        }
+        for (const auto& [nodeId, effIdx, name] : calls) {
+            auto eit = scene.nodeEffectLayerMap.find(nodeId);
+            if (eit == scene.nodeEffectLayerMap.end()) continue;
+            auto* effLayer = eit->second;
+            if (effIdx < 0 || effIdx >= (i32)effLayer->EffectCount()) continue;
+            for (const auto& fn : effLayer->GetEffect((usize)effIdx)->fluidFunctions) {
+                if (fn.name != name) continue;
+                LOG_INFO("fluid simulation: node=%d effect=%d runs '%s' (%zu target(s))",
+                         nodeId,
+                         effIdx,
+                         name.c_str(),
+                         fn.clears.size());
+                scene.fluidClears.insert(
+                    scene.fluidClears.end(), fn.clears.begin(), fn.clears.end());
+            }
+        }
+    }
 
     // Published scene clock (m_scene->elapsingTime) — read cross-thread from QML.
     // Writers: this render thread after each PassFrameTime(). Readers: SceneBackend.
@@ -2444,6 +2505,17 @@ void SceneWallpaper::pause() {
 
 void SceneWallpaper::mouseInput(double x, double y) {
     m_main_handler->renderHandler()->setMousePos(x, y);
+}
+
+void SceneWallpaper::mouseLeftButton(bool down) {
+    m_main_handler->renderHandler()->setMouseLeftDown(down);
+}
+
+void SceneWallpaper::mouseLeft() { m_main_handler->renderHandler()->setMouseLeft(); }
+
+void SceneWallpaper::runEffectFunction(int32_t nodeId, int32_t effectIndex,
+                                       const std::string& name) {
+    m_main_handler->renderHandler()->runEffectFunction(nodeId, effectIndex, name);
 }
 
 void SceneWallpaper::updateText(int32_t id, const std::string& text) {

@@ -695,9 +695,14 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             m_uses_time_uniforms = UsesTimeUniforms(ref.blocks.front());
             // Effect feedback (fluid-targets patch): with it on, two more
             // globals change every frame.
-            if (scene.shaderValueUpdater && scene.shaderValueUpdater->SuppliesFrameUniforms())
+            if (scene.shaderValueUpdater && scene.shaderValueUpdater->SuppliesFrameUniforms()) {
                 m_uses_time_uniforms =
                     m_uses_time_uniforms || UsesFeedbackFrameUniforms(ref.blocks.front());
+                // Fluid simulation (fluid-effect patch): and the button.
+                if (scene.shaderValueUpdater->SuppliesPointerState())
+                    m_uses_time_uniforms = m_uses_time_uniforms ||
+                                           exists(ref.blocks.front().member_map, G_POINTERSTATE);
+            }
         }
 
         auto& bindings = descriptor_info.bindings;

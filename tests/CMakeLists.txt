@@ -337,6 +337,18 @@ if(Qt6Gui_FOUND AND Qt6Quick_FOUND)
     endif()
     add_test(NAME tst_mousegrabber COMMAND tst_mousegrabber -v2)
 
+    # ── MouseGrabber: a hover leave passed on only when told (fluid-effect patch)
+    add_executable(tst_mousegrabber_leave
+        tst_mousegrabber_leave.cpp
+        ${WEKDE_SRC_DIR}/MouseGrabber.cpp
+    )
+    target_include_directories(tst_mousegrabber_leave PRIVATE ${WEKDE_SRC_DIR})
+    target_link_libraries(tst_mousegrabber_leave PRIVATE
+        Qt6::Core Qt6::Test Qt6::Gui Qt6::Quick)
+    add_test(NAME tst_mousegrabber_leave COMMAND tst_mousegrabber_leave -v2)
+    set_tests_properties(tst_mousegrabber_leave PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # ── KeyGrabber keyboard-mode tests (we-manager input patch) ───────────────
     add_executable(tst_keygrabber
         tst_keygrabber.cpp

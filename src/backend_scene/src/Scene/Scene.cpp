@@ -44,6 +44,12 @@ std::string Scene::SerializeLayerInitialStates() const {
                 auto& efv = entry["efv"] = nlohmann::json::array();
                 for (bool v : vit->second) efv.push_back(v ? 1 : 0);
             }
+            // Fluid simulation (fluid-effect patch): the functions a script
+            // may run on each effect, only for a layer that has any.
+            if (! layerEffectFunctions.empty()) {
+                auto fit = layerEffectFunctions.find(name);
+                if (fit != layerEffectFunctions.end()) entry["efn"] = fit->second;
+            }
         }
         // Node id for setParent bridge dispatch.
         auto idit = nodeNameToId.find(name);

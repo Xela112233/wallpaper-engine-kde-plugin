@@ -833,6 +833,9 @@ void SceneObject::sendSceneQuality() {
     if (switched("flatMsaa", 1)) text += ";flatMsaa=1";
     // Effect feedback (fluid-targets patch): named only when the map has it on.
     if (switched("feedback", 1)) text += ";feedback=1";
+    // Fluid simulation (fluid-effect patch): likewise.
+    m_fluidInput = switched("fluid", 1);
+    if (m_fluidInput) text += ";fluid=1";
     SET_PROPERTY(String, wallpaper::PROPERTY_SCENE_QUALITY, text);
 }
 
@@ -2457,6 +2460,7 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
     // Before the no-target return: a script that polls input.cursorLeftDown
     // needs no cursor handler of its own.
     if (event->button() == Qt::LeftButton) setCursorLeftDown(m_inputObj, true);
+    if (m_fluidInput && m_scene && event->button() == Qt::LeftButton) m_scene->mouseLeftButton(true);
     if (m_cursorTargets.empty() || ! m_jsEngine) return;
 
 #if (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
@@ -2648,10 +2652,19 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
 
 // The press is lost without a release (another item took the mouse, or the
 // window lost it): the button no longer counts as down for polling scripts.
-void SceneObject::mouseUngrabEvent() { setCursorLeftDown(m_inputObj, false); }
+void SceneObject::mouseUngrabEvent() {
+    setCursorLeftDown(m_inputObj, false);
+    if (m_fluidInput && m_scene) m_scene->mouseLeftButton(false);
+}
+
+void SceneObject::hoverLeaveEvent(QHoverEvent* event) {
+    if (m_fluidInput && m_scene) m_scene->mouseLeft();
+    QQuickItem::hoverLeaveEvent(event);
+}
 
 void SceneObject::mouseReleaseEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton) setCursorLeftDown(m_inputObj, false);
+    if (m_fluidInput && m_scene && event->button() == Qt::LeftButton) m_scene->mouseLeftButton(false);
     if (m_cursorTargets.empty() || ! m_jsEngine) {
         m_dragTarget.clear();
         return;
@@ -6291,6 +6304,15 @@ void SceneObject::evaluatePropertyScripts() {
                 int      cmdCount = cmds.property("length").toInt();
                 for (int c = 0; c < cmdCount; c++) {
                     QString cmd = cmds.property(c).toString();
+                    // Fluid simulation (fluid-effect patch): "efn:<effect>:<name>",
+                    // which only a scene loaded with the setting on can send.
+                    if (m_fluidInput && cmd.startsWith(QLatin1String("efn:"))) {
+                        const int sep = cmd.indexOf(QLatin1Char(':'), 4);
+                        if (sep > 4)
+                            m_dispatch->runEffectFunction(
+                                id, cmd.mid(4, sep - 4).toInt(), cmd.mid(sep + 1).toStdString());
+                        continue;
+                    }
                     if (! cmd.startsWith("panim_")) continue;
                     int sep = cmd.indexOf(':');
                     if (sep < 0) continue;

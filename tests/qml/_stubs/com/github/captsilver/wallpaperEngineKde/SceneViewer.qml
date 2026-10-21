@@ -26,7 +26,7 @@ Item {
     property int    processPriority: 0   // 0 normal, 1 below normal, 2 low (ProcessPriority)
     property bool   cameraParallax: true   // false: the scene's camera parallax stays off
     property bool   pixelArt:       false  // true: nearest-neighbour textures and output
-    property var    sceneQuality:   ({})   // {textures: 0 full, 1 performance, 2 automatic} (texture-quality patch); feedback: 1 only with EffectFeedback on (fluid-targets patch)
+    property var    sceneQuality:   ({})   // {textures: 0 full, 1 performance, 2 automatic} (texture-quality patch); feedback: 1 only with EffectFeedback or FluidSimulation on (fluid-targets patch); fluid: 1 only with FluidSimulation on (fluid-effect patch)
     property int    vramMiB:        0      // what the scene holds after its first frame; tests set it
     property bool   storagePerWallpaper: false  // localstorage patch: LocalStoragePerWallpaper
     property string storageScreen:  ""     // the screen of LOCATION_SCREEN (the output's connector)

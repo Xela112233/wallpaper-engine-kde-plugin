@@ -167,6 +167,48 @@ void RecClearNewImage(const vvk::CommandBuffer& cmd, VkImage image, const VkClea
         VK_PIPELINE_STAGE_TRANSFER_BIT, kFirstUseStages, VK_DEPENDENCY_BY_REGION_BIT, to_final);
 }
 
+// Fluid simulation (fluid-effect patch).  The image is one a pass or a copy
+// left in SHADER_READ_ONLY_OPTIMAL, as every render target is between two
+// passes; what drew into it or sampled it last is waited for.
+void RecClearLiveImage(const vvk::CommandBuffer& cmd, VkImage image, const VkClearColorValue& color) {
+    const VkImageSubresourceRange range {
+        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel   = 0,
+        .levelCount     = VK_REMAINING_MIP_LEVELS,
+        .baseArrayLayer = 0,
+        .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+    };
+    const VkImageMemoryBarrier to_dst {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext            = nullptr,
+        .srcAccessMask    = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .image            = image,
+        .subresourceRange = range,
+    };
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | kFirstUseStages,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0,
+                        to_dst);
+
+    cmd.ClearColorImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, range);
+
+    const VkImageMemoryBarrier to_read {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext            = nullptr,
+        .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask    = kFirstUseAccess,
+        .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .image            = image,
+        .subresourceRange = range,
+    };
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, kFirstUseStages, 0, to_read);
+}
+
 void RecTransitionNewImage(const vvk::CommandBuffer& cmd, VkImage image,
                            VkImageLayout final_layout) {
     const VkImageMemoryBarrier barrier {

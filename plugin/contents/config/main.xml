@@ -226,6 +226,10 @@
       <label>Scene effects that carry a picture over from frame to frame (cursor trails, fluids): on, the render targets such an effect reads before it has drawn into them keep their image between frames and change places instead of being copied, and shaders get the pointer's last position (g_PointerPositionLast) and the frame time (g_Frametime); off, scenes are drawn as before</label>
       <default>false</default>
     </entry>
+    <entry name="FluidSimulation" type="Bool">
+      <label>Wallpaper Engine's fluid simulation effect: on, effects that carry a picture over between frames are on with it (EffectFeedback need not be), and such an effect is built with the parts of its file the fluid effect uses (passes and textures with conditions, render targets with a fixed size and a start colour, functions a script runs to clear them) and reads the cursor where it is, with the left button (g_PointerState); off, none of it runs and scenes are drawn as before</label>
+      <default>false</default>
+    </entry>
     <entry name="ProcessPriority" type="Int">
       <label>CPU priority of the scene renderer's threads: 0 = normal, 1 = below normal (nice 5), 2 = low (nice 10); low also asks the GPU for a low-priority queue where the driver offers one</label>
       <default>0</default>

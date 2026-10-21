@@ -1,5 +1,7 @@
 #pragma once
 #include <vector>
+#include <array>
+#include <utility>
 #include <list>
 #include <memory>
 #include <cstdint>
@@ -47,6 +49,16 @@ struct SceneImageEffect {
     // runs every command of the effect where the effect file has it, also
     // several at one place and those after the last pass.
     bool feedback { false };
+
+    // Fluid simulation (fluid-effect patch; empty unless FluidSimulation is
+    // on and the effect file has "functions"): what a script runs with
+    // IEffect.executeMaterialFunction(name).  A function puts the kept render
+    // targets it lists back to a colour.
+    struct FluidFunction {
+        std::string                                                 name;
+        std::vector<std::pair<std::string, std::array<float, 4>>> clears;
+    };
+    std::vector<FluidFunction> fluidFunctions;
 };
 
 class SceneImageEffectLayer {

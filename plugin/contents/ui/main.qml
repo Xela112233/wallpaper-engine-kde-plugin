@@ -99,6 +99,18 @@ Rectangle {
     // main.xml EffectFeedback): Scene.qml adds it to SceneViewer.sceneQuality
     // only when on, so off the scene gets what it got before the patch.
     property bool   effectFeedback: wallpaper.configuration.EffectFeedback === true
+    // Wallpaper Engine's fluid simulation effect (fluid-effect patch,
+    // main.xml FluidSimulation): Scene.qml adds it, and effect feedback with
+    // it, to SceneViewer.sceneQuality only when on.
+    property bool   fluidSimulation: wallpaper.configuration.FluidSimulation === true
+    // The scene has to know when the cursor leaves the desktop, so that its
+    // return somewhere else is not a move across the picture.  The pointer
+    // hook passes the leave on only when told to: it is told when it is made
+    // with the setting on (doHookMouse) and here, when the setting changes.
+    // With the setting off and left alone, neither runs.
+    onFluidSimulationChanged: {
+        if (background.mouseHooker) background.mouseHooker.hoverLeaveToTarget = background.fluidSimulation === true;
+    }
     // SceneScript localStorage per wallpaper and per screen (localstorage
     // patch, main.xml LocalStoragePerWallpaper): Scene.qml hands both to
     // SceneViewer.  storageScreen is the screen whose LOCATION_SCREEN values
@@ -1138,6 +1150,8 @@ Rectangle {
             console.warn("[WEK] MouseHook: found target " + hookParent);
             if(background.mouseHooker) background.mouseHooker.destroy();
             background.mouseHooker = mouseHookerComponent.createObject(hookParent);
+            // Fluid simulation (fluid-effect patch): see onFluidSimulationChanged.
+            if (background.fluidSimulation === true) background.mouseHooker.hoverLeaveToTarget = true;
             return true;
        }
        return false;

@@ -73,6 +73,14 @@ struct WPUniformInfo {
     // Effect feedback (fluid-targets patch): asked for only with it on.
     bool has_POINTERPOSITIONLAST { false };
     bool has_FRAMETIME { false };
+    // Fluid simulation (fluid-effect patch): a node whose shader reads the
+    // cursor itself (WPShaderValueData::fluidPointer).  fluid_pointer says
+    // one of the three below is set; has_POINTERPOSITION and
+    // has_POINTERPOSITIONLAST are then false.
+    bool fluid_pointer { false };
+    bool has_POINTERRAW { false };
+    bool has_POINTERRAWLAST { false };
+    bool has_POINTERSTATE { false };
 
     bool has_AUDIOSPECTRUM16LEFT { false };
     bool has_AUDIOSPECTRUM16RIGHT { false };
@@ -135,6 +143,11 @@ struct WPShaderValueData {
     std::vector<std::pair<usize, std::string>> renderTargets;
 
     WPPuppetLayer puppet_layer;
+
+    // Fluid simulation (fluid-effect patch): set by the parser, with the
+    // setting on, for the passes of an effect that carries over between
+    // frames (WPShaderValueUpdater::SetFluidPointer).
+    bool fluidPointer { false };
 };
 
 struct WPCameraParallax {
@@ -273,6 +286,58 @@ public:
     bool SuppliesFrameUniforms() const override { return m_pointerFeedback; }
     std::array<float, 2> GetMousePositionLast() const { return m_mousePosLast; }
 
+    // Fluid simulation (fluid-effect patch, SceneQuality::fluid).  On, the
+    // passes the parser marked (WPShaderValueData::fluidPointer) read the
+    // cursor as Wallpaper Engine's shaders do:
+    // * g_PointerPosition is where the cursor is, as the wallpaper was last
+    //   told, without the delay the camera parallax gives the pointer that
+    //   every other shader sees;
+    // * g_PointerPositionLast is where it was in the frame before.  The two
+    //   are equal whenever the position is the start of a new stroke and not
+    //   a move from the last one: in the first frame, at the first position
+    //   that differs from the first frame's (when the scene loads, the cursor
+    //   may be anywhere, and the position it starts with is an old one), and
+    //   at the first position told after the cursor left the wallpaper;
+    // * g_PointerState tells the left button: its first and third value are
+    //   1 while the button is held on the wallpaper, the others 0.
+    // FluidPointerInput is called once a frame, after MouseInput, with the
+    // position the wallpaper was last told, and, when it was told since the
+    // last call that the cursor left, the position the cursor had then
+    // (cursorLeft, leftAt).  The cursor is away from then until a position
+    // arrives that is not leftAt: a move that came before the leave between
+    // the same two frames is still a move, and the return, in the same frame
+    // or many frames later, is the new stroke.
+    // Off, nothing here runs or is kept.
+    void SetFluidPointer(bool on) { m_fluidPointer = on; }
+    bool FluidPointer() const { return m_fluidPointer; }
+    bool SuppliesPointerState() const override { return m_fluidPointer; }
+    void FluidPointerInput(std::array<float, 2> position, bool leftDown, bool cursorLeft,
+                           std::array<float, 2> leftAt) {
+        bool newStroke = false;
+        if (! m_pointerRawSeen) {
+            // A scene starts with the cursor away, at wherever it was last.
+            m_pointerRawSeen = true;
+            m_pointerAway    = true;
+            m_pointerAwayAt  = position;
+            newStroke        = true;
+        }
+        if (cursorLeft) {
+            m_pointerAway   = true;
+            m_pointerAwayAt = leftAt;
+        }
+        if (m_pointerAway && position != m_pointerAwayAt) {
+            m_pointerAway = false;
+            newStroke     = true;
+        }
+        m_pointerRawLast = newStroke ? position : m_pointerRaw;
+        m_pointerRaw     = position;
+        m_pointerState.fill(0.0f);
+        if (leftDown) m_pointerState[0] = m_pointerState[2] = 1.0f;
+    }
+    std::array<float, 2> GetFluidPointer() const { return m_pointerRaw; }
+    std::array<float, 2> GetFluidPointerLast() const { return m_pointerRawLast; }
+    std::array<float, 4> GetFluidPointerState() const { return m_pointerState; }
+
 private:
     Scene*               m_scene;
     WPCameraParallax     m_parallax;
@@ -286,6 +351,13 @@ private:
     bool                 m_pointerFeedback { false };
     std::array<float, 2> m_mousePosLast { 0.5f, 0.5f };
     double               m_frameStartTime { 0.0 };
+    bool                 m_fluidPointer { false };
+    bool                 m_pointerRawSeen { false };
+    bool                 m_pointerAway { false };
+    std::array<float, 2> m_pointerAwayAt { 0.5f, 0.5f };
+    std::array<float, 2> m_pointerRaw { 0.5f, 0.5f };
+    std::array<float, 2> m_pointerRawLast { 0.5f, 0.5f };
+    std::array<float, 4> m_pointerState { 0.0f, 0.0f, 0.0f, 0.0f };
     double               m_mouseDelayedTime { 0.0f };
 
     std::chrono::time_point<std::chrono::steady_clock> m_last_mouse_input_time;

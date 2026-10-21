@@ -400,6 +400,9 @@ protected:
     void mouseUngrabEvent() override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void hoverMoveEvent(QHoverEvent* event) override;
+    // Fluid simulation (fluid-effect patch): with the setting on, tells the
+    // scene that the cursor's next position is not a move from its last.
+    void hoverLeaveEvent(QHoverEvent* event) override;
 
 public slots:
     void resizeFb();
@@ -490,6 +493,10 @@ private:
     bool        m_cameraParallax { true };
     bool        m_pixelArt { false };
     QVariantMap m_sceneQuality;
+    // Fluid simulation (fluid-effect patch): the quality map says fluid.
+    // Then, and only then, the scene is told of the left button and of the
+    // cursor leaving, and a script's effect function is passed on.
+    bool        m_fluidInput { false };
     // The Vulkan target size updatePaintNode made (0 x 0 before): Automatic's target.
     int         m_targetWidth { 0 };
     int         m_targetHeight { 0 };

@@ -127,6 +127,8 @@ ColumnLayout {
     property int    cfg_WebRenderScale
     // Effect feedback (fluid-targets patch): SettingPage's switch.
     property bool   cfg_EffectFeedback
+    // Fluid simulation (fluid-effect patch): SettingPage's switch.
+    property bool   cfg_FluidSimulation
     property int    cfg_ProcessPriority
     property int    cfg_ShareRenderer
     property int    cfg_SpanGroup

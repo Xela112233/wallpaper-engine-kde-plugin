@@ -538,6 +538,23 @@ Flickable {
                 }
             }
             OptionItem {
+                text: i18nc("@label settings option", "Fluid simulation")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: Switch {
+                    checked: cfg_FluidSimulation
+                    onToggled: cfg_FluidSimulation = checked
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info fluid simulation help text", "For Wallpaper Engine's fluid simulation effect, which the cursor stirs. Turns on effects that carry over between frames as well, whatever the switch above says, and gives such effects what the fluid needs: passes that are only drawn with certain options, a simulation grid of a fixed size, a start colour, clearing by a script, and the cursor where it is with its left button. Off, none of this runs and scenes are drawn as before. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
                 text: i18nc("@label settings option", "Anti-aliasing")
                 text_color: Kirigami.Theme.textColor
                 icon: '../../images/window.svg'

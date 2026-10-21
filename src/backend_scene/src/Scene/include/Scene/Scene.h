@@ -4,6 +4,8 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <array>
+#include <cstdint>
 #include <string>
 
 #include "SceneTexture.h"
@@ -756,6 +758,26 @@ public:
     // takes second's, all of one effect at once).
     std::unordered_set<std::string>                               feedbackTargets;
     std::vector<std::vector<std::pair<std::string, std::string>>> feedbackMoves;
+
+    // Fluid simulation (fluid-effect patch; all empty unless the screen's
+    // FluidSimulation is on and the scene has an effect that uses the part,
+    // see EffectFluid.hpp).
+    // fluidFit: render targets of a full-screen layer's effect whose "fbos"
+    // entry has "fit": the name and the pixels of the longer side; the
+    // renderer sizes them when it knows the output's size.
+    // fluidStart: kept render targets and the colour their "fbos" entry
+    // starts them with ("clear"), where that is not transparent black; the
+    // renderer puts it there whenever it has made the targets anew.
+    // fluidClears: kept render targets a script asked to be put back to a
+    // colour (IEffect.executeMaterialFunction); the renderer does it before
+    // the next frame's passes and empties the list.
+    // layerEffectFunctions: layer name to, per effect of
+    // layerEffectNames[name], the names a script may run.
+    using FluidColour = std::array<float, 4>;
+    std::map<std::string, std::int32_t>                                    fluidFit;
+    std::map<std::string, FluidColour>                                     fluidStart;
+    std::vector<std::pair<std::string, FluidColour>>                       fluidClears;
+    std::unordered_map<std::string, std::vector<std::vector<std::string>>> layerEffectFunctions;
 
     // Non-throwing render-target lookup.  Returns nullptr when `name` is
     // absent instead of throwing std::out_of_range like renderTargets.at().

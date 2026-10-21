@@ -34,6 +34,27 @@ void MouseGrabber::setForceCapture(bool value) {
     Q_EMIT forceCaptureChanged();
 }
 
+bool MouseGrabber::hoverLeaveToTarget() const { return m_hoverLeaveToTarget; }
+
+void MouseGrabber::setHoverLeaveToTarget(bool value) {
+    if (value == m_hoverLeaveToTarget) return;
+    m_hoverLeaveToTarget = value;
+    // No handler of this item is changed for the leave: with the setting
+    // off, an event takes the way through the item it always took.
+    if (value) {
+        installEventFilter(this);
+    } else {
+        removeEventFilter(this);
+    }
+    Q_EMIT hoverLeaveToTargetChanged();
+}
+
+bool MouseGrabber::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == this && event->type() == QEvent::HoverLeave)
+        sendHoverEvent(static_cast<QHoverEvent*>(event));
+    return QQuickItem::eventFilter(watched, event);
+}
+
 void MouseGrabber::setTarget(QQuickItem* item) {
     if (item == m_target) return;
     // Restore the OLD target's accepted-button mask to whatever the QML

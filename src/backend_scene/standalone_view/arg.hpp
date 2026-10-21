@@ -254,6 +254,13 @@ void setAndParseArg(argparse::ArgumentParser& arg, int argc, char** argv) {
         .default_value(std::string())
         .nargs(1);
 
+    arg.add_argument("--pointer")
+        .help("sceneviewer only: where the cursor stands, 'x,y' in 0..1 of the window from its "
+              "top left, with ',down' while the left button is held (which a scene takes "
+              "notice of with --scene-quality 'fluid=1'); empty sends nothing")
+        .default_value(std::string())
+        .nargs(1);
+
     arg.add_argument("--hide-pattern")
         .help("debug: hide any scene object whose name contains any of the "
               "comma-separated substrings (e.g. 'hair' or 'hair c1,hair top')")

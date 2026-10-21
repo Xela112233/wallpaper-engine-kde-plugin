@@ -23,6 +23,13 @@ class MouseGrabber : public QQuickItem {
     Q_OBJECT
     Q_PROPERTY(bool forceCapture READ forceCapture WRITE setForceCapture NOTIFY forceCaptureChanged)
     Q_PROPERTY(QQuickItem* target READ target WRITE setTarget NOTIFY targetChanged)
+    // Fluid simulation (fluid-effect patch): off (the default), the grabber
+    // does with a hover leave what it always did, nothing.  On, the target is
+    // sent the leave as well, so a scene learns that the cursor went off the
+    // desktop (onto a window, a panel, another screen).  main.qml sets it
+    // only while the screen's FluidSimulation is on.
+    Q_PROPERTY(bool hoverLeaveToTarget READ hoverLeaveToTarget WRITE setHoverLeaveToTarget NOTIFY
+                   hoverLeaveToTargetChanged)
 
 public:
     MouseGrabber(QQuickItem* parent = nullptr);
@@ -33,6 +40,13 @@ public:
 
     void setForceCapture(bool);
     void setTarget(QQuickItem*);
+
+    bool hoverLeaveToTarget() const;
+    void setHoverLeaveToTarget(bool);
+    // Sees this item's own events, and only while hoverLeaveToTarget is on
+    // (the item is its own event filter then, and at no other time): it
+    // passes a hover leave on and takes nothing away.
+    bool eventFilter(QObject*, QEvent*) override;
 
     Q_INVOKABLE void sendEvent(QObject*, QEvent*);
 
@@ -50,6 +64,7 @@ protected:
 signals:
     void forceCaptureChanged();
     void targetChanged();
+    void hoverLeaveToTargetChanged();
 
 private:
     void                 sendMouseEvent(QMouseEvent*);
@@ -66,6 +81,7 @@ private:
     // ends it with a release, so the target is not left with the button down.
     void                 endPress();
     bool                 m_forceCapture { false };
+    bool                 m_hoverLeaveToTarget { false };
     QPointer<QQuickItem> m_target { nullptr };
     // Snapshot of m_target->acceptedMouseButtons() captured BEFORE the grabber
     // overwrites it with Qt::LeftButton. Restored on detach (target change or

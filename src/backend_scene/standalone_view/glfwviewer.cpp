@@ -2,6 +2,7 @@
 #include <set>
 #include <fstream>
 #include <csignal>
+#include <cstdio>
 #include <chrono>
 #include <thread>
 
@@ -187,6 +188,20 @@ int main(int argc, char** argv) {
     }
     psw->setPropertyString(wallpaper::PROPERTY_ASSETS, g_assets);
     psw->setPropertyString(wallpaper::PROPERTY_SOURCE, g_scene);
+    // --pointer: a cursor that stands still, for pictures taken without a
+    // person at the mouse; without the option nothing is sent.
+    if (const auto pointer = program.get<std::string>("--pointer"); ! pointer.empty()) {
+        double x = 0.5, y = 0.5;
+        char   down[8] { 0 };
+        const int n = std::sscanf(pointer.c_str(), "%lf,%lf,%7s", &x, &y, down);
+        if (n >= 2) {
+            std::cout << "--pointer: " << pointer << std::endl;
+            psw->mouseInput(x, y);
+            if (n == 3 && std::string(down) == "down") psw->mouseLeftButton(true);
+        } else {
+            std::cerr << "--pointer wants 'x,y' or 'x,y,down', got " << pointer << std::endl;
+        }
+    }
     // Print a one-line discoverability hint so new users find the help
     // overlay without spelunking the source.
     std::cout << "sceneviewer running — press H for keyboard shortcuts." << std::endl;

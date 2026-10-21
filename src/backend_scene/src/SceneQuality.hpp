@@ -84,6 +84,13 @@ struct SceneQuality {
     // g_Frametime get them.  Named in the text only when on, like the
     // switches above.
     bool         feedback { false };
+    // Fluid simulation (fluid-effect patch, main.xml FluidSimulation), key
+    // "fluid": off, nothing of that patch runs.  On, effect feedback is on
+    // with it (the text need not name both), and an effect that carries over
+    // between frames is built with the parts of its file that Wallpaper
+    // Engine's fluid simulation uses (EffectFluid.hpp) and reads the cursor
+    // as that effect does.  Named in the text only when on.
+    bool         fluid { false };
 
     bool operator==(const SceneQuality&) const = default;
 
@@ -115,7 +122,10 @@ struct SceneQuality {
                 q.flatMsaa = static_cast<FlatMsaa>(v);
             else if (key == "feedback" && v >= 0 && v <= 1)
                 q.feedback = v == 1;
+            else if (key == "fluid" && v >= 0 && v <= 1)
+                q.fluid = v == 1;
         }
+        if (q.fluid) q.feedback = true;
         return q;
     }
 
@@ -128,6 +138,7 @@ struct SceneQuality {
         if (reflections != Reflections::Scene) text += ";reflections=" + std::to_string((int)reflections);
         if (flatMsaa != FlatMsaa::AsSet) text += ";flatMsaa=" + std::to_string((int)flatMsaa);
         if (feedback) text += ";feedback=1";
+        if (fluid) text += ";fluid=1";
         return text;
     }
 

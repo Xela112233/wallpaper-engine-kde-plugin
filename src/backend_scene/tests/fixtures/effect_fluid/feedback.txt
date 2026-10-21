@@ -1,0 +1,168 @@
+[effects]
+layer 10: _rt_effect_pingpong_a_@1 _rt_effect_pingpong_b_@1
+  effect tint
+    node -> _rt_default <- _rt_effect_pingpong_a_@1
+layer 20: _rt_effect_pingpong_a_@2 _rt_effect_pingpong_b_@2
+  effect fluidsimulation
+    node -> _rt__rt_SmokeCurl_fb0_@3 <- _rt__rt_SmokeVelocity1_fb0_@3
+    node -> _rt__rt_SmokeVelocity2_fb0_@3 <- _rt__rt_SmokeVelocity1_fb0_@3, _rt__rt_SmokeCurl_fb0_@3
+    node -> _rt__rt_SmokeDivergence_fb0_@3 <- _rt__rt_SmokeVelocity2_fb0_@3
+    node -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3
+    node -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+    node -> _rt__rt_SmokeVelocity1_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeVelocity2_fb0_@3
+    node -> _rt__rt_SmokeVelocity2_fb0_@3 <- _rt__rt_SmokeVelocity1_fb0_@3, _rt__rt_SmokeVelocity1_fb0_@3
+    node -> _rt__rt_SmokeDye2_fb0_@3 <- _rt__rt_SmokeVelocity2_fb0_@3, _rt__rt_SmokeDye1_fb0_@3, _rt_effect_pingpong_a_@2
+    node -> _rt__rt_SmokeNormal_@3 <- _rt__rt_SmokeDye2_fb0_@3
+    node -> _rt_default <- _rt_effect_pingpong_a_@2, _rt__rt_SmokeDye2_fb0_@3, _rt__rt_SmokeNormal_@3, -, _rt__rt_SmokeVelocity2_fb0_@3
+layer 30: _rt_effect_pingpong_a_@4 _rt_effect_pingpong_b_@4
+  effect fluidsimulation
+    node -> _rt__rt_SmokeCurl_fb0_@5 <- _rt__rt_SmokeVelocity1_fb0_@5
+    node -> _rt__rt_SmokeVelocity2_fb0_@5 <- _rt__rt_SmokeVelocity1_fb0_@5, _rt__rt_SmokeCurl_fb0_@5
+    node -> _rt__rt_SmokeDivergence_fb0_@5 <- _rt__rt_SmokeVelocity2_fb0_@5
+    node -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5
+    node -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+    node -> _rt__rt_SmokeVelocity1_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeVelocity2_fb0_@5
+    node -> _rt__rt_SmokeVelocity2_fb0_@5 <- _rt__rt_SmokeVelocity1_fb0_@5, _rt__rt_SmokeVelocity1_fb0_@5
+    node -> _rt__rt_SmokeDye2_fb0_@5 <- _rt__rt_SmokeVelocity2_fb0_@5, _rt__rt_SmokeDye1_fb0_@5, _rt_effect_pingpong_a_@4
+    node -> _rt__rt_SmokeNormal_@5 <- _rt__rt_SmokeDye2_fb0_@5
+    node -> _rt_default <- _rt_effect_pingpong_a_@4, _rt__rt_SmokeDye2_fb0_@5, _rt__rt_SmokeNormal_@5, -, _rt__rt_SmokeVelocity2_fb0_@5
+layer 40: _rt_effect_pingpong_a_@6 _rt_effect_pingpong_b_@6
+  effect fluidsimulation
+    node -> _rt__rt_SmokeCurl_fb0_@7 <- _rt__rt_SmokeVelocity1_fb0_@7
+    node -> _rt__rt_SmokeVelocity2_fb0_@7 <- _rt__rt_SmokeVelocity1_fb0_@7, _rt__rt_SmokeCurl_fb0_@7
+    node -> _rt__rt_SmokeDivergence_fb0_@7 <- _rt__rt_SmokeVelocity2_fb0_@7
+    node -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7
+    node -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+    node -> _rt__rt_SmokeVelocity1_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeVelocity2_fb0_@7
+    node -> _rt__rt_SmokeVelocity2_fb0_@7 <- _rt__rt_SmokeVelocity1_fb0_@7, _rt__rt_SmokeVelocity1_fb0_@7
+    node -> _rt__rt_SmokeDye2_fb0_@7 <- _rt__rt_SmokeVelocity2_fb0_@7, _rt__rt_SmokeDye1_fb0_@7, _rt_effect_pingpong_a_@6
+    node -> _rt__rt_SmokeNormal_@7 <- _rt__rt_SmokeDye2_fb0_@7
+    node -> _rt_default <- _rt_effect_pingpong_a_@6, _rt__rt_SmokeDye2_fb0_@7, _rt__rt_SmokeNormal_@7, -, _rt__rt_SmokeVelocity2_fb0_@7
+[passes]
+draw -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7
+draw -> _rt__rt_SmokeCurl_fb0_@7 <- _rt__rt_SmokeVelocity1_fb0_@7
+draw -> _rt__rt_SmokeVelocity2_fb0_@7 <- _rt__rt_SmokeVelocity1_fb0_@7, _rt__rt_SmokeCurl_fb0_@7
+draw -> _rt__rt_SmokeDivergence_fb0_@7 <- _rt__rt_SmokeVelocity2_fb0_@7
+draw -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure2_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokePressure1_fb0_@7 <- _rt__rt_SmokePressure2_fb0_@7, _rt__rt_SmokeDivergence_fb0_@7
+draw -> _rt__rt_SmokeVelocity1_fb0_@7 <- _rt__rt_SmokePressure1_fb0_@7, _rt__rt_SmokeVelocity2_fb0_@7
+draw -> _rt__rt_SmokeVelocity2_fb0_@7 <- _rt__rt_SmokeVelocity1_fb0_@7, _rt__rt_SmokeVelocity1_fb0_@7
+draw -> _rt_effect_pingpong_a_@6 <- 
+draw -> _rt__rt_SmokeDye2_fb0_@7 <- _rt__rt_SmokeVelocity2_fb0_@7, _rt__rt_SmokeDye1_fb0_@7, _rt_effect_pingpong_a_@6
+draw -> _rt__rt_SmokeNormal_@7 <- _rt__rt_SmokeDye2_fb0_@7
+draw -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5
+draw -> _rt__rt_SmokeCurl_fb0_@5 <- _rt__rt_SmokeVelocity1_fb0_@5
+draw -> _rt__rt_SmokeVelocity2_fb0_@5 <- _rt__rt_SmokeVelocity1_fb0_@5, _rt__rt_SmokeCurl_fb0_@5
+draw -> _rt__rt_SmokeDivergence_fb0_@5 <- _rt__rt_SmokeVelocity2_fb0_@5
+draw -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure2_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokePressure1_fb0_@5 <- _rt__rt_SmokePressure2_fb0_@5, _rt__rt_SmokeDivergence_fb0_@5
+draw -> _rt__rt_SmokeVelocity1_fb0_@5 <- _rt__rt_SmokePressure1_fb0_@5, _rt__rt_SmokeVelocity2_fb0_@5
+draw -> _rt__rt_SmokeVelocity2_fb0_@5 <- _rt__rt_SmokeVelocity1_fb0_@5, _rt__rt_SmokeVelocity1_fb0_@5
+draw -> _rt_effect_pingpong_a_@4 <- 
+draw -> _rt__rt_SmokeDye2_fb0_@5 <- _rt__rt_SmokeVelocity2_fb0_@5, _rt__rt_SmokeDye1_fb0_@5, _rt_effect_pingpong_a_@4
+draw -> _rt__rt_SmokeNormal_@5 <- _rt__rt_SmokeDye2_fb0_@5
+draw -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3
+draw -> _rt__rt_SmokeCurl_fb0_@3 <- _rt__rt_SmokeVelocity1_fb0_@3
+draw -> _rt__rt_SmokeVelocity2_fb0_@3 <- _rt__rt_SmokeVelocity1_fb0_@3, _rt__rt_SmokeCurl_fb0_@3
+draw -> _rt__rt_SmokeDivergence_fb0_@3 <- _rt__rt_SmokeVelocity2_fb0_@3
+draw -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure2_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokePressure1_fb0_@3 <- _rt__rt_SmokePressure2_fb0_@3, _rt__rt_SmokeDivergence_fb0_@3
+draw -> _rt__rt_SmokeVelocity1_fb0_@3 <- _rt__rt_SmokePressure1_fb0_@3, _rt__rt_SmokeVelocity2_fb0_@3
+draw -> _rt__rt_SmokeVelocity2_fb0_@3 <- _rt__rt_SmokeVelocity1_fb0_@3, _rt__rt_SmokeVelocity1_fb0_@3
+draw -> _rt_effect_pingpong_a_@2 <- 
+draw -> _rt__rt_SmokeDye2_fb0_@3 <- _rt__rt_SmokeVelocity2_fb0_@3, _rt__rt_SmokeDye1_fb0_@3, _rt_effect_pingpong_a_@2
+draw -> _rt__rt_SmokeNormal_@3 <- _rt__rt_SmokeDye2_fb0_@3
+draw -> _rt_effect_pingpong_a_@1 <- 
+draw -> _rt_default <- _rt_effect_pingpong_a_@1
+draw -> _rt_default <- _rt_effect_pingpong_a_@2, _rt__rt_SmokeDye2_fb0_@3, _rt__rt_SmokeNormal_@3, -, _rt__rt_SmokeVelocity2_fb0_@3
+draw -> _rt_default <- _rt_effect_pingpong_a_@4, _rt__rt_SmokeDye2_fb0_@5, _rt__rt_SmokeNormal_@5, -, _rt__rt_SmokeVelocity2_fb0_@5
+draw -> _rt_default <- _rt_effect_pingpong_a_@6, _rt__rt_SmokeDye2_fb0_@7, _rt__rt_SmokeNormal_@7, -, _rt__rt_SmokeVelocity2_fb0_@7
+[targets]
+_rt_MipMappedFrameBuffer 1280x720 reuse=0 depth=0 mip=1 format=RGBA8 bind=1/_rt_default/0/1.000
+_rt_Reflection 1280x720 reuse=0 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt_Reflection_blur 1280x720 reuse=0 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt__rt_SmokeCurl_fb0_@3 640x360 reuse=1 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeCurl_fb0_@5 2x2 reuse=1 depth=0 mip=0 format=RGBA16F bind=1//1/1.000
+_rt__rt_SmokeCurl_fb0_@7 640x360 reuse=1 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeDivergence_fb0_@3 640x360 reuse=1 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeDivergence_fb0_@5 2x2 reuse=1 depth=0 mip=0 format=RGBA16F bind=1//1/1.000
+_rt__rt_SmokeDivergence_fb0_@7 640x360 reuse=1 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeDye1_fb0_@3 320x180 reuse=0 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt__rt_SmokeDye1_fb0_@5 2x2 reuse=0 depth=0 mip=0 format=RGBA8 bind=1//1/0.500
+_rt__rt_SmokeDye1_fb0_@7 320x180 reuse=0 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt__rt_SmokeDye2_fb0_@3 320x180 reuse=0 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt__rt_SmokeDye2_fb0_@5 2x2 reuse=0 depth=0 mip=0 format=RGBA8 bind=1//1/0.500
+_rt__rt_SmokeDye2_fb0_@7 320x180 reuse=0 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt__rt_SmokeNormal_@3 320x180 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt__rt_SmokeNormal_@5 2x2 reuse=1 depth=0 mip=0 format=RGBA8 bind=1//1/0.500
+_rt__rt_SmokeNormal_@7 320x180 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt__rt_SmokePressure1_fb0_@3 640x360 reuse=0 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokePressure1_fb0_@5 2x2 reuse=0 depth=0 mip=0 format=RGBA16F bind=1//1/1.000
+_rt__rt_SmokePressure1_fb0_@7 640x360 reuse=0 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokePressure2_fb0_@3 640x360 reuse=1 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokePressure2_fb0_@5 2x2 reuse=1 depth=0 mip=0 format=RGBA16F bind=1//1/1.000
+_rt__rt_SmokePressure2_fb0_@7 640x360 reuse=1 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeVelocity1_fb0_@3 640x360 reuse=0 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeVelocity1_fb0_@5 2x2 reuse=0 depth=0 mip=0 format=RGBA16F bind=1//1/1.000
+_rt__rt_SmokeVelocity1_fb0_@7 640x360 reuse=0 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeVelocity2_fb0_@3 640x360 reuse=0 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt__rt_SmokeVelocity2_fb0_@5 2x2 reuse=0 depth=0 mip=0 format=RGBA16F bind=1//1/1.000
+_rt__rt_SmokeVelocity2_fb0_@7 640x360 reuse=0 depth=0 mip=0 format=RGBA16F bind=0//0/1.000
+_rt_default 1280x720 reuse=0 depth=0 mip=0 format=RGBA8 bind=1//1/1.000
+_rt_effect_pingpong_a_@1 256x256 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt_effect_pingpong_a_@2 640x360 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt_effect_pingpong_a_@4 2x2 reuse=1 depth=0 mip=0 format=RGBA8 bind=1//1/1.000
+_rt_effect_pingpong_a_@6 640x360 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt_effect_pingpong_b_@1 256x256 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt_effect_pingpong_b_@2 640x360 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt_effect_pingpong_b_@4 2x2 reuse=1 depth=0 mip=0 format=RGBA8 bind=1//1/1.000
+_rt_effect_pingpong_b_@6 640x360 reuse=1 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+_rt_shadowAtlas 2048x2048 reuse=0 depth=0 mip=0 format=RGBA8 bind=0//0/1.000
+[uniforms]
+asked: g_ModelMatrixInverse, g_NormalModelMatrix, g_ModelMatrix, g_AltModelMatrix, g_ModelViewProjectionMatrix, g_ModelViewProjectionMatrixInverse, g_EffectTextureProjectionMatrix, g_EffectTextureProjectionMatrixInverse, g_ViewProjectionMatrix, g_Bones, g_Time, g_DayTime, g_PointerPosition, g_ParallaxPosition, g_TexelSize, g_TexelSizeHalf, g_Screen, g_LightAmbientColor, g_LightSkylightColor, g_LightsPosition, g_LightsColorRadius, g_EyePosition, g_PointerPositionLast, g_Frametime, g_AudioSpectrum16Left, g_AudioSpectrum16Right, g_AudioSpectrum32Left, g_AudioSpectrum32Right, g_AudioSpectrum64Left, g_AudioSpectrum64Right, g_Texture0Resolution, g_Texture0MipMapInfo, g_Texture1Resolution, g_Texture1MipMapInfo, g_Texture2Resolution, g_Texture2MipMapInfo, g_Texture3Resolution, g_Texture3MipMapInfo, g_Texture4Resolution, g_Texture4MipMapInfo, g_Texture5Resolution, g_Texture5MipMapInfo, g_Texture6Resolution, g_Texture6MipMapInfo, g_Texture7Resolution, g_Texture7MipMapInfo, g_Texture8Resolution, g_Texture8MipMapInfo, g_Texture9Resolution, g_Texture9MipMapInfo, g_Texture10Resolution, g_Texture10MipMapInfo, g_Texture11Resolution, g_Texture11MipMapInfo
+written: g_Texture0Resolution, g_Texture0MipMapInfo, g_ViewProjectionMatrix, g_ModelMatrix, g_AltModelMatrix, g_ModelMatrixInverse, g_NormalModelMatrix, g_ModelViewProjectionMatrix, g_ModelViewProjectionMatrixInverse, g_Time, g_DayTime, g_PointerPosition, g_PointerPositionLast, g_Frametime, g_TexelSize, g_TexelSizeHalf, g_Screen, g_ParallaxPosition, g_LightsPosition, g_LightsColorRadius, g_LightsColorPremultiplied, g_LightAmbientColor, g_LightSkylightColor, g_AudioSpectrum16Left, g_AudioSpectrum16Right, g_AudioSpectrum32Left, g_AudioSpectrum32Right, g_AudioSpectrum64Left, g_AudioSpectrum64Right

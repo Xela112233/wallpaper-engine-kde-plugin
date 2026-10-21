@@ -43,6 +43,7 @@
 #include "VulkanRender/PassCacheAlias.hpp"
 #include "VulkanRender/PassMerge.hpp"
 #include "VulkanRender/FeedbackMoves.hpp"
+#include "EffectFluid.hpp"
 #include "VulkanRender/FenceWaitRetry.hpp"
 #include "FrameFenceCycle.hpp"
 
@@ -249,6 +250,13 @@ struct VulkanRender::Impl {
     std::vector<std::optional<VmaImageParameters>>        m_feedback_scratch;
     void                                                  resolveFeedbackMoves(Scene& scene);
     void                                                  moveFeedbackImages();
+    // Fluid simulation (fluid-effect patch; empty unless the scene has a
+    // kept target with a start colour or a script ran an effect's function,
+    // Scene::fluidStart and Scene::fluidClears).  The slots to put back to a
+    // colour before the next frame's passes.
+    std::vector<std::pair<RtSlot*, std::array<float, 4>>> m_fluid_clears;
+    void queueFluidClears(Scene& scene, const std::vector<std::pair<std::string, std::array<float, 4>>>&);
+    void recordFluidClears(const vvk::CommandBuffer& cmd);
 
     void              buildResidencyTables();
     const std::vector<bool>& computeDemand();
@@ -1196,6 +1204,13 @@ void VulkanRender::Impl::drawFrame([[maybe_unused]] Scene& scene) {
             RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE((VkInstance)m_instance.inst()), NULL);
 #endif
 
+    // Fluid simulation (fluid-effect patch): what a script asked to be
+    // cleared since the last frame.
+    if (! scene.fluidClears.empty()) {
+        queueFluidClears(scene, scene.fluidClears);
+        scene.fluidClears.clear();
+    }
+
     if (m_instance.offscreen()) {
         drawFrameOffscreen();
     } else {
@@ -1314,6 +1329,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
             rr.group_abandoned = false;
             AdvanceRewrittenFrame(m_rewritten_frame, m_rewritten_last_frame);
             residencyStep(rr);
+            if (! m_fluid_clears.empty()) recordFluidClears(rr.command);
             for (auto* p : m_passes) {
                 if (p->prepared()) {
                     p->execute(*m_device, rr);
@@ -1477,6 +1493,7 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         rr.group_abandoned = false;
         AdvanceRewrittenFrame(m_rewritten_frame, m_rewritten_last_frame);
         residencyStep(rr);
+        if (! m_fluid_clears.empty()) recordFluidClears(rr.command);
         for (auto* p : m_passes) {
             if (p->prepared()) {
                 p->execute(*m_device, rr);
@@ -1543,6 +1560,17 @@ void VulkanRender::Impl::setRenderTargetSize(Scene& scene, [[maybe_unused]] rg::
         if (rt.bind.enable && rt.bind.screen) {
             rt.width  = (i32)(rt.bind.scale * ext.width);
             rt.height = (i32)(rt.bind.scale * ext.height);
+        }
+    }
+    // Fluid simulation (fluid-effect patch): a full-screen layer's targets
+    // with "fit" have their larger side at that many pixels.
+    if (! scene.fluidFit.empty()) {
+        for (const auto& [name, fit] : scene.fluidFit) {
+            auto rt = scene.renderTargets.find(name);
+            if (rt == scene.renderTargets.end()) continue;
+            const auto [w, h] = fluid::FitSize((i32)ext.width, (i32)ext.height, fit);
+            rt->second.width  = w;
+            rt->second.height = h;
         }
     }
     for (auto& item : scene.renderTargets) {
@@ -1693,6 +1721,7 @@ void VulkanRender::Impl::clearLastRenderGraph(Scene* scene) {
     m_slot_clear_on_attach.clear();
     m_feedback_moves.clear();
     m_feedback_scratch.clear();
+    m_fluid_clears.clear();
 
     // (Removed: g_msaa_color_inited.clear() — the MSAA first-use latch now
     // lives on VmaImageParameters as initial_layout_transitioned and dies
@@ -1879,6 +1908,11 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
 
     m_feedback_moves.clear();
     if (! scene.feedbackTargets.empty()) resolveFeedbackMoves(scene);
+    // Fluid simulation (fluid-effect patch): targets made anew start with
+    // the colour their "fbos" entry gives them.
+    m_fluid_clears.clear();
+    if (! scene.fluidStart.empty())
+        queueFluidClears(scene, { scene.fluidStart.begin(), scene.fluidStart.end() });
 
     // Pass-output cache gating: skip-on-reexec is safe ONLY when the
     // pass's cached output bytes remain valid at the moment downstream
@@ -2183,6 +2217,43 @@ void VulkanRender::Impl::resolveFeedbackMoves(Scene& scene) {
                by_name.size(),
                (double)bytes / (1024.0 * 1024.0),
                m_feedback_moves.size());
+}
+
+// Fluid simulation (fluid-effect patch).  The named render targets, as far
+// as a prepared pass holds a slot for them and they are kept targets, are
+// put on the list of slots to clear before the next frame's passes.
+void VulkanRender::Impl::queueFluidClears(
+    Scene& scene, const std::vector<std::pair<std::string, std::array<float, 4>>>& named) {
+    std::unordered_map<std::string, RtSlot*> by_name;
+    auto                                     note = [&](const std::string& name, RtSlot* slot) {
+        if (slot != nullptr && scene.feedbackTargets.count(name) != 0) by_name[name] = slot;
+    };
+    for (auto* p : m_passes) {
+        if (! p->prepared()) continue;
+        if (auto* csp = dynamic_cast<CustomShaderPass*>(p)) {
+            const auto& d = csp->desc();
+            note(d.output, d.out_slot);
+            for (usize i = 0; i < d.textures.size() && i < d.in_slots.size(); i++)
+                note(d.textures[i], d.in_slots[i]);
+        } else if (auto* cp = dynamic_cast<CopyPass*>(p)) {
+            note(cp->desc().src, cp->desc().src_slot);
+            note(cp->desc().dst, cp->desc().dst_slot);
+        }
+    }
+    for (const auto& [name, colour] : named) {
+        const auto it = by_name.find(name);
+        if (it != by_name.end()) m_fluid_clears.emplace_back(it->second, colour);
+    }
+}
+
+void VulkanRender::Impl::recordFluidClears(const vvk::CommandBuffer& cmd) {
+    for (const auto& [slot, colour] : m_fluid_clears) {
+        if (! slot->image) continue;
+        RecClearLiveImage(cmd,
+                          *slot->image->handle,
+                          VkClearColorValue { { colour[0], colour[1], colour[2], colour[3] } });
+    }
+    m_fluid_clears.clear();
 }
 
 void VulkanRender::Impl::moveFeedbackImages() {

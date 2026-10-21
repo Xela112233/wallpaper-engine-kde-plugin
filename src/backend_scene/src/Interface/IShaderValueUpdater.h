@@ -47,6 +47,9 @@ public:
     // Effect feedback (fluid-targets patch): whether g_PointerPositionLast
     // and g_Frametime are supplied (WPShaderValueUpdater::SetPointerFeedback).
     virtual bool SuppliesFrameUniforms() const { return false; }
+    // Fluid simulation (fluid-effect patch): whether g_PointerState is
+    // supplied (WPShaderValueUpdater::SetFluidPointer).
+    virtual bool SuppliesPointerState() const { return false; }
 
     virtual void MouseInput(double x, double y) = 0;
     virtual void SetScreenSize(i32 w, i32 h)    = 0;

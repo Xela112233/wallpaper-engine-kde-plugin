@@ -165,6 +165,13 @@ Item{
                                       // EffectFeedback): in the map only when
                                       // on, like the switches above.
                                       if (background.effectFeedback === true) q.feedback = 1;
+                                      // Fluid simulation (fluid-effect patch,
+                                      // FluidSimulation): in the map only
+                                      // when on, and effect feedback with it.
+                                      if (background.fluidSimulation === true) {
+                                          q.feedback = 1;
+                                          q.fluid = 1;
+                                      }
                                       return q;
                                   }));
             // Audio output (mute patch, AudioOutput): off, the scene opens no

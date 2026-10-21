@@ -1164,6 +1164,15 @@ function _makeLayerProxy(name) {
     ep.getMaterial = function() {
       return _makeMaterialProxy(_s.name, idx);
     };
+    // Fluid simulation (fluid-effect patch): init.efn is there only for a
+    // layer of a scene loaded with the setting on that has an effect with
+    // functions; without it the effect has no such method, as before.
+    var efn = init ? init.efn : null;
+    if (efn) ep.executeMaterialFunction = function(fname) {
+      var names = efn[idx];
+      if (!names || names.indexOf(String(fname)) < 0) return;
+      _s._cmds.push('efn:' + idx + ':' + fname); _s._dirty._cmds = true;
+    };
     _s._effCache[idx] = ep;
     return ep;
   };
