@@ -143,10 +143,17 @@ Rectangle {
     // whole file.
     readonly property int shareRenderer: Math.max(0, Math.min(2, Number(wallpaper.configuration.ShareRenderer ?? 0) || 0))
     property var    cloneLink: null
+    // One scene stretched across screens (we-manager span patch, main.xml
+    // SpanGroup: 0 off, 1 to 4 the group).  The screens of a group that show
+    // the same scene show one picture, each its own part: one of them renders
+    // a canvas that covers them all, the others show their part of its frame.
+    // It runs on the clone patch's parts, so the CloneLink is made for it
+    // too; off, nothing of it runs, with ShareRenderer on or off.
+    readonly property int spanGroup: Math.max(0, Math.min(4, Number(wallpaper.configuration.SpanGroup ?? 0) || 0))
     // `live`: the setting changed while a wallpaper is loaded, which is then
     // loaded again (a cut), as a change of render resolution is.
     function updateCloneLink(live) {
-        const on = background.shareRenderer > 0;
+        const on = background.shareRenderer > 0 || background.spanGroup > 0;
         if (on === (background.cloneLink !== null)) return;
         if (on) {
             const comp = Qt.createComponent("CloneLink.qml");
@@ -164,6 +171,22 @@ Rectangle {
             link.destroy();
         }
         if (live && !background.stopped && background.nowBackend === "scene") {
+            background._transitionCause = "reload";
+            try {
+                background.loadBackend();
+            } finally {
+                background._transitionCause = "";
+            }
+        }
+    }
+    // SpanGroup changed: the link is made or goes as for ShareRenderer; where
+    // it stays (the other of the two settings is on), the scene is loaded
+    // again, for the group it is in now.
+    function updateSpanGroup() {
+        const had = background.cloneLink !== null;
+        background.updateCloneLink(true);
+        if (!had || background.cloneLink === null) return;
+        if (!background.stopped && background.nowBackend === "scene") {
             background._transitionCause = "reload";
             try {
                 background.loadBackend();
@@ -1736,6 +1759,10 @@ Rectangle {
                 let re = backendLoader.item.getMouseTarget();
                 if(!re)
                     re = null;
+                // SpanGroup: the pointer goes through the group's own item,
+                // which hands the renderer the scene's point under it.
+                if (background.cloneLink !== null && background.cloneLink.pointerPad)
+                    re = background.cloneLink.pointerPad;
                 background.mouseHooker.target = re;
            }
         }
@@ -1924,6 +1951,8 @@ Rectangle {
         if (vramStopOn) makeVramWatch();
         // ShareRenderer on from the start.
         if (shareRenderer > 0) updateCloneLink(false);
+        // SpanGroup on from the start.
+        else if (spanGroup > 0) updateCloneLink(false);
         // Safe start: a wallpaper that stopped Plasma just now is held back.
         checkSafeStart();
         // load first backend
@@ -1939,6 +1968,7 @@ Rectangle {
         background.okChanged.connect(autoPause);
         background.sourceChanged.connect(applySource);
         background.shareRendererChanged.connect(function() { background.updateCloneLink(true); });
+        background.spanGroupChanged.connect(background.updateSpanGroup);
 
         lauchPauseTimer.start();
     }

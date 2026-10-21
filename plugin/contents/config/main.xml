@@ -216,6 +216,12 @@
       <min>0</min>
       <max>2</max>
     </entry>
+    <entry name="SpanGroup" type="Int">
+      <label>Stretch one scene across screens: 0 = off (every screen shows the whole wallpaper), 1 to 4 = the group; the screens of this Plasma with the same group number that show the same scene with the same properties show one picture, each its own part, rendered once on a canvas that covers them all</label>
+      <default>0</default>
+      <min>0</min>
+      <max>4</max>
+    </entry>
     <entry name="PresentMode" type="Int">
       <label>Swapchain present mode policy (0=Auto, 1=Fifo, 2=FifoRelaxed, 3=Mailbox, 4=Immediate)</label>
       <default>0</default>

@@ -30,9 +30,36 @@
 //    a screen whose window is drawn (drawCheck, Clone.mayTake).  With every
 //    screen asleep nothing moves and nothing is unloaded.
 // Each change of part is one line in the journal: "[WEK] clone: ...".
+//
+// SpanGroup (we-manager span patch; main.xml SpanGroup, 0 off): the screens of
+// a group that show the same scene show one picture, each its own part.  The
+// link is then made for SpanGroup alone too, and everything above holds for
+// the group (its key carries the group's number, so it never mixes with
+// screens that only share a renderer).  What is added, all behind `span > 0`
+// (js/span.mjs has the maths):
+//  * every screen's entry carries its rectangle in Plasma's screen
+//    coordinates; the canvas is the rectangle around the group's screens;
+//  * the screen that renders puts its SceneViewer into a SpanCanvas.qml the
+//    size of the canvas (_spread), so the renderer draws the whole canvas and
+//    the window shows this screen's part; its entry names the canvas;
+//  * a screen that shows the frame is handed that canvas (mirrorProperties)
+//    and draws the part of the frame that lies on it;
+//  * a canvas that is no longer the group's (a screen came, went or moved) is
+//    rendered again: follow() loads the scene again, as a reload;
+//  * a screen that is stopped keeps its place in the canvas (_place), so the
+//    picture on the other screens does not move when one of them stops;
+//  * the pointer of every screen of the group goes through a SpanPointer.qml
+//    (_point, pointerPad), which hands the renderer the scene's point under
+//    the pointer; the rendering screen's entry says how much of the scene
+//    its frame shows (_shown);
+//  * the table is followed spanFollowDelayMs after a change, not
+//    followDelayMs: every change of the group's screens is a scene load, so
+//    screens that come up one after the other (a login, a wake, we-manager
+//    writing the group) are waited for.
 import QtQuick
 import com.github.captsilver.wallpaperEngineKde
 import "js/clone.mjs" as Clone
+import "js/span.mjs" as Span
 
 Item {
     id: link
@@ -50,6 +77,38 @@ Item {
         ? host.width * host.height * Math.pow(host.Screen.devicePixelRatio || 1, 2) : 0
     // The screen's own pause rules let the wallpaper play.
     readonly property bool playing: host !== null && host.ok === true
+    // SpanGroup: the group this screen stretches a scene across with the
+    // others of the same number; 0, it does not.
+    readonly property int span: host !== null ? (Number(host.spanGroup) || 0) : 0
+    // This screen's rectangle in Plasma's screen coordinates (logical
+    // pixels), as Plasma gives it to the wallpaper; read only for a group.
+    readonly property rect screenRect: {
+        if (link.span <= 0 || link.host === null) return Qt.rect(0, 0, 0, 0);
+        const g = wallpaper.parent ? wallpaper.parent.screenGeometry : undefined;
+        if (g && g.width > 0 && g.height > 0) return Qt.rect(g.x, g.y, g.width, g.height);
+        return Qt.rect(link.host.Screen.virtualX, link.host.Screen.virtualY, link.host.width, link.host.height);
+    }
+    // The canvas this screen's renderer was made for, while it renders for a
+    // group; set with the renderer (_spread) and fixed for its life.
+    property rect canvas
+    // A stopped screen's place: the key of the group whose canvas it stays
+    // part of ("" for none).
+    property string _place: ""
+    // The SpanCanvas of the renderer this screen loaded last.
+    property var    _holder: null
+    // The SpanPointer of the backend this screen loaded last: main.qml's
+    // MouseGrabber sends the pointer to it (null: to the backend's own item).
+    property var    pointerPad: null
+    // How much of the scene the frame this screen renders shows, each way
+    // (Span.shownPart); null while it renders for no group.
+    readonly property var _shown: link.span > 0 && link.player !== null
+        ? Span.shownPart(link.player.fillMode === SceneViewer.ASPECTCROP, link.player.nativeAspectRatio,
+                         link.player.width, link.player.height)
+        : null
+    on_ShownChanged: if (link.span > 0 && link.role === "source") publish()
+    // No canvas could be made for want of a rectangle (_spread): tried again
+    // when the table has one.
+    property bool   _noCanvas: false
 
     // The group this screen is in (Clone.groupKey); "" in none.
     property string key: ""
@@ -86,6 +145,11 @@ Item {
     // change of wallpaper that reaches the screens one after the other does
     // not make a mirror load the old scene for the moment in between.
     property int followDelayMs: 200
+    // SpanGroup: the same wait for a screen of a group.  Longer, because
+    // there every screen that comes or goes changes the canvas, which is a
+    // scene load: screens that come up within this of each other (a login, a
+    // wake, we-manager's two writes) cost one load, not one each.
+    property int spanFollowDelayMs: 1000
     // A source whose window has drawn none of its frames for stallMs, seen
     // at two checks in a row, is marked stalled; once marked, it looks every
     // stallClearMs whether its window draws again.
@@ -114,13 +178,35 @@ Item {
     // This screen's entry in the table.
     function publish() {
         if (link.key === "") {
-            group.member = ({});
+            group.member = link._place !== "" ? Span.placeholder(link._place, link.screenName, link.screenRect) : ({});
             return;
         }
-        group.member = {
+        const entry = {
             key: link.key, screen: link.screenName, prefer: link.prefer, area: link.area, role: link.role,
             frameKey: link.role === "source" ? link.frameKey : "", playing: link.playing, stalled: link.stalled
         };
+        // SpanGroup: where this screen is, and the canvas its renderer draws.
+        group.member = link.span <= 0 ? entry
+            : Span.entry(entry, link.span, link.screenRect,
+                         link.role === "source" && link.frameKey !== "" ? link.canvas : null, link._shown);
+    }
+    // The group of what this screen shows: the scene and its properties,
+    // and, stretched across screens, the SpanGroup's number.
+    function _groupKey(path, props) {
+        const key = Clone.groupKey(path, props);
+        return link.span > 0 ? Span.groupKey(link.span, key) : key;
+    }
+    // SpanGroup: this screen moved (Plasma arranged the screens anew).  The
+    // table hears of it, and what this screen shows now is told its place:
+    // if the canvas is still the same rectangle, nothing is loaded again.
+    onScreenRectChanged: {
+        if (link.span <= 0 || !(link.screenRect.width > 0)) return;
+        publish();
+        if (link.role === "source" && link._holder) link._holder.screen = link.screenRect;
+        if (link.pointerPad) link.pointerPad.screen = link.screenRect;
+        const shown = link.loader ? link.loader.item : null;
+        if (link.role === "mirror" && shown && shown.spanCanvas !== undefined && shown.spanCanvas.width > 0)
+            shown.spanScreen = link.screenRect;
     }
     onPreferChanged: { publish(); if (key !== "") followSoon.restart(); }
     onAreaChanged: publish()
@@ -146,6 +232,8 @@ Item {
     // mirrorProperties()), false when it loads backend/Scene.qml.
     function claim() {
         followSoon.stop();
+        // SpanGroup: a stopped screen's place ends when it loads again.
+        if (link._place !== "") link._dropPlace();
         if (link.failure !== "" || link.host === null) {
             link.leave();
             return false;
@@ -158,7 +246,7 @@ Item {
             link.pyext.read_wallpaper_config(wid).then((res) => {
                 props = res && res['user_props'] ? JSON.stringify(res['user_props']) : "";
             });
-        const key = Clone.groupKey(link.host.wallpaperPath, props);
+        const key = link._groupKey(link.host.wallpaperPath, props);
         if (key === "") {
             link.leave();
             return false;
@@ -198,7 +286,17 @@ Item {
         return d.role === "mirror";
     }
     function mirrorProperties() {
-        return { link: link, frameKey: link.frameKey };
+        const props = { link: link, frameKey: link.frameKey };
+        // SpanGroup: the canvas that frame was rendered for; this screen
+        // shows the part of it that lies on it (backend/SceneMirror.qml).
+        if (link.span > 0) {
+            const c = Span.canvasOf(group.members(), link.frameKey);
+            if (c !== null) {
+                props.spanCanvas = Qt.rect(c.x, c.y, c.width, c.height);
+                props.spanScreen = link.screenRect;
+            }
+        }
+        return props;
     }
 
     // backend/Scene.qml, for the SceneViewer it has just made: the source's
@@ -213,7 +311,137 @@ Item {
         }
         link.player = viewer;
         link.frameKey = frame;
+        if (link.span > 0) link._spread(viewer);
         link.publish();
+    }
+    // SpanGroup: the viewer just made renders the group's whole canvas.  It
+    // goes into a SpanCanvas.qml of the canvas's size, placed so that this
+    // screen's window shows its own part; backend/Scene.qml sizes the viewer
+    // to its parent, and the renderer makes its target from the viewer's size
+    // times the window's scale factor times RenderScale, as for one screen.
+    // A canvas beyond Span.maxSide pixels a side gets a smaller render scale.
+    // If the canvas cannot be made, the group goes on as screens that share a
+    // renderer: each shows the rendering screen's picture.
+    function _spread(viewer) {
+        link.canvas = Qt.rect(0, 0, 0, 0);
+        link._holder = null;
+        link.pointerPad = null;
+        link._noCanvas = false;
+        const u = Span.union(group.members(), link.key);
+        const inside = viewer.parent;
+        if (u === null || !inside) {
+            // Plasma gave no screen of the group a rectangle (yet).
+            link._noCanvas = true;
+            link._unspread("no screen of the group has a rectangle");
+            return;
+        }
+        const comp = Qt.createComponent("SpanCanvas.qml");
+        const holder = comp.status === Component.Ready
+            ? comp.createObject(inside, { canvas: Qt.rect(u.x, u.y, u.width, u.height), screen: link.screenRect })
+            : null;
+        if (!holder) {
+            link._unspread(comp.errorString().trim() || "SpanCanvas.qml made no item");
+            return;
+        }
+        viewer.parent = holder;
+        // The canvas is cut off at the backend's own item, which is the
+        // screen's: main.qml's transition moves that item (slide) or scales
+        // it (zoom), and what leaves the window must be this screen's part,
+        // not a canvas that still reaches across the window.
+        inside.clip = true;
+        const dpr = link.host.Screen.devicePixelRatio || 1;
+        const w = holder.width > 0 ? holder.width : u.width, h = holder.height > 0 ? holder.height : u.height;
+        const scale = Span.renderScale(link.host.renderScale, w, h, dpr);
+        if (scale !== link.host.renderScale) Common.setIfSupported(viewer, "SceneViewer", "renderScale", scale);
+        link.canvas = holder.canvas;
+        link._holder = holder;
+        link._point(inside, viewer, null);
+        const px = Span.renderSize(w, h, dpr, scale);
+        link._say("span " + link.span + ": " + link._where() + " renders " + link._what() + " on a canvas of "
+                  + Math.round(u.width) + "x" + Math.round(u.height) + " at " + Math.round(u.x) + ","
+                  + Math.round(u.y) + ", about " + px.width + "x" + px.height + " pixels"
+                  + (scale !== link.host.renderScale
+                     ? " (scaled down for the limit of " + Span.maxSide + " pixels a side)" : ""));
+    }
+    // SpanGroup: the canvas could not be laid out.  One line says so, and
+    // the group goes on as screens that share a renderer.
+    function _unspread(why) {
+        link.lastLine = "[WEK] span: " + link._where() + " could not lay out the canvas of group " + link.span
+                        + " for " + link._what() + " (" + why + "): the screens of the group each show the "
+                        + "rendering screen's whole picture, not their part of one";
+        console.warn(link.lastLine);
+    }
+    // SpanGroup: this screen's pointer goes through a SpanPointer.qml made
+    // inside the backend just loaded (`inside`): for the screen that renders,
+    // with its `viewer`; for one that shows the frame, with its `mirror`
+    // item.  Without one (it could not be made) the pointer goes to the
+    // backend's own item, as without a group.
+    function _point(inside, viewer, mirror) {
+        link.pointerPad = null;
+        const comp = Qt.createComponent("SpanPointer.qml");
+        const canvas = viewer ? link.canvas : inside.spanCanvas;
+        const pad = comp.status === Component.Ready
+            ? comp.createObject(inside, { frameKey: link.frameKey, canvas: canvas, screen: link.screenRect }) : null;
+        if (!pad) {
+            console.warn("[WEK] span: " + link._where() + " could not make the pointer's item ("
+                         + comp.errorString().trim() + "): the scene's cursor is not under the pointer "
+                         + "where the canvas shows a part of the scene only");
+            return;
+        }
+        if (viewer) {
+            pad.shape = Qt.binding(function() { return viewer.height > 0 ? viewer.width / viewer.height : 0; });
+            pad.partX = Qt.binding(function() { return link._shown ? link._shown.kx : 1; });
+            pad.partY = Qt.binding(function() { return link._shown ? link._shown.ky : 1; });
+        } else {
+            pad.shape = Qt.binding(function() { return mirror.frameAspect; });
+            const k = Span.shownOf(group.members(), link.frameKey);
+            pad.partX = k.kx;
+            pad.partY = k.ky;
+        }
+        link.pointerPad = pad;
+    }
+    // SpanGroup, when the table changed: a screen that shows the frame learns
+    // how much of the scene the frame shows.
+    function _spanFollowed() {
+        if (link.role !== "mirror" || !link.pointerPad) return;
+        const k = Span.shownOf(group.members(), link.frameKey);
+        link.pointerPad.partX = k.kx;
+        link.pointerPad.partY = k.ky;
+    }
+    // SpanGroup: the canvas this screen renders is not the group's any more:
+    // a screen of it came, went or moved.
+    function _canvasStale() {
+        if (link.span <= 0 || link.role !== "source" || link.player === null) return false;
+        const u = Span.union(group.members(), link.key);
+        if (!(link.canvas.width > 0)) return link._noCanvas && u !== null;
+        return u !== null && !Span.sameRect(u, link.canvas);
+    }
+    // SpanGroup: a stopped screen keeps its place in the canvas of `key`
+    // until it loads again, is given another wallpaper while stopped, or is
+    // taken out of the group.
+    function _keepPlace(key) {
+        link._place = key;
+        if (link.host === null) return;
+        link.host.sourceChanged.connect(link, link._dropPlace);
+        link.host.userPropsJsonChanged.connect(link, link._dropPlace);
+    }
+    function _dropPlace() {
+        if (link._place === "") return;
+        link._place = "";
+        if (link.host !== null) {
+            link.host.sourceChanged.disconnect(link, link._dropPlace);
+            link.host.userPropsJsonChanged.disconnect(link, link._dropPlace);
+        }
+        if (link.key === "") link.publish();
+    }
+    onSpanChanged: {
+        _dropPlace();
+        if (link.span <= 0) {
+            link.canvas = Qt.rect(0, 0, 0, 0);
+            link._holder = null;
+            link.pointerPad = null;
+            link._noCanvas = false;
+        }
     }
 
     // backend/SceneMirror.qml: its item cannot draw the frame (reason).  The
@@ -228,6 +456,11 @@ Item {
     }
     // backend/SceneMirror.qml, for the SceneMirror item it has just made.
     function mirrorCreated(item) {
+        // SpanGroup: the pointer of a screen that shows its part of a canvas.
+        link.pointerPad = null;
+        if (link.span > 0 && item && item.parent && item.parent.spanCanvas !== undefined
+            && item.parent.spanCanvas.width > 0)
+            link._point(item.parent, null, item);
         link.mirror = item;
         link._probeCount = -1;
         link._drawnRuns = 0;
@@ -243,6 +476,12 @@ Item {
     function leave() {
         followSoon.stop();
         if (link.key === "" && link.role === "") return;
+        // SpanGroup: a screen that is stopped (its backend unloaded until the
+        // reason ends) keeps its place in the group's canvas, so the other
+        // screens' parts stay where they are.
+        if (link.span > 0 && link.key !== "" && link.host !== null && link.host.stopped === true)
+            link._keepPlace(link.key);
+        if (link.pointerPad) link.pointerPad = null;
         link.key = "";
         link.role = "";
         link.frameKey = "";
@@ -308,6 +547,14 @@ Item {
             link._reload();
             return;
         }
+        // SpanGroup: the group's screens changed; the canvas is rendered anew.
+        if (link.span > 0) {
+            link._spanFollowed();
+            if (link._canvasStale()) {
+                link._reload();
+                return;
+            }
+        }
         // The other screens' pauses came or went: the source's pause follows.
         const on = !link.host.ok && link.playsOn();
         if (on !== link._playedOn) {
@@ -317,7 +564,7 @@ Item {
     }
     Timer {
         id: followSoon
-        interval: Math.max(0, link.followDelayMs)
+        interval: Math.max(0, link.span > 0 ? link.spanFollowDelayMs : link.followDelayMs)
         repeat: false
         onTriggered: link.follow()
     }
@@ -326,6 +573,9 @@ Item {
         function onChanged() {
             if (link.key === "") return;
             link._watchSource();
+            // SpanGroup: what the frame shows of its scene, for the pointer,
+            // at once (the rest is followed after the wait).
+            if (link.span > 0) link._spanFollowed();
             followSoon.restart();
         }
     }
@@ -343,7 +593,7 @@ Item {
     }
     function _rekey() {
         if (link.key === "" || link.host === null) return;
-        const key = Clone.groupKey(link.host.wallpaperPath, link.host.userPropsJson);
+        const key = link._groupKey(link.host.wallpaperPath, link.host.userPropsJson);
         if (key === "" || key === link.key) return;
         link.key = key;
         link.publish();

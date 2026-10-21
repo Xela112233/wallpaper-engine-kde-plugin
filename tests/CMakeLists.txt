@@ -157,6 +157,20 @@ else()
     message(STATUS "Qt6Quick not found — skipping tst_sharedframe")
 endif()
 
+# ── Span (SpanGroup, we-manager span patch) ──────────────────────────────────
+# tst_spanframe: three windows that each draw their own part of one texture,
+# through the real SpanCanvas.qml and backend/SceneMirror.qml, and the pointer
+# of each window mapped into the canvas.  Its cases need Qt Quick on OpenGL,
+# as tst_sharedframe's, and skip elsewhere.
+if(TARGET Qt6::Quick AND TARGET Qt6::Qml)
+    add_executable(tst_spanframe tst_spanframe.cpp
+        ${WEKDE_SRC_DIR}/backend_scene/qml_helper/SceneMirror.cpp)
+    target_include_directories(tst_spanframe PRIVATE ${WEKDE_SRC_DIR}/backend_scene/qml_helper)
+    target_compile_definitions(tst_spanframe PRIVATE WEK_UI_DIR="${WEKDE_SRC_DIR}/../plugin/contents/ui")
+    target_link_libraries(tst_spanframe PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::Test)
+    add_test(NAME tst_spanframe COMMAND tst_spanframe -v2)
+endif()
+
 # ── SceneQuality (texture resolution, we-manager texture-quality patch) ──────
 # Header-only, in the scene renderer's source; no Vulkan.
 add_executable(tst_scenequality tst_scenequality.cpp)

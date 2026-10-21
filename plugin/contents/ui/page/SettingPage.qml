@@ -491,6 +491,32 @@ Flickable {
                 }
             }
             OptionItem {
+                text: i18nc("@label settings option", "Stretch across screens")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: ComboBox {
+                    id: cbSpanGroup
+                    model: [
+                        { text: i18nc("@item:inlistbox stretch across screens", "Off"),     value: 0 },
+                        { text: i18nc("@item:inlistbox stretch across screens", "Group 1"), value: 1 },
+                        { text: i18nc("@item:inlistbox stretch across screens", "Group 2"), value: 2 },
+                        { text: i18nc("@item:inlistbox stretch across screens", "Group 3"), value: 3 },
+                        { text: i18nc("@item:inlistbox stretch across screens", "Group 4"), value: 4 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_SpanGroup = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_SpanGroup))
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info stretch across screens help text", "Screens with the same group that show the same scene with the same properties show one picture, each its own part, as the screens are arranged in Display settings. One screen renders the whole picture and the others show their part of it; the frame rate, quality, alignment, sound and volume are the rendering screen's (choose it with One renderer for the same wallpaper: On, and this screen renders). Set the same scene and the same group on every screen of the group. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
                 text: i18nc("@label settings option", "Anti-aliasing")
                 text_color: Kirigami.Theme.textColor
                 icon: '../../images/window.svg'

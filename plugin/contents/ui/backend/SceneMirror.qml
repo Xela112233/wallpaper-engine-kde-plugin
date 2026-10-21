@@ -2,6 +2,7 @@ import QtQuick 2.5
 import com.github.captsilver.wallpaperEngineKde 1.2
 import ".."
 import "../js/clone.mjs" as Clone
+import "../js/span.mjs" as Span
 
 // The backend of a screen that shows another screen's scene (we-manager clone
 // patch, ShareRenderer; main.qml loads it only when CloneLink.claim() says
@@ -24,6 +25,12 @@ import "../js/clone.mjs" as Clone
 // SceneMirror item is hidden and follows no frame until play().  The same
 // when the renderer itself is paused.
 //
+// SpanGroup (we-manager span patch): the frame is the picture of a canvas
+// that covers every screen of the group, `spanCanvas`.  This screen then
+// shows the part of the frame that lies on it, whatever its own alignment
+// (Span.mirrorPlacement); the alignment of the picture in the canvas is the
+// rendering screen's.
+//
 // The pointer: main.qml's MouseGrabber sends this screen's pointer to
 // getMouseTarget(), the SceneMirror item, which passes each event on to the
 // rendering SceneViewer at the point of its item where the same part of the
@@ -40,6 +47,13 @@ Item {
     // life.  Another source, or the same one loaded again, is another item.
     property var link: null
     property string frameKey: ""
+    // SpanGroup: the canvas that frame was rendered for, in Plasma's screen
+    // coordinates; like the frame, fixed for this item's life.  Empty (the
+    // default): the frame is another screen's picture, not a canvas.  And
+    // this screen's own rectangle, which CloneLink sets again when the
+    // screen moves inside the same canvas.
+    property rect spanCanvas
+    property rect spanScreen
     property int displayMode: background.displayMode
     property bool pixelArt: background.pixelArt
     property bool _paused: false
@@ -60,7 +74,10 @@ Item {
         // waits for one, to have something to keep).
         live: !mirrorItem._stillTaken
         smooth: !mirrorItem.pixelArt
-        readonly property var _place: Clone.mirrorPlacement(
+        readonly property var _place: mirrorItem.spanCanvas.width > 0
+            ? Span.mirrorPlacement(mirrorItem.spanCanvas, mirrorItem.spanScreen, frameAspect,
+                                   mirrorItem.width, mirrorItem.height)
+            : Clone.mirrorPlacement(
             mirrorItem.displayMode === Common.DisplayMode.Aspect ? "fit"
                 : (mirrorItem.displayMode === Common.DisplayMode.Crop ? "crop" : "stretch"),
             frameAspect, mirrorItem.width, mirrorItem.height)
