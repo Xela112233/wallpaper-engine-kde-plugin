@@ -8,6 +8,10 @@ Item{
     // Set once this backend has put a frame on screen; main.qml keeps the
     // previous backend visible until then.
     property bool frameShown: false
+    // What the scene holds after its first frame (SceneViewer.vramMiB), 0
+    // before: main.qml adds an outgoing scene's to the VRAM guard's estimate
+    // for the length of a transition (transitions patch).
+    property int vramMiB: 0
     anchors.fill: parent
     property alias source: player.source
     property string assets: "assets"
@@ -195,6 +199,7 @@ Item{
             ignoreUnknownSignals: true
             function onVramMiBChanged() {
                 if (player.vramMiB > 0) background.vramEstimateMiB = player.vramMiB;
+                sceneItem.vramMiB = player.vramMiB;
             }
         }
     }
@@ -333,6 +338,13 @@ Item{
         if ("audioOutput" in player) player.audioOutput = player.audioOutput;
         player.muted = player.muted;
         if (volumeFade) volumeFade.freeze();
+    }
+    // A mute that comes on while this is the old layer of a handoff, its
+    // options frozen (main.qml's muteOutgoingNow, transitions patch): the
+    // sound goes at once.
+    function muteNow() {
+        if (volumeFade) volumeFade.stop();
+        player.muted = true;
     }
     function getMouseTarget() {
         return Qt.binding(function() { return player; })

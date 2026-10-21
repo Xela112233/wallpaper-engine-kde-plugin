@@ -41,6 +41,8 @@ Item {
         "UnpauseOnOverview":  true,      // matches main.xml default (unpause-overview patch)
         "VramStop":            false,    // matches main.xml default (we-manager vram patch)
         "UnloadAfterPausedMin": 0,       // matches main.xml default (we-manager vram patch)
+        "TransitionDuration":  250,      // matches main.xml default (we-manager transitions patch)
+        "TransitionType":      "fade",   // matches main.xml default (we-manager transitions patch)
         "PauseOnBatPower":     false,
         "PauseBatPercent":     0,
         "PauseDebugLogging":   false,

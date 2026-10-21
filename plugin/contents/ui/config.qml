@@ -54,6 +54,7 @@ ColumnLayout {
     property alias  cfg_UnpauseOnShowDesktop: settingPage.cfg_UnpauseOnShowDesktop
     property alias  cfg_UnpauseOnOverview:   settingPage.cfg_UnpauseOnOverview
     property alias  cfg_UnloadAfterPausedMin: settingPage.cfg_UnloadAfterPausedMin
+    property alias  cfg_TransitionDuration: settingPage.cfg_TransitionDuration
     property alias  cfg_Speed:               settingPage.cfg_Speed
     property alias  cfg_MuteAudio:           settingPage.cfg_MuteAudio
     property alias  cfg_MouseInput:          settingPage.cfg_MouseInput
@@ -110,6 +111,9 @@ ColumnLayout {
     // The screen's post-processing level (SettingPage's combo box writes it
     // unqualified, like cfg_RenderScale).
     property string cfg_PostProcessing
+    // How the old wallpaper goes at a change (transitions patch): SettingPage's
+    // combo box writes it unqualified, like cfg_PostProcessing.
+    property string cfg_TransitionType
     property int    cfg_MsaaMode
     // Texture resolution (texture-quality patch): SettingPage's combo box
     // writes it unqualified, like cfg_RenderScale.

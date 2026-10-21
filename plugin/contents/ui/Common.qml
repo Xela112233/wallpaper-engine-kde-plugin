@@ -443,16 +443,6 @@ QtObject {
         if (muted !== undefined) timer.muted = muted;
         timer.hardMuted = timer.muted;
         const target = () => timer.muted ? 0 : timer.volume;
-        const fadeDown = () => {
-            if (timer.volumeFade <= 0) {
-                finishDown();
-                return;
-            }
-            timer._downStep = Math.max(0.5, timer.volumeFade / fadeOutSteps);
-            timer._down = true;
-            timer.interval = Math.max(1, Math.round(fadeOutMs / fadeOutSteps));
-            if (!timer.running) timer.start();
-        };
         const finishDown = () => {
             timer._down = false;
             timer.stop();
@@ -467,6 +457,21 @@ QtObject {
                 timer._paused = true;
                 done();
             }
+        };
+        // ms: how long (fadeOutMs unless given; transitions patch: a
+        // wallpaper change's length), in steps of at least 50 ms each.
+        const fadeDown = (ms) => {
+            const len = ms === undefined ? fadeOutMs : Math.max(0, Number(ms) || 0);
+            if (timer.volumeFade <= 0 || len === 0) {
+                timer.volumeFade = 0;
+                finishDown();
+                return;
+            }
+            const steps = Math.max(fadeOutSteps, Math.ceil(len / 50));
+            timer._downStep = Math.max(0.5, timer.volumeFade / steps);
+            timer._down = true;
+            timer.interval = Math.max(1, Math.round(len / steps));
+            if (!timer.running) timer.start();
         };
         const fadeUp = () => {
             timer._down = false;
@@ -512,9 +517,11 @@ QtObject {
                 if (timer.muted && timer._down) return;   // the mute's fade-out goes on
                 fadeUp();
             },
-            fadeOut: (done) => {
+            // done: called at 0 (a pause's player.pause()); ms: the length,
+            // fadeOutMs unless given (a transition's, from main.qml).
+            fadeOut: (done, ms) => {
                 timer._pauseDone = done || function() {};
-                fadeDown();
+                fadeDown(ms);
             },
             stop: () => {
                 timer._down = false;

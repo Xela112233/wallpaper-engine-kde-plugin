@@ -126,6 +126,13 @@ Item{
         audioOut.muted = audioOut.muted;
         if (volumeFade) volumeFade.freeze();
     }
+    // A mute that comes on while this is the old layer of a handoff, its
+    // options frozen (main.qml's muteOutgoingNow, transitions patch): the
+    // sound goes at once.
+    function muteNow() {
+        if (volumeFade) volumeFade.stop();
+        audioOut.muted = true;
+    }
     function getMouseTarget() {
     }
 }

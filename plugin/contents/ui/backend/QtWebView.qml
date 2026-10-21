@@ -736,6 +736,12 @@ Item {
         userPropsJson = userPropsJson;
         web.audioMuted = web.audioMuted;
     }
+    // A mute that comes on while this is the old layer of a handoff, its
+    // options frozen (main.qml's muteOutgoingNow, transitions patch): the
+    // sound goes at once.
+    function muteNow() {
+        web.audioMuted = true;
+    }
     function getMouseTarget() {
         web.activeFocusOnPress = true;
         return Qt.binding(function() { return web.children[0]; })

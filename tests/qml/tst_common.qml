@@ -618,6 +618,30 @@ TestCase {
         inp.destroy();
     }
 
+    // The transitions patch: a wallpaper change fades the old one's sound
+    // over the transition's length (fadeOut's ms), 0 at once.
+    function test_createVolumeFade_fadeOutTakesTheLengthItIsGiven() {
+        const inp = fadeInputs.createObject(testCaseRoot);
+        const f = _fade(inp);
+        f.start();
+        f.state.volumeFade = 60;
+        const t0 = Date.now();
+        f.fadeOut(() => { inp.pauses += 1; }, 1200);
+        wait(500);
+        verify(inp.level > 0 && inp.level < 60, "not fading over 1.2 s: " + inp.level);
+        compare(inp.pauses, 0);
+        tryVerify(() => inp.pauses === 1, 3000);
+        const took = Date.now() - t0;
+        verify(took >= 1000 && took < 2500, "the 1.2 s fade took " + took + " ms");
+        f.start();
+        f.state.volumeFade = 60;
+        f.fadeOut(() => { inp.pauses += 1; }, 0);
+        compare(inp.pauses, 2, "0 did not end at once");
+        compare(inp.level, 0);
+        f.state.destroy();
+        inp.destroy();
+    }
+
     function test_createVolumeFade_stopCutsAtOnce() {
         const inp = fadeInputs.createObject(testCaseRoot);
         const f = _fade(inp);

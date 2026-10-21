@@ -107,6 +107,23 @@ Rectangle {
     readonly property bool reducedMotion: Kirigami.Settings.hasOwnProperty('hasReducedAnimations')
                                           ? Kirigami.Settings.hasReducedAnimations
                                           : false
+    // A change of wallpaper (we-manager transitions patch): how long the
+    // handoff takes once the new wallpaper has drawn its first frame (ms, 0 a
+    // cut), and how the old one goes: fade, zoom (it grows as it fades) or
+    // slide (the new one pushes it off to the left).  Any other type fades.
+    // Reduce animations makes every one a cut.  Read when the handoff starts.
+    readonly property int    transitionMs: reducedMotion ? 0
+                                           : Math.max(0, Math.min(5000, Number(wallpaper.configuration.TransitionDuration ?? 250) || 0))
+    readonly property string transitionType: {
+        const t = String(wallpaper.configuration.TransitionType ?? "fade");
+        return ["fade", "zoom", "slide"].indexOf(t) >= 0 ? t : "fade";
+    }
+    // Set around a load that is not a change of wallpaper (a reload of the
+    // same one, unit 14's resume reload): its handoff is a cut.
+    property string _transitionCause: ""
+    // Tests only: stands in for loadBackend() in reloadWallpaper(), to show
+    // that a load that throws still clears _transitionCause and _guardWhy.
+    property var    _reloadLoadForTest: null
     // Media integration (we-manager): the media player's track, cover and
     // playback state for scene scripts and web wallpapers (Scene.qml,
     // QtWebView.qml); off, neither backend watches the player.
@@ -150,8 +167,13 @@ Rectangle {
     // globalMute and autoMuted) and AudioOutput off, which also keeps every
     // backend from opening an audio stream at all.
     readonly property bool audioOutput: wallpaper.configuration.AudioOutput ?? true
-    property bool   mute: !audioOutput || playlistController.globalMute || playlistController.autoMuted
-                          || windowModel.reqMute || get_opt_value('mute_audio', wallpaper.configuration.MuteAudio)
+    // The mutes that hold whatever shows on this screen, not one wallpaper's
+    // own setting (transitions patch: they reach the old layer of a handoff
+    // too, whose options are frozen).
+    readonly property bool screenMute: !audioOutput || playlistController.globalMute || playlistController.autoMuted
+                                       || windowModel.reqMute
+    property bool   mute: screenMute || get_opt_value('mute_audio', wallpaper.configuration.MuteAudio)
+    onScreenMuteChanged: if (screenMute) backendLoader.muteOutgoingNow()
     // WekControl.MuteStatus, through PlaylistController.muteStatus(): why this
     // screen is silent.
     function muteStatusReport() {
@@ -343,6 +365,18 @@ Rectangle {
     // Two wallpapers at once (the handoff keeps the old one until the new
     // one draws) only while the video memory has room for both.
     readonly property bool overlapAllowed: !(vramStopOn && vramWatch !== null && vramWatch.tight)
+    // Too little room now for the two a handoff keeps (transitions patch):
+    // the old layer goes at once rather than at the end of its transition.
+    onOverlapAllowedChanged: if (!overlapAllowed) backendLoader.dropOutgoingNow("video memory is tight")
+    // What this screen's scenes hold now (transitions patch): during a
+    // handoff the old scene still holds its memory for the transition's
+    // length, so it counts with the new one.  With no scene alive (a stop),
+    // the last estimate, which is what a reload will need again.
+    readonly property int vramEstimateNow: {
+        const live = backendLoader.vramOf(backendLoader.item) + backendLoader.vramOf(backendLoader._outgoing)
+                   + backendLoader.vramOf(outgoingFade.target);
+        return live > 0 ? live : vramEstimateMiB;
+    }
     onVramStopOnChanged: {
         if (vramStopOn && vramWatch === null) makeVramWatch();
         updateVramStop();
@@ -360,7 +394,7 @@ Rectangle {
         });
         // A library from before the texture-quality patch has no estimate.
         Common.setIfSupported(background.vramWatch, "VramSampler", "estimateMiB",
-                              Qt.binding(function() { return background.vramEstimateMiB; }));
+                              Qt.binding(function() { return background.vramEstimateNow; }));
     }
     function updateVramStop() {
         const w = background.vramWatch;
@@ -594,8 +628,14 @@ Rectangle {
                    : (how === "shortcut" ? "asked by the Reload current wallpaper shortcut" : "asked over " + how);
         background._reloadLine(tag + "reloading the wallpaper on " + where + " (" + what + "): " + said);
         background._guardWhy = cause === "resume" ? "resume" : "";
-        background.loadBackend();
-        background._guardWhy = "";          // spent by markLoadGuard, or the load went no further
+        background._transitionCause = "reload";     // the same wallpaper again: a cut (transitions patch)
+        try {
+            if (typeof background._reloadLoadForTest === "function") background._reloadLoadForTest();
+            else background.loadBackend();
+        } finally {
+            background._guardWhy = "";          // spent by markLoadGuard, or the load went no further
+            background._transitionCause = "";   // load() took it for its handoff, if there was one
+        }
         return true;
     }
 
@@ -625,6 +665,7 @@ Rectangle {
                 // At once, no fade-out (mute patch): the machine may be about
                 // to sleep, and nobody hears the last half second anyway.
                 if (backendLoader.item) backendLoader.item.pause(true);
+                backendLoader.holdOutgoing(true);
             } else {
                 console.log("Waking up (VT switch back)");
                 diagnostics.logPauseTransition("tty", true);
@@ -1340,13 +1381,20 @@ Rectangle {
 
         // Handoff between backends: the backend already on screen stays
         // (still playing, stacked above) until the new one reports its first
-        // frame (frameShown), then fades out over 250 ms.  A cold scene start
-        // can take seconds; fading the old one out right away showed the bare
-        // background colour and the desktop icons for all of that.  The fade
-        // is an instant cut when the desktop has "Reduce animations" enabled.
+        // frame (frameShown).  A cold scene start can take seconds; dropping
+        // the old one right away showed the bare background colour and the
+        // desktop icons for all of that.  Then the transition (we-manager
+        // transitions patch): over background.transitionMs (250 by default,
+        // 0 a cut, and a cut with Reduce animations) the old one fades, zooms
+        // or is pushed off by the new one (background.transitionType).  A
+        // handoff that is not a change of wallpaper (a reload of the same
+        // one, an InfoShow screen either side) always cuts.
         property var _outgoing: null
+        property bool _outgoingCuts: false      // the pending handoff cuts
+        property bool _outgoingIsInfo: false
+        property bool _itemIsInfo: false
         // Backends alive now: 2 during a handoff (the vram patch's log names it).
-        readonly property int liveBackends: (item ? 1 : 0) + (_outgoing ? 1 : 0)
+        readonly property int liveBackends: (item ? 1 : 0) + (_outgoing ? 1 : 0) + (outgoingFade.target ? 1 : 0)
 
         signal loaded
 
@@ -1357,19 +1405,52 @@ Rectangle {
             interval: 25000
             onTriggered: backendLoader.dropOutgoing()
         }
-        NumberAnimation {
+        // What an animation of the transition holds when nothing is given.
+        Item { id: noTarget; visible: false }
+        // A slide moves the layers by these: the backends are anchored to
+        // fill the loader, so their own x cannot move.
+        Translate { id: outgoingShift }
+        Translate { id: incomingShift }
+        // The transition: the old layer (target) goes; with slide the new one
+        // (incoming) comes in from the right as the old one leaves to the left.
+        // Values are set by dropOutgoing() before each start.
+        ParallelAnimation {
             id: outgoingFade
-            property: "opacity"
-            to: 0
-            duration: background.reducedMotion ? 0 : 250
-            onFinished: {
-                // Invisible now.  A backend that can wind down asynchronously
-                // (mpv) gets a moment to do so before its render-thread
-                // teardown, instead of stalling the scenegraph.
-                if (target) backendLoader.retire(target);
-                target = null;
-                if (background._accentPending) background.emitAccentColor();
+            property var    target: null
+            property var    incoming: null
+            property string kind: "fade"
+            property int    ms: 250
+            NumberAnimation {
+                target: outgoingFade.target || noTarget
+                property: "opacity"
+                to: outgoingFade.kind === "slide" ? 1 : 0
+                duration: outgoingFade.ms
+                easing.type: Easing.InOutQuad
             }
+            NumberAnimation {
+                target: outgoingFade.target || noTarget
+                property: "scale"
+                to: outgoingFade.kind === "zoom" ? 1.3 : 1
+                duration: outgoingFade.ms
+                easing.type: Easing.OutQuad
+            }
+            NumberAnimation {
+                target: outgoingShift
+                property: "x"
+                from: 0
+                to: outgoingFade.kind === "slide" ? -backendLoader.width : 0
+                duration: outgoingFade.ms
+                easing.type: Easing.InOutQuad
+            }
+            NumberAnimation {
+                target: incomingShift
+                property: "x"
+                from: outgoingFade.kind === "slide" ? backendLoader.width : 0
+                to: 0
+                duration: outgoingFade.ms
+                easing.type: Easing.InOutQuad
+            }
+            onFinished: backendLoader.endTransition()
         }
 
         Component.onCompleted: {
@@ -1381,6 +1462,7 @@ Rectangle {
             this.loaded.connect(function() { background.keyboardMode = false; });
         }
         Component.onDestruction: {
+            this.endTransition();
             if(this.item) this.retire(this.item);
             if(this._outgoing) this.retire(this._outgoing);
         }
@@ -1396,37 +1478,108 @@ Rectangle {
                 backend.destroy();
             }
         }
+        // What a backend's scene holds (Scene.qml vramMiB), for the VRAM guard.
+        function vramOf(backend) {
+            return backend && typeof backend.vramMiB === "number" ? backend.vramMiB : 0;
+        }
+        // The transition is over, or cut short: the old layer goes (hidden
+        // first, so a backend that winds down for a moment is not seen), the
+        // new one is in place.  With no old layer left on top, an accent
+        // colour that waited for it goes to Plasma now, however the
+        // transition ended (its end, a pause, a VT switch, tight memory, a
+        // stop).
+        function endTransition() {
+            const old = outgoingFade.target, incoming = outgoingFade.incoming;
+            if (outgoingFade.running) outgoingFade.stop();
+            outgoingFade.target = null;
+            outgoingFade.incoming = null;
+            this.clip = false;
+            if (incoming) incoming.transform = [];
+            outgoingShift.x = 0;
+            incomingShift.x = 0;
+            if (old) {
+                old.visible = false;
+                this.retire(old);
+            }
+            if (!this._outgoing && background._accentPending) background.emitAccentColor();
+        }
         // Stop: every backend goes now, the outgoing layer too, with no fade.
         function unload() {
             handoffTimeout.stop();
-            if (outgoingFade.running) outgoingFade.stop();
-            if (outgoingFade.target) this.retire(outgoingFade.target);
-            outgoingFade.target = null;
             if (this._outgoing) this.retire(this._outgoing);
             this._outgoing = null;
+            this.endTransition();
             const cur = this.item;
             this.item = null;
             if (cur) this.retire(cur);
             if (background.mouseHooker) background.mouseHooker.target = null;
             background.nowBackend = "";
         }
-        // Fade the outgoing backend out and destroy it.
+        // The new one is on screen (or never will be): the old one goes, by
+        // the transition.
         function dropOutgoing() {
             handoffTimeout.stop();
             const old = this._outgoing;
-            this._outgoing = null;
+            const cut = this._outgoingCuts;
+            this._outgoingCuts = false;
             if (!old) return;
-            if (outgoingFade.running) {
-                outgoingFade.stop();
-                if (outgoingFade.target) this.retire(outgoingFade.target);
-            }
+            // One still under way ends now (load() ends it first, so this is
+            // a guard); `old` is still the old layer on top, so an accent
+            // colour goes on waiting, for its transition.
+            this.endTransition();
+            this._outgoing = null;
+            const ms = cut ? 0 : background.transitionMs;
+            const kind = cut || !this.item ? "fade" : background.transitionType;
+            // Its sound fades out with it, while the new one's fades in (mute
+            // patch's fade, over the transition's length).
+            if (old.volumeFade && typeof old.volumeFade.fadeOut === "function")
+                old.volumeFade.fadeOut(function() {}, ms);
             outgoingFade.target = old;
+            outgoingFade.incoming = this.item;
+            outgoingFade.kind = kind;
+            outgoingFade.ms = ms;
+            this.clip = kind !== "fade" && ms > 0;
+            if (kind === "slide") {
+                old.transform = [outgoingShift];
+                this.item.transform = [incomingShift];
+            }
             outgoingFade.start();
+        }
+        // The old layer goes now, transition or not (video memory too tight
+        // for two).
+        function dropOutgoingNow(why) {
+            if (!this._outgoing && !outgoingFade.target) return;
+            console.log("[WEK] transition: the old wallpaper on " + (background.Screen.name || "this screen")
+                        + " goes at once: " + why);
+            handoffTimeout.stop();
+            const old = this._outgoing;
+            this._outgoing = null;
+            this._outgoingCuts = false;
+            if (old) {
+                old.visible = false;
+                this.retire(old);
+            }
+            this.endTransition();
+        }
+        // A mute that comes on during a handoff (screenMute): the old
+        // layer's options are frozen, so its sound is cut here, at once.
+        function muteOutgoingNow() {
+            for (const old of [this._outgoing, outgoingFade.target])
+                if (old && typeof old.muteNow === "function") old.muteNow();
+        }
+        // A pause (now: a VT switch or sleep) during a handoff: a transition
+        // under way ends at once; an old layer still waiting for the new one's
+        // first frame is the only picture, so it stays, and pauses too.
+        function holdOutgoing(now) {
+            if (outgoingFade.target) this.endTransition();
+            if (this._outgoing && typeof this._outgoing.pause === "function") this._outgoing.pause(now);
         }
         function load(url, properties) {
             const com = Qt.createComponent(url);
             if(com.status === Component.Ready) {
+                const info = String(url).indexOf("InfoShow.qml") >= 0;
                 const prev = this.item;
+                const prevInfo = this._itemIsInfo;
                 this.item = null;
                 if (prev) {
                     if (prev.frameShown === false) {
@@ -1435,19 +1588,29 @@ Rectangle {
                         this.retire(prev);
                     } else if (!background.overlapAllowed) {
                         // Video memory has no room for two (VramStop): a cut.
+                        this.endTransition();
                         if (this._outgoing) this.retire(this._outgoing);
                         this._outgoing = null;
                         this.retire(prev);
                     } else {
+                        // One old layer at most: one still going (A, while
+                        // B came in) goes now, B becomes the old layer.
+                        this.endTransition();
                         if (this._outgoing) this.retire(this._outgoing);
                         // Keeps playing until the new one is on screen.
                         this._outgoing = prev;
+                        this._outgoingIsInfo = prevInfo;
                         // background.* now follows the next wallpaper; pin
                         // what this one shows (fill mode, speed, user props).
                         if (typeof prev.freezeOptions === "function")
                             prev.freezeOptions();
                     }
                 }
+                // Whatever stays on screen, this handoff is a change of
+                // wallpaper only if neither side is an InfoShow screen and
+                // the load is not a reload.
+                if (this._outgoing)
+                    this._outgoingCuts = background._transitionCause !== "" || info || this._outgoingIsInfo;
                 if (this._outgoing) this._outgoing.z = 1;
                 let created = null;
                 try {
@@ -1457,6 +1620,7 @@ Rectangle {
                     return;
                 }
                 this.item = created;
+                this._itemIsInfo = info;
                 if (created) {
                     created.z = 0;
                     if (created.frameShown === false) {
@@ -1651,6 +1815,7 @@ Rectangle {
     }
    
     function autoPause() {
+        if (! background.ok) backendLoader.holdOutgoing(false);
         if (! backendLoader.item) return;
         if (background.ok) backendLoader.item.play();
         else backendLoader.item.pause();

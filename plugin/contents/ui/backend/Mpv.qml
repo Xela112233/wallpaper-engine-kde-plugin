@@ -164,6 +164,13 @@ Item{
             if (name in player) player[name] = player[name];
         if (volumeFade) volumeFade.freeze();
     }
+    // A mute that comes on while this is the old layer of a handoff, its
+    // options frozen (main.qml's muteOutgoingNow, transitions patch): the
+    // sound goes at once.
+    function muteNow() {
+        if (volumeFade) volumeFade.stop();
+        player.mute = true;
+    }
     // Called by main.qml once this backend has faded out, some time before
     // destroying it: mpv drops its video output off the render thread, so
     // ~MpvRender no longer waits on the core there.

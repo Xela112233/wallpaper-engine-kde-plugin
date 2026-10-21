@@ -30,6 +30,7 @@ Flickable {
     property alias cfg_UnpauseOnShowDesktop: ckbox_unpauseOnShowDesktop.checked
     property alias cfg_UnpauseOnOverview: ckbox_unpauseOnOverview.checked
     property alias cfg_UnloadAfterPausedMin: spin_unloadAfterPausedMin.value
+    property alias cfg_TransitionDuration: spin_transitionDuration.value
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
     property alias cfg_MouseInput: ckbox_mouseInput.checked
@@ -296,6 +297,39 @@ Flickable {
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
                         text: i18nc("@info vram stop help text", "Unloads the wallpaper when the graphics card has too little memory free for 3 seconds (a game or another program took it), so that program gets it; the preview shows meanwhile. It loads again once there is room for it and a margin, waiting longer each time memory runs out again soon after. Needs a Vulkan driver that reports free memory (VK_EXT_memory_budget).")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Transition")
+                text_color: Kirigami.Theme.textColor
+                actor: ComboBox {
+                    id: cbTransitionType
+                    model: [
+                        { text: i18nc("@item:inlistbox wallpaper transition", "Fade"),  value: "fade" },
+                        { text: i18nc("@item:inlistbox wallpaper transition", "Zoom"),  value: "zoom" },
+                        { text: i18nc("@item:inlistbox wallpaper transition", "Slide"), value: "slide" },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_TransitionType = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_TransitionType))
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Transition length (ms)")
+                text_color: Kirigami.Theme.textColor
+                actor: SpinBox {
+                    id: spin_transitionDuration
+                    from: 0
+                    to: 5000
+                    stepSize: 50
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info transition help text", "How the old wallpaper gives way to a new one, once the new one has drawn: Fade, Zoom (it grows as it fades) or Slide (the new one pushes it off to the left). 0 ms is a cut. A reload of the same wallpaper and the plugin's own message screens always cut, and so does every change when the desktop reduces animations or, with Stop when video memory runs out, when memory is too tight for both.")
                         wrapMode: Text.Wrap
                     }
                 }

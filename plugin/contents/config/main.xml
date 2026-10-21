@@ -74,6 +74,16 @@
       <label>Stop when video memory runs out: the wallpaper unloads when the GPU has too little free for 3 seconds, and loads again when there is room for it and a margin (we-manager vram patch)</label>
       <default>false</default>
     </entry>
+    <entry name="TransitionDuration" type="Int">
+      <label>How long a change of wallpaper takes, in milliseconds, once the new one has drawn its first frame; 0 is a cut, and so is every change when the desktop reduces animations (we-manager transitions patch)</label>
+      <default>250</default>
+      <min>0</min>
+      <max>5000</max>
+    </entry>
+    <entry name="TransitionType" type="String">
+      <label>How the old wallpaper goes: fade, zoom (it grows as it fades) or slide (the new one pushes it off to the left); any other value fades</label>
+      <default>fade</default>
+    </entry>
     <entry name="UnloadAfterPausedMin" type="Int">
       <label>Unload a wallpaper that has been paused this many minutes, and load it again when the pause ends (0=never)</label>
       <default>0</default>
