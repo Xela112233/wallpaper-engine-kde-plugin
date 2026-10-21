@@ -33,6 +33,16 @@ QPointer<QObject>& keyboardOwner() {
     return owner;
 }
 
+std::function<void()>& audioConfigReloader() {
+    static std::function<void()> reload;
+    return reload;
+}
+
+std::function<QString()>& audioCaptureStatusReader() {
+    static std::function<QString()> read;
+    return read;
+}
+
 void broadcast(const char* method) {
     for (const QPointer<QObject>& ctrl : controllerRegistry())
         if (ctrl) QMetaObject::invokeMethod(ctrl, method, Qt::QueuedConnection);
@@ -191,6 +201,33 @@ void WekControl::ToggleKeyboard() {
 
 void WekControl::keyboardModeEnded() {
     if (m_controller && keyboardOwner() == m_controller) keyboardOwner() = nullptr;
+}
+
+// -- Audio configuration (process-wide) --
+
+void WekControl::setAudioConfigReloader(std::function<void()> reload) {
+    audioConfigReloader() = std::move(reload);
+}
+
+void WekControl::setAudioCaptureStatusReader(std::function<QString()> read) {
+    audioCaptureStatusReader() = std::move(read);
+}
+
+QString WekControl::AudioCaptureStatus() {
+    if (! audioCaptureStatusReader()) {
+        qWarning("wek-dbus: AudioCaptureStatus: no capture status reader installed");
+        return {};
+    }
+    return audioCaptureStatusReader()();
+}
+
+bool WekControl::ReloadAudioConfig() {
+    if (! audioConfigReloader()) {
+        qWarning("wek-dbus: ReloadAudioConfig: no audio reloader installed; audio.json not re-read");
+        return false;
+    }
+    audioConfigReloader()();
+    return true;
 }
 
 // -- Query (sync) --

@@ -53,6 +53,7 @@ Item {
         "MpvHwdec":            true,
         "MpvLoadInMemory":     false,
         "MpvVideoSync":        0,
+        "AudioConfigFile":     true,
         "VerboseLogging":      false,
         "MouseInput":          false,
         "KeyboardInput":       false,    // matches main.xml default (we-manager input patch)

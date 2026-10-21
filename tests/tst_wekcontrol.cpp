@@ -185,6 +185,11 @@ private slots:
     // -- Q_CLASSINFO contract --------------------------------------
     void qClassInfo_dbusInterfaceName_isCorrect();
 
+    // -- Audio configuration (audio-config patch) -------------------------
+    void reloadAudioConfig_runsTheInstalledReloader();
+    void reloadAudioConfig_withoutReloader_returnsFalse();
+    void audioCaptureStatus_answersWhatTheReaderSays();
+
     // -- Ctor-injected connection (the dbus-launch fallback seam) ------
     void registerOnConnection_acceptsInjectedBus_orReturnsNull();
 };
@@ -676,6 +681,42 @@ void TestWekControl::qClassInfo_dbusInterfaceName_isCorrect() {
     QVERIFY(idx >= 0);
     QCOMPARE(QString(meta->classInfo(idx).value()),
              QString("com.github.captsilver.WallpaperEngine"));
+}
+
+// -- Audio configuration (audio-config patch) --------------------------
+// The plugin installs AudioBus::Reconfigure; the D-Bus method only runs it.
+
+void TestWekControl::reloadAudioConfig_runsTheInstalledReloader() {
+    int runs = 0;
+    WekControl::setAudioConfigReloader([&runs] { ++runs; });
+    auto control = std::make_unique<WekControl>();
+    QVERIFY(control->ReloadAudioConfig());
+    QVERIFY(control->ReloadAudioConfig());
+    QCOMPARE(runs, 2);
+    // A slot, so QDBusConnection::ExportAllSlots exports it with the others.
+    QVERIFY(control->metaObject()->indexOfSlot("ReloadAudioConfig()") >= 0);
+    WekControl::setAudioConfigReloader({});
+}
+
+void TestWekControl::audioCaptureStatus_answersWhatTheReaderSays() {
+    QString state = QStringLiteral("failed");
+    WekControl::setAudioCaptureStatusReader([&state] { return state; });
+    auto control = std::make_unique<WekControl>();
+    QCOMPARE(control->AudioCaptureStatus(), QStringLiteral("failed"));
+    state = QStringLiteral("on");
+    QCOMPARE(control->AudioCaptureStatus(), QStringLiteral("on"));
+    // A slot, so it is on the bus with ReloadAudioConfig.
+    QVERIFY(control->metaObject()->indexOfSlot("AudioCaptureStatus()") >= 0);
+    WekControl::setAudioCaptureStatusReader({});
+    QTest::ignoreMessage(QtWarningMsg, QRegularExpression("AudioCaptureStatus: no capture status reader"));
+    QCOMPARE(control->AudioCaptureStatus(), QString());
+}
+
+void TestWekControl::reloadAudioConfig_withoutReloader_returnsFalse() {
+    WekControl::setAudioConfigReloader({});
+    auto control = std::make_unique<WekControl>();
+    QTest::ignoreMessage(QtWarningMsg, QRegularExpression("ReloadAudioConfig: no audio reloader"));
+    QVERIFY(! control->ReloadAudioConfig());
 }
 
 // -- Ctor-injected connection (the dbus-launch fallback seam) ------

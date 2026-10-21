@@ -220,6 +220,10 @@
       <label>System Audio Capture</label>
       <default>true</default>
     </entry>
+    <entry name="AudioConfigFile" type="Bool">
+      <label>Marker, never read: this build takes the audio capture source, sensitivity, noise floor, attack and decay from ~/.config/wekde/audio.json (one file for every screen), reloaded by the ReloadAudioConfig D-Bus method; tools tell it from other builds by this entry</label>
+      <default>true</default>
+    </entry>
     <entry name="MediaIntegration" type="Bool">
       <label>Media integration: scene and web wallpapers get the media player's title, artist, album, cover, playback state and position over MPRIS</label>
       <default>true</default>

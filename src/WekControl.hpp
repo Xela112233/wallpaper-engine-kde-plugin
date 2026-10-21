@@ -4,6 +4,8 @@
 #include <QPointer>
 #include <QString>
 
+#include <functional>
+
 namespace wekde
 {
 
@@ -88,6 +90,14 @@ public:
     // ToggleKeyboard starts it again instead of ending it.
     Q_INVOKABLE void keyboardModeEnded();
 
+    // What ReloadAudioConfig runs: the plugin installs the scene renderer's
+    // AudioBus::Reconfigure at start (plugin.cpp), tests a fake.  Kept out
+    // of this class so it builds without the renderer.
+    static void setAudioConfigReloader(std::function<void()> reload);
+    // What AudioCaptureStatus answers (the plugin: AudioBus::CaptureStatus,
+    // "pending" while a reload runs).
+    static void setAudioCaptureStatusReader(std::function<QString()> read);
+
 public slots:
     // Playlist navigation
     Q_NOREPLY void Next();
@@ -110,6 +120,19 @@ public slots:
     // under the pointer, else the one whose desktop window is active, else
     // the first that can take it (KeyboardInput on, a web wallpaper).
     Q_NOREPLY void ToggleKeyboard();
+
+    // Re-read ~/.config/wekde/audio.json (we-manager's Settings > Audio
+    // writes it): the capture source, sensitivity, noise floor, attack and
+    // decay of the process-wide audio analyzer.  Every screen shares it.
+    // Returns false when no reloader is installed.  The reload runs off the
+    // GUI thread; AudioCaptureStatus says how it went.
+    bool ReloadAudioConfig();
+    // The process-wide capture: "off" (no wallpaper wants system audio),
+    // "on", "fallback" (the source audio.json names is absent; the default
+    // output's monitor meanwhile), "failed" (nothing could be opened), or
+    // "pending" while a ReloadAudioConfig still runs; "" when the plugin
+    // installed no reader.
+    QString AudioCaptureStatus();
 
     // Query (sync, returns a value — D-Bus method, not signal/property)
     QString CurrentWorkshopId() const;

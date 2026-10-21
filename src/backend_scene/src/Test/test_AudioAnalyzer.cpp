@@ -309,6 +309,85 @@ TEST_SUITE("AudioAnalyzer.Smoothing") {
 
 } // Smoothing
 
+// The KDE plugin's audio.json (AudioBus::ReadConfig) sets these at runtime:
+// sensitivity scales the gain, the noise floor is taken off after it, and
+// attack/decay replace the smoothing constants.
+TEST_SUITE("AudioAnalyzer.Tuning") {
+    static float peakAfter(AudioAnalyzer& a, float amplitude) {
+        auto pcm = makeSineStereo(1000.f, MIN_FRAMES_TO_FFT * 8, 48000, amplitude);
+        a.FeedPcm(pcm.data(), MIN_FRAMES_TO_FFT * 8, 2);
+        a.Process();
+        float peak = 0.0f;
+        for (float v : a.GetRawSpectrum(64, 0)) peak = std::max(peak, v);
+        return peak;
+    }
+
+    TEST_CASE("the default tuning is the built-in gain and smoothing") {
+        AudioAnalyzer a;
+        const auto    t = a.GetTuning();
+        CHECK(t.gain == doctest::Approx(15.0f));
+        CHECK(t.floor == 0.0f);
+        CHECK(t.attack == doctest::Approx(0.8f));
+        CHECK(t.decay == doctest::Approx(0.4f));
+    }
+
+    TEST_CASE("more gain gives taller bands for the same sound") {
+        AudioAnalyzer quiet, loud;
+        auto          t = quiet.GetTuning();
+        t.gain          = 7.5f; // sensitivity 25
+        quiet.SetTuning(t);
+        t.gain = 30.0f; // sensitivity 100
+        loud.SetTuning(t);
+        const float q = peakAfter(quiet, 0.05f);
+        const float l = peakAfter(loud, 0.05f);
+        CHECK(q > 0.0f);
+        CHECK(l > q * 1.2f);
+    }
+
+    TEST_CASE("a noise floor above a quiet signal keeps every band at zero") {
+        AudioAnalyzer a, floored;
+        auto          t = floored.GetTuning();
+        t.floor         = 1.0f; // audio.json floor 100
+        floored.SetTuning(t);
+        CHECK(peakAfter(a, 0.01f) > 0.0f);
+        CHECK(peakAfter(floored, 0.01f) == 0.0f);
+    }
+
+    TEST_CASE("a smaller attack makes the first window rise less") {
+        AudioAnalyzer fast, slow;
+        auto          t = slow.GetTuning();
+        t.attack        = 0.1f;
+        slow.SetTuning(t);
+        auto pcm = makeSineStereo(1000.f, MIN_FRAMES_TO_FFT * 2, 48000, 0.3f);
+        fast.FeedPcm(pcm.data(), MIN_FRAMES_TO_FFT * 2, 2);
+        slow.FeedPcm(pcm.data(), MIN_FRAMES_TO_FFT * 2, 2);
+        fast.Process();
+        slow.Process();
+        float f = 0.0f, s = 0.0f;
+        for (float v : fast.GetRawSpectrum(64, 0)) f = std::max(f, v);
+        for (float v : slow.GetRawSpectrum(64, 0)) s = std::max(s, v);
+        CHECK(s < f * 0.5f);
+    }
+
+    TEST_CASE("SetTuning clamps out-of-range and non-finite values") {
+        AudioAnalyzer         a;
+        AudioAnalyzer::Tuning t;
+        t.gain   = -3.0f;
+        t.floor  = -1.0f;
+        t.attack = 0.0f;
+        t.decay  = 5.0f;
+        a.SetTuning(t);
+        auto got = a.GetTuning();
+        CHECK(got.gain == 0.0f);
+        CHECK(got.floor == 0.0f);
+        CHECK(got.attack == doctest::Approx(0.01f));
+        CHECK(got.decay == doctest::Approx(0.99f));
+        t.gain = std::nanf("");
+        a.SetTuning(t);
+        CHECK(a.GetTuning().gain == doctest::Approx(15.0f));
+    }
+} // Tuning
+
 // MPSC producer race + consumer overrun cushion.  These tests pin the contract:
 //   (1) two concurrent FeedPcm callers don't tear ring stores (verified under
 //       --tsan, silent otherwise);

@@ -3,12 +3,16 @@
 #include "Audio/AudioCapture.h"
 #include "Utils/Logging.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
+
+#include <nlohmann/json.hpp>
 
 namespace wallpaper
 {
@@ -42,6 +46,11 @@ std::thread                    g_process_thread;
 std::condition_variable        g_process_wake;
 bool                           g_process_quit { false };
 bool                           g_in_null_mode_for_test { false };
+// Test only: a source the null capture cannot open (an unplugged device).
+std::string                    g_null_absent_source_for_test;
+// audio.json's capture source, read when the analyzer is made and by
+// Reconfigure; openCaptureLocked opens it.
+std::string                    g_capture_source;
 
 bool isNullCaptureMode() {
     const char* e = std::getenv("WEK_TEST_AUDIO_NULL_CAPTURE");
@@ -110,6 +119,7 @@ void teardownAll() {
     // time anyone calls .lock() / .expired().
     g_process_quit          = false; // reset for next Acquire cycle
     g_in_null_mode_for_test = false;
+    g_null_absent_source_for_test.clear();
 }
 
 // Stop the capture without tearing down the analyzer / Process thread.
@@ -186,18 +196,27 @@ bool openCaptureLocked() {
         // HasSystemCapture reports true and TEST_getInitCount
         // increments — the test driver feeds PCM into the analyzer
         // directly via AudioAnalyzer::FeedPcm.
+        if (! g_capture_source.empty() && g_capture_source == g_null_absent_source_for_test) return false;
         ++g_init_count;
         g_capture_active = true;
         return true;
     }
     g_capture = std::make_unique<AudioCapture>();
-    if (! g_capture->Init(g_analyzer_strong)) {
+    if (! g_capture->Init(g_analyzer_strong, g_capture_source)) {
         g_capture.reset();
         return false;
     }
     ++g_init_count;
     g_capture_active = true;
     return true;
+}
+
+// What CaptureStatus says.  Must be called with g_mutex held.
+std::string captureStatusLocked() {
+    if (g_capture_want_count == 0) return "off";
+    if (! g_capture_active) return "failed";
+    if (g_capture && g_capture->OnFallback()) return "fallback";
+    return "on";
 }
 
 // ── Process-exit teardown guard ──────────────────────────────────────────────
@@ -233,6 +252,9 @@ std::shared_ptr<AudioAnalyzer> AudioBus::Acquire(bool wantSystemCapture) {
         if (! g_analyzer_strong) {
             g_analyzer_strong       = std::make_shared<AudioAnalyzer>();
             g_analyzer_handle       = g_analyzer_strong;
+            const Config cfg        = ReadConfig(ConfigPath());
+            g_capture_source        = cfg.captureSource;
+            g_analyzer_strong->SetTuning(cfg.tuning);
             g_in_null_mode_for_test = isNullCaptureMode();
             need_start_thread       = true;
         }
@@ -280,6 +302,80 @@ AudioBus::SpectrumConsumer AudioBus::AcquireSpectrumConsumer() {
 bool AudioBus::HasSystemCapture() {
     std::lock_guard<std::mutex> lk(g_mutex);
     return g_capture_active;
+}
+
+std::string AudioBus::ConfigPath() {
+    if (const char* e = std::getenv("WEK_AUDIO_CONFIG"); e && e[0]) return e;
+    if (const char* x = std::getenv("XDG_CONFIG_HOME"); x && x[0])
+        return std::string(x) + "/wekde/audio.json";
+    const char* home = std::getenv("HOME");
+    return std::string(home ? home : "") + "/.config/wekde/audio.json";
+}
+
+AudioBus::Config AudioBus::ReadConfig(const std::string& path) {
+    Config        cfg;
+    std::ifstream in(path);
+    if (! in) return cfg; // no file: the built-in values
+    const nlohmann::json j = nlohmann::json::parse(in, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || ! j.is_object()) {
+        LOG_INFO("Audio config %s is not a JSON object; using the built-in values", path.c_str());
+        return cfg;
+    }
+    auto number = [&j](const char* key, double fallback, double lo, double hi) {
+        const auto it = j.find(key);
+        if (it == j.end() || ! it->is_number()) return fallback;
+        return std::clamp(it->get<double>(), lo, hi);
+    };
+    if (const auto it = j.find("capture_source"); it != j.end() && it->is_string())
+        cfg.captureSource = it->get<std::string>();
+    const AudioAnalyzer::Tuning def {};
+    cfg.tuning.gain   = float(def.gain * number("sensitivity", 50, 0, 100) / 50.0);
+    cfg.tuning.floor  = float(number("floor", 0, 0, 100) / 100.0);
+    cfg.tuning.attack = float(number("attack", def.attack * 100.0, 1, 100) / 100.0);
+    cfg.tuning.decay  = float(number("decay", def.decay * 100.0, 0, 99) / 100.0);
+    return cfg;
+}
+
+std::string AudioBus::Reconfigure() {
+    const Config                cfg = ReadConfig(ConfigPath());
+    std::lock_guard<std::mutex> lk(g_mutex);
+    const bool                  sourceChanged = cfg.captureSource != g_capture_source;
+    g_capture_source                          = cfg.captureSource;
+    if (g_analyzer_strong) g_analyzer_strong->SetTuning(cfg.tuning);
+    LOG_INFO("Audio config reloaded: source '%s', gain %.2f, floor %.2f, attack %.2f, decay %.2f",
+             cfg.captureSource.empty() ? "(default output)" : cfg.captureSource.c_str(),
+             (double)cfg.tuning.gain,
+             (double)cfg.tuning.floor,
+             (double)cfg.tuning.attack,
+             (double)cfg.tuning.decay);
+    // A wallpaper wants system audio and the capture is not on the source
+    // asked for: a new source, or an earlier open that failed (the source
+    // was unplugged when the wallpaper loaded).  Open it now.
+    if (g_capture_want_count > 0 && (sourceChanged || ! g_capture_active)) {
+        stopCaptureLocked();
+        if (! openCaptureLocked()) {
+            LOG_NOTICE("Audio spectrum: the capture source '%s' (%s capture_source) could not be opened; "
+                       "subscribers see analyzer-only mode until the next reload",
+                       cfg.captureSource.empty() ? "the default output's monitor" : cfg.captureSource.c_str(),
+                       ConfigPath().c_str());
+        }
+    }
+    return captureStatusLocked();
+}
+
+std::string AudioBus::CaptureStatus() {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return captureStatusLocked();
+}
+
+void AudioBus::TEST_setNullCaptureAbsentSource(const std::string& source) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_null_absent_source_for_test = source;
+}
+
+std::string AudioBus::TEST_captureSource() {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_capture_source;
 }
 
 bool AudioBus::TEST_isExpired() {

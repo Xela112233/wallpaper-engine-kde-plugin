@@ -45,6 +45,10 @@ function walkQmlFiles(dir) {
 // that in this build PostProcessing and each wallpaper's postprocessing take levels.
 ALLOWLIST.add('PostProcessingLevels');
 
+// AudioConfigFile: a marker, never read.  It tells tools (we-manager reads main.xml) that this
+// build reads ~/.config/wekde/audio.json and answers ReloadAudioConfig over D-Bus.
+ALLOWLIST.add('AudioConfigFile');
+
 function readerText() {
     return walkQmlFiles(uiDir)
         .map((f) => readFileSync(f, 'utf8')

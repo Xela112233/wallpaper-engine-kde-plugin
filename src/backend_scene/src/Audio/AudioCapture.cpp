@@ -48,6 +48,9 @@ struct AudioCapture::Impl {
 
     std::shared_ptr<AudioAnalyzer> analyzer;
     std::atomic<bool>              active { false };
+    // The named source was absent at Init; the default output's monitor is
+    // open instead until the rebind thread opens the named one.
+    std::atomic<bool>              fallback { false };
 
 #ifdef WEK_HAVE_LIBPULSE
     // ---- libpulse: default-sink discovery + change subscription ----
@@ -63,7 +66,11 @@ struct AudioCapture::Impl {
     std::string             boundSink;  // touched only by rebindThread + Init
     std::atomic<bool>       rebindPending { false };
     std::atomic<bool>       shutdown { false };
+    bool                    forceReopen { false }; // protected by rebindMutex
 #endif
+    // A named source (Init's `source`); empty follows the default output.
+    // Written by Init before any thread that reads it starts.
+    std::string fixedSource;
 
     static void captureCallback(ma_device* pDevice, void* pOutput, const void* pInput,
                                 ma_uint32 frameCount) {
@@ -76,11 +83,15 @@ struct AudioCapture::Impl {
     }
 
     bool OpenMaDevice(const std::string& sinkName) {
+        return OpenMaDeviceByName(AudioCapture::DeviceNameFor(sinkName, fixedSource));
+    }
+
+    // Opens the PulseAudio source `monitorName` exactly as named.
+    bool OpenMaDeviceByName(const std::string& monitorName) {
         if (maDeviceInited) {
             StopAndUninitDevice(&maDevice);
             maDeviceInited = false;
         }
-        std::string  monitorName = sinkName + ".monitor";
         ma_device_id devId {};
         std::strncpy(devId.pulse, monitorName.c_str(), sizeof(devId.pulse) - 1);
 
@@ -196,6 +207,8 @@ struct AudioCapture::Impl {
     static void paSubscribedServerInfoCb(pa_context* /*c*/, const pa_server_info* info,
                                          void* userdata) {
         auto* impl = static_cast<Impl*>(userdata);
+        // A named source does not follow the default output.
+        if (! impl->fixedSource.empty()) return;
         if (! info || ! info->default_sink_name) return;
         std::string newSink = info->default_sink_name;
         {
@@ -207,14 +220,35 @@ struct AudioCapture::Impl {
         impl->rebindCV.notify_one();
     }
 
-    static void paSubscribeCb(pa_context* c, pa_subscription_event_type_t t, uint32_t /*idx*/,
+    // A source appeared: when it is the named one coming back (unplugged
+    // and plugged in again, a virtual device re-created), open it again.
+    static void paNewSourceInfoCb(pa_context* /*c*/, const pa_source_info* info, int eol,
+                                  void* userdata) {
+        auto* impl = static_cast<Impl*>(userdata);
+        if (eol != 0 || ! info || ! info->name || impl->fixedSource != info->name) return;
+        {
+            std::lock_guard<std::mutex> lk(impl->rebindMutex);
+            impl->targetSink  = impl->fixedSource;
+            impl->forceReopen = true;
+        }
+        impl->rebindPending = true;
+        impl->rebindCV.notify_one();
+    }
+
+    static void paSubscribeCb(pa_context* c, pa_subscription_event_type_t t, uint32_t idx,
                               void* userdata) {
         // Any server/sink event triggers a default-sink re-check.  Sink unload
         // (e.g. user removes EasyEffects sink) is what makes this necessary —
         // SERVER events alone don't fire on sink removal.
-        auto facility = static_cast<unsigned>(t) & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
+        auto* impl     = static_cast<Impl*>(userdata);
+        auto  facility = static_cast<unsigned>(t) & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
+        auto  type     = static_cast<unsigned>(t) & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
         if (facility == PA_SUBSCRIPTION_EVENT_SERVER || facility == PA_SUBSCRIPTION_EVENT_SINK) {
             pa_operation* op = pa_context_get_server_info(c, paSubscribedServerInfoCb, userdata);
+            if (op) pa_operation_unref(op);
+        } else if (facility == PA_SUBSCRIPTION_EVENT_SOURCE && type == PA_SUBSCRIPTION_EVENT_NEW &&
+                   ! impl->fixedSource.empty()) {
+            pa_operation* op = pa_context_get_source_info_by_index(c, idx, paNewSourceInfoCb, userdata);
             if (op) pa_operation_unref(op);
         }
     }
@@ -259,7 +293,8 @@ struct AudioCapture::Impl {
                         pa_operation* op = pa_context_subscribe(
                             paContext,
                             static_cast<pa_subscription_mask_t>(PA_SUBSCRIPTION_MASK_SERVER |
-                                                                PA_SUBSCRIPTION_MASK_SINK),
+                                                                PA_SUBSCRIPTION_MASK_SINK |
+                                                                PA_SUBSCRIPTION_MASK_SOURCE),
                             nullptr,
                             nullptr);
                         if (op) pa_operation_unref(op);
@@ -325,16 +360,21 @@ struct AudioCapture::Impl {
                          (int)shutdown.load(), (int)rebindPending.load());
                 if (shutdown) return;
                 rebindPending = false;
-                if (targetSink == boundSink) continue;
-                newSink = targetSink;
+                if (targetSink == boundSink && ! forceReopen) continue;
+                forceReopen = false;
+                newSink     = targetSink;
             }
-            LOG_INFO("AudioCapture: default sink changed → rebinding to monitor of '%s'",
-                     newSink.c_str());
+            if (fixedSource.empty())
+                LOG_INFO("AudioCapture: default sink changed → rebinding to monitor of '%s'",
+                         newSink.c_str());
+            else
+                LOG_INFO("AudioCapture: source '%s' is back → opening it again", newSink.c_str());
             // OpenMaDevice stops the old device before freeing it.  Freeing it
             // while it still runs can block this thread for good when the old
             // sink has gone quiet (see StopAndUninitDevice).
             if (OpenMaDevice(newSink)) {
                 boundSink = newSink;
+                fallback  = false;
             } else {
                 // Initial open failed (sink unloaded mid-init, PA race, card
                 // vanished).  Try a short exponential backoff before giving
@@ -344,7 +384,11 @@ struct AudioCapture::Impl {
                 const bool recovered = RetryOpenWithBackoff(
                     newSink, shutdown, rebindPending, rebindCV, rebindMutex,
                     [this](const std::string& s) { return this->OpenMaDevice(s); });
-                if (recovered) boundSink = newSink;
+                // (OpenMaDevice opens a fixed source by its own name.)
+                if (recovered) {
+                    boundSink = newSink;
+                    fallback  = false;
+                }
                 // No `else` log here — RetryOpenWithBackoff already emits the
                 // terminal "rebind to '%s' failed after N retries" line on
                 // giveup.
@@ -358,9 +402,14 @@ AudioCapture::AudioCapture(): m_impl(std::make_unique<Impl>()) {}
 
 AudioCapture::~AudioCapture() { Stop(); }
 
-bool AudioCapture::Init(std::shared_ptr<AudioAnalyzer> analyzer) {
+std::string AudioCapture::DeviceNameFor(const std::string& sink, const std::string& fixedSource) {
+    return fixedSource.empty() ? sink + ".monitor" : fixedSource;
+}
+
+bool AudioCapture::Init(std::shared_ptr<AudioAnalyzer> analyzer, const std::string& source) {
     if (! analyzer) return false;
-    m_impl->analyzer = analyzer;
+    m_impl->analyzer    = analyzer;
+    m_impl->fixedSource = source;
 
     // Init miniaudio context against the PulseAudio backend (works on
     // PipeWire-pulse too).
@@ -377,6 +426,45 @@ bool AudioCapture::Init(std::shared_ptr<AudioAnalyzer> analyzer) {
 
 #ifdef WEK_HAVE_LIBPULSE
     if (m_impl->ConnectPulse()) {
+        if (! source.empty()) {
+            // A named source: opened as given; the subscription watches for
+            // it to come back after it went away.  Absent now (a headset not
+            // plugged in at login): the default output's monitor meanwhile,
+            // and the named source is opened as soon as it appears.
+            std::string bound = source;
+            if (! m_impl->OpenMaDeviceByName(source)) {
+                std::string defaultSink;
+                if (! m_impl->QueryDefaultSinkBlocking(defaultSink) || defaultSink.empty() ||
+                    ! m_impl->OpenMaDeviceByName(AudioCapture::DeviceNameFor(defaultSink, {}))) {
+                    LOG_NOTICE("AudioCapture: failed to open the capture source '%s' (audio.json "
+                               "capture_source), and the default output's monitor too; is it in "
+                               "`pactl list short sources`?",
+                               source.c_str());
+                    return false;
+                }
+                LOG_NOTICE("AudioCapture: the capture source '%s' (audio.json capture_source) is not "
+                           "there; capturing the default output's monitor ('%s') until it appears",
+                           source.c_str(),
+                           AudioCapture::DeviceNameFor(defaultSink, {}).c_str());
+                bound            = defaultSink;
+                m_impl->fallback = true;
+            }
+            {
+                std::lock_guard<std::mutex> lk(m_impl->rebindMutex);
+                m_impl->boundSink  = bound;
+                m_impl->targetSink = source;
+            }
+            m_impl->active       = true;
+            m_impl->rebindThread = std::thread([impl = m_impl.get()] {
+                impl->RebindLoop();
+            });
+            LOG_INFO("AudioCapture: active on '%s' (%u Hz, %u ch) — the named source is reopened when it "
+                     "returns",
+                     m_impl->fallback ? AudioCapture::DeviceNameFor(bound, {}).c_str() : source.c_str(),
+                     m_impl->maDevice.sampleRate,
+                     m_impl->maDevice.capture.channels);
+            return true;
+        }
         std::string defaultSink;
         if (! m_impl->QueryDefaultSinkBlocking(defaultSink) || defaultSink.empty()) {
             LOG_INFO("AudioCapture: no default sink reported by PulseAudio");
@@ -405,6 +493,17 @@ bool AudioCapture::Init(std::shared_ptr<AudioAnalyzer> analyzer) {
     LOG_INFO("AudioCapture: libpulse unavailable, falling back to one-shot enumeration");
 #endif
 
+    if (! source.empty()) {
+        if (! m_impl->OpenMaDeviceByName(source)) {
+            LOG_INFO("AudioCapture: failed to open the capture source '%s' (audio.json capture_source)",
+                     source.c_str());
+            return false;
+        }
+        m_impl->active = true;
+        LOG_INFO("AudioCapture: active on source '%s' (no libpulse: not reopened if it goes away)",
+                 source.c_str());
+        return true;
+    }
     if (! m_impl->InitLegacy()) {
         LOG_INFO("AudioCapture: no monitor source found");
         return false;
@@ -417,6 +516,8 @@ bool AudioCapture::Init(std::shared_ptr<AudioAnalyzer> analyzer) {
 }
 
 bool AudioCapture::IsActive() const { return m_impl->active; }
+
+bool AudioCapture::OnFallback() const { return m_impl->fallback; }
 
 void AudioCapture::Stop() {
     LOG_INFO("AudioCapture::Stop: enter (this=%p)", (void*)this);

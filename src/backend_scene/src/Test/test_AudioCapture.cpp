@@ -71,6 +71,14 @@ TEST_SUITE("AudioCapture") {
         CHECK_FALSE(cap.IsActive());
     }
 
+    // audio.json's capture_source is opened as named; without one the
+    // default output's monitor is.
+    TEST_CASE("DeviceNameFor: a fixed source as named, else the sink's monitor") {
+        CHECK(AudioCapture::DeviceNameFor("alsa_output.pci", "") == "alsa_output.pci.monitor");
+        CHECK(AudioCapture::DeviceNameFor("alsa_output.pci", "alsa_input.usb-mic") == "alsa_input.usb-mic");
+        CHECK(AudioCapture::DeviceNameFor("", "wek_visualiser.monitor") == "wek_visualiser.monitor");
+    }
+
     TEST_CASE("destructor handles never-init'd instance") {
         // Smoke test: just construct and let RAII run.  Catches accidental
         // null derefs in the Impl destructor / Stop() interaction.

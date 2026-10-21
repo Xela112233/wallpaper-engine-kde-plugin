@@ -5,6 +5,7 @@
 #include <kiss_fft.h>
 #include <kiss_fftr.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -52,6 +53,10 @@ constexpr float    MAX_FREQ         = 20000.0f;
 //     old 15.0+hard-clamp saturation problem doesn't return.  Driver:
 //     user explicitly wanted maximum visible amplitude on visualizers.
 constexpr float SPECTRUM_GAIN = 15.0f;
+// audio.json's defaults are exactly the constants above (Tuning's members).
+static_assert(AudioAnalyzer::Tuning {}.gain == SPECTRUM_GAIN);
+static_assert(AudioAnalyzer::Tuning {}.attack == SMOOTHING_ATTACK);
+static_assert(AudioAnalyzer::Tuning {}.decay == SMOOTHING_DECAY);
 
 // Precompute Hanning window coefficients
 struct HanningWindow {
@@ -192,6 +197,13 @@ struct AudioAnalyzer::Impl {
 
     bool hasData { false };
 
+    // SetTuning writes `tuning` under tuningMutex from any thread; Process
+    // copies it into `active` once per call, so the FFT windows read their
+    // own copy without a lock.
+    mutable std::mutex tuningMutex;
+    Tuning             tuning {};
+    Tuning             active {};
+
     // Reader-visible copy of the finished frame; see PublishedSpectrum above.
     PublishedSpectrum     pub {};
     std::atomic<uint32_t> pubSeq { 0 }; // odd while a publish is in flight
@@ -297,19 +309,23 @@ void AudioAnalyzer::Impl::DoOneFFTWindow(uint32_t rp_start) {
             x = std::sqrt(std::max(x, 0.0f));
             return x / (1.0f + x * 0.4f);
         };
-        float newL = softSat(sumL / n * SPECTRUM_GAIN);
-        float newR = softSat(sumR / n * SPECTRUM_GAIN);
+        // The gain (audio.json's sensitivity) and noise floor are the
+        // listener's; softSat clamps what the floor takes below zero.
+        float newL = softSat(sumL / n * active.gain - active.floor);
+        float newR = softSat(sumR / n * active.gain - active.floor);
 
         // Exponential smoothing: fast attack, slow decay
+        const float attack = active.attack;
+        const float decay  = active.decay;
         if (newL >= smoothL64[b])
-            smoothL64[b] = newL * SMOOTHING_ATTACK + smoothL64[b] * (1.0f - SMOOTHING_ATTACK);
+            smoothL64[b] = newL * attack + smoothL64[b] * (1.0f - attack);
         else
-            smoothL64[b] = newL * (1.0f - SMOOTHING_DECAY) + smoothL64[b] * SMOOTHING_DECAY;
+            smoothL64[b] = newL * (1.0f - decay) + smoothL64[b] * decay;
 
         if (newR >= smoothR64[b])
-            smoothR64[b] = newR * SMOOTHING_ATTACK + smoothR64[b] * (1.0f - SMOOTHING_ATTACK);
+            smoothR64[b] = newR * attack + smoothR64[b] * (1.0f - attack);
         else
-            smoothR64[b] = newR * (1.0f - SMOOTHING_DECAY) + smoothR64[b] * SMOOTHING_DECAY;
+            smoothR64[b] = newR * (1.0f - decay) + smoothR64[b] * decay;
 
         rawL64[b] = smoothL64[b];
         rawR64[b] = smoothR64[b];
@@ -385,6 +401,21 @@ void AudioAnalyzer::Impl::PublishFrame() {
 AudioAnalyzer::AudioAnalyzer(): m_impl(std::make_unique<Impl>()) {}
 AudioAnalyzer::~AudioAnalyzer() = default;
 
+void AudioAnalyzer::SetTuning(const Tuning& t) {
+    Tuning c;
+    c.gain   = std::isfinite(t.gain) ? std::max(t.gain, 0.0f) : SPECTRUM_GAIN;
+    c.floor  = std::isfinite(t.floor) ? std::max(t.floor, 0.0f) : 0.0f;
+    c.attack = std::isfinite(t.attack) ? std::clamp(t.attack, 0.01f, 1.0f) : SMOOTHING_ATTACK;
+    c.decay  = std::isfinite(t.decay) ? std::clamp(t.decay, 0.0f, 0.99f) : SMOOTHING_DECAY;
+    std::lock_guard<std::mutex> lock(m_impl->tuningMutex);
+    m_impl->tuning = c;
+}
+
+AudioAnalyzer::Tuning AudioAnalyzer::GetTuning() const {
+    std::lock_guard<std::mutex> lock(m_impl->tuningMutex);
+    return m_impl->tuning;
+}
+
 void AudioAnalyzer::FeedPcm(const float* interleavedStereo, uint32_t frameCount,
                             uint32_t channels) {
     // Write interleaved stereo samples into ring buffer.  MPSC: AudioCapture's
@@ -435,6 +466,10 @@ void AudioAnalyzer::Process() {
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(d.tuningMutex);
+        d.active = d.tuning;
+    }
     uint32_t windowsThisCall = 0;
     while (wp - rp >= FFT_SIZE * 2) {
         d.DoOneFFTWindow(rp);

@@ -16,8 +16,27 @@ namespace audio
 // acquire load.
 class AudioAnalyzer {
 public:
+    // What a listener can change at runtime (the KDE plugin's audio.json,
+    // AudioBus::ReadConfig): the gain on the raw band magnitudes, a floor
+    // taken off after it so a steady hiss drives nothing, and the
+    // exponential smoothing's attack and decay.  The defaults are the
+    // analyzer's constants (SPECTRUM_GAIN, SMOOTHING_ATTACK/DECAY).  The FFT
+    // size and band counts stay compile-time: they size the buffers and the
+    // shaders' g_AudioSpectrum uniforms.
+    struct Tuning {
+        float gain { 15.0f };
+        float floor { 0.0f };
+        float attack { 0.8f }; // share of a louder value taken at once
+        float decay { 0.4f };  // share of the old value kept while it falls
+    };
+
     AudioAnalyzer();
     ~AudioAnalyzer();
+
+    // Any thread.  Clamped to gain >= 0, floor >= 0, attack in [0.01, 1] and
+    // decay in [0, 0.99]; the next Process() call uses it.
+    void   SetTuning(const Tuning& tuning);
+    Tuning GetTuning() const;
 
     // Called from audio thread (miniaudio data_callback).  MPSC: concurrent
     // producers serialize via an internal mutex; consumer is unaffected.

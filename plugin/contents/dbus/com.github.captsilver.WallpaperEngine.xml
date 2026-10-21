@@ -41,6 +41,19 @@
          it, else on for one screen (the one under the pointer, else the one
          whose desktop window is active, else the first that can). -->
     <method name="ToggleKeyboard"/>
+    <!-- Re-read ~/.config/wekde/audio.json (capture source, sensitivity,
+         noise floor, attack, decay) for every screen; false when the plugin
+         installed no reloader (the we-manager build's audio-config patch). -->
+    <method name="ReloadAudioConfig">
+      <arg name="value" type="b" direction="out"/>
+    </method>
+    <!-- The audio capture after a reload: "off" (no wallpaper wants system
+         audio), "on", "fallback" (the named source is absent; the default
+         output's monitor until it appears), "failed", or "pending" while a
+         ReloadAudioConfig still runs. -->
+    <method name="AudioCaptureStatus">
+      <arg name="value" type="s" direction="out"/>
+    </method>
     <method name="CurrentWorkshopId">
       <arg name="value" type="s" direction="out"/>
     </method>

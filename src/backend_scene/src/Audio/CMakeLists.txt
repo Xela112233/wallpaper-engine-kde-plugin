@@ -15,6 +15,7 @@ PUBLIC
     wpUtils
 PRIVATE
     wpFs
+    nlohmann_json   # AudioBus reads audio.json
 )
 target_include_directories(${LIB_NAME}
     PUBLIC include

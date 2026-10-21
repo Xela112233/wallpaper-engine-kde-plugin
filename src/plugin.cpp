@@ -1,7 +1,9 @@
 #include "GuiThreadOnce.hpp"
 #include "WallpaperHost.hpp"
+#include <atomic>
 #include <mutex>
 #include <QQmlExtensionPlugin>
+#include <QThreadPool>
 #include <QQmlEngine>
 #include <QCoreApplication>
 #include <QDebug>
@@ -29,6 +31,7 @@
 #include "WekNotifier.hpp"
 #include "WekDiagnostics.hpp"
 #include "ActivityHelper.hpp"
+#include "Audio/AudioBus.h"
 #ifdef WEKDE_HAS_GLOBALACCEL
 #    include "WekShortcuts.hpp"
 #endif
@@ -167,6 +170,22 @@ private:
         // standalone wallpaper-host process this is where we'd set up a
         // KAboutData for it.
         KCrash::initialize();
+
+        // WekControl.ReloadAudioConfig (we-manager's Settings > Audio) re-reads
+        // audio.json for the process-wide AudioBus.  Reopening a capture can
+        // wait on PulseAudio, so it runs on the thread pool, not the GUI thread.
+        static std::atomic<int> audioReloads { 0 };
+        wekde::WekControl::setAudioConfigReloader([] {
+            ++audioReloads;
+            QThreadPool::globalInstance()->start([] {
+                wallpaper::audio::AudioBus::Reconfigure();
+                --audioReloads;
+            });
+        });
+        wekde::WekControl::setAudioCaptureStatusReader([] {
+            if (audioReloads.load() > 0) return QStringLiteral("pending");
+            return QString::fromStdString(wallpaper::audio::AudioBus::CaptureStatus());
+        });
 
         qputenv("QML_XHR_ALLOW_FILE_READ", "1");
         // Allow web wallpapers to make cross-origin requests (XHR/fetch).
