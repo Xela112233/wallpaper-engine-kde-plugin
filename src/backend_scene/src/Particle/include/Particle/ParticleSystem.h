@@ -1,0 +1,439 @@
+#pragma once
+#include "ParticleEmitter.h"
+#include "ParticleTrail.h"
+#include "AudioRateMultiplier.hpp"
+#include "Interface/IParticleRawGener.h"
+#include "Core/NoCopyMove.hpp"
+#include "Core/MapSet.hpp"
+
+#include <atomic>
+#include <memory>
+
+namespace wallpaper
+{
+
+// Hard ceiling on the aggregate particles spawned across all subsystems per
+// ParticleSystem::Emitt call.  Once tripped, subsequent subsystems in the
+// iteration skip their spawn phase (update + operators + trail + burst-done
+// all still run, so existing particles age out normally).  Per-subsystem cap
+// is min(maxcount, 20000) at parse time (WPSceneParser); a real scene with
+// 1-30 subsystems at 200-5000 maxcount runs at ~5-30k aggregate per frame.
+// 200k is ~6x the worst real case and 10x the per-sub cap (saturates ~10
+// simultaneously bursting subsystems), well above any legitimate workshop
+// content while blocking the adversarial 500-subsystem case (10M particles /
+// frame -> GPU wedge).
+inline constexpr uint32_t kMaxParticlesPerFrame = 200'000;
+
+class SceneNode;
+
+enum class ParticleAnimationMode
+{
+    SEQUENCE,
+    RANDOMONE,
+};
+
+class ParticleSystem;
+
+class ParticleInstance : NoCopy, NoMove {
+public:
+    struct BoundedData {
+        ParticleInstance* parent { nullptr };
+        isize             particle_idx { -1 };
+
+        bool            pre_lifetime_ok { true };
+        Eigen::Vector3f pos { 0.0f, 0.0f, 0.0f };
+    };
+
+    void Refresh();
+
+    bool IsDeath() const;
+    void SetDeath(bool);
+
+    bool IsNoLiveParticle() const;
+    void SetNoLiveParticle(bool);
+
+    std::span<const Particle> Particles() const;
+    std::vector<Particle>&    ParticlesVec();
+
+    BoundedData&       GetBoundedData();
+    const BoundedData& GetBoundedData() const { return m_bounded_data; }
+
+    std::vector<ParticleTrailHistory>& TrailHistories();
+
+    // Resolves the parent-event particle for this instance, or nullptr when the link is
+    // missing/stale/dead.  EVENT_FOLLOW, EVENT_SPAWN, and EVENT_DEATH children carry a
+    // `parent` subsystem pointer + `particle_idx`; the helper guards each step (parent
+    // pointer set, index in range, particle still alive) so callers can dereference the
+    // returned pointer without re-checking.  Used by the inherit-from-event family
+    // (initializer + per-frame operator) to read the parent's current color/size/alpha/
+    // velocity/rotation, and by any future op that needs to bind to the parent.
+    const Particle* GetEventParentParticle() const;
+
+private:
+    bool                              m_is_death { false };
+    bool                              m_no_live_particle { false };
+    std::vector<Particle>             m_particles;
+    BoundedData                       m_bounded_data;
+    std::vector<ParticleTrailHistory> m_trail_histories;
+};
+
+class ParticleSubSystem : NoCopy, NoMove {
+public:
+    enum class SpawnType
+    {
+        STATIC,
+        EVENT_FOLLOW,
+        EVENT_SPAWN,
+        EVENT_DEATH,
+    };
+
+public:
+    ParticleSubSystem(ParticleSystem& p, std::shared_ptr<SceneMesh> sm, uint32_t maxcount,
+                      double rate, u32 maxcount_instance, double probability, SpawnType type,
+                      ParticleRawGenSpecOp specOp, float starttime = 0.0f);
+    ~ParticleSubSystem();
+
+    void Emitt();
+
+    // Runs the same per-tick body as Emitt but skips the per-instance
+    // emitter spawn block.  Update / operators / trail / burst-done all
+    // still run, so existing particles age out normally and downstream
+    // bookkeeping (CP resolve, dead-instance skip, burst-done edge) stays
+    // in sync.  Used by ParticleSystem::Emitt's global cap path when the
+    // aggregate kMaxParticlesPerFrame ceiling has already been exhausted
+    // by earlier subsystems in this tick.
+    void EmittSkipSpawn();
+
+    // Clears all particle instances and trail histories so the next Emitt()
+    // treats the subsystem as freshly created — instantaneous emitters fire
+    // again.  Used by the dynamic-asset pool to re-arm spent particle FX
+    // (e.g. dino_run's coinget burst) when the script pops a new instance.
+    void Reset();
+
+    // True after the subsystem has had at least one live particle since the
+    // last Reset() and all particles are now dead.  The dynamic-asset pool
+    // uses this to auto-hide a burst-FX node once its effect has played out,
+    // so scripts that don't promptly call destroyLayer don't leave lingering
+    // slots visible on screen.
+    bool IsBurstDone() const { return m_burst_done; }
+    void ClearBurstDone() {
+        m_burst_done = false;
+        // Reset the per-cycle ack so a re-armed burst (the pool re-firing
+        // the same coin-pickup sparkle for a new pickup) produces a fresh
+        // edge-trigger notification.  Without this, only the first burst
+        // would be auto-hidden.
+        m_burst_done_acked = false;
+    }
+
+    // Edge-trigger ack for the producer-pushed burst-done queue: the
+    // false→true transition of m_burst_done must produce exactly one
+    // consumer notification per Reset() cycle.  ParticleSystem::Emitt
+    // walks subsystems, pushes the NodeId of any sub whose IsBurstDone()
+    // is true but WasBurstDoneAcked() is false, then calls AckBurstDone()
+    // so subsequent ticks treat the level as "already published".
+    // ClearBurstDone() (called by the consumer drain after auto-hide)
+    // resets both the level flag and the ack so a re-armed burst publishes
+    // on the next edge.
+    //
+    // Pattern parity: the sprite-snapshot gate is the sticky-flag
+    // producer-skip variant; this is the edge-trigger producer-pushed
+    // variant.  Both mirror the WorldCacheGate.h consumer-gate intent —
+    // avoid per-frame work when no consumer-side state change has
+    // occurred.
+    bool WasBurstDoneAcked() const { return m_burst_done_acked; }
+    void AckBurstDone() { m_burst_done_acked = true; }
+
+    // Test-only: directly latch m_burst_done = true without driving the
+    // full Emitt() any-alive-since-reset transition.  Unit tests for the
+    // edge-trigger semantics use this to exercise the producer collector
+    // in ParticleSystem::Emitt without spinning up a real emitter loop.
+    // Production code never calls this — m_burst_done is set inside
+    // ParticleSubSystem::Emitt when m_any_alive_since_reset becomes
+    // true-then-no-live.
+    void TEST_MarkBurstDone() { m_burst_done = true; }
+
+    // Node id assigned by the parser for pool-particle subsystems
+    // (`particleSubByNodeId[wppartobj.id] = sub.get()`).  Surfaced here so
+    // the producer's edge-trigger collector in ParticleSystem::Emitt can
+    // push the id onto m_burst_done_this_tick without needing a back-
+    // pointer to Scene::particleSubByNodeId.  Non-pool subsystems leave
+    // this at the default -1 and never participate in the burst-done
+    // queue (their node ids aren't registered in particleSubByNodeId).
+    int32_t NodeId() const { return m_node_id; }
+    void    SetNodeId(int32_t id) { m_node_id = id; }
+
+    // Runtime multiplier applied on top of the static `m_rate` factor.
+    // Scripted instanceoverride.rate (NieR:Automata audio-reactive emission)
+    // writes here once per property tick from the QML/scene-script thread;
+    // Emitt() on the render thread reads it.  Defaults to 1.0 → no effect
+    // when no script is driving it.  Atomic because render and script
+    // threads are separate.
+    void   SetDynamicRateMultiplier(double m) { m_dynamic_rate_multiplier.store(m); }
+    double DynamicRateMultiplier() const { return m_dynamic_rate_multiplier.load(); }
+
+    // Audio-reactive emit-rate scalar — pushed each render frame by
+    // SceneWallpaper when this subsystem was flagged audio-reactive (any
+    // emitter authored with a non-zero `audioprocessingmode`).  Independent
+    // of the scripted dynamic multiplier so the two compose multiplicatively.
+    void   SetAudioRateMultiplier(double m) { m_audio_rate_multiplier.store(m); }
+    double AudioRateMultiplier() const { return m_audio_rate_multiplier.load(); }
+    void   MarkAudioReactive() { m_audio_reactive = true; }
+    bool   IsAudioReactive() const { return m_audio_reactive; }
+    // Smoothing state held on the subsystem so attack/decay survives across
+    // frames.  Touched only on the render thread (no atomic needed).
+    double& AudioSmoothedRef() { return m_audio_smoothed; }
+
+    // Per-emitter response parameters (channel mode + optional WE-shape curve
+    // window / bounds / exponent / amount).  Populated at parse time from the
+    // first audio-reactive emitter on this subsystem and read on the render
+    // thread; not mutated post-load so no atomic is needed.
+    void                                        SetAudioParams(const audio_reactive::RateMultiplierParams& p) { m_audio_params = p; }
+    const audio_reactive::RateMultiplierParams& AudioParams() const { return m_audio_params; }
+
+    ParticleInstance* QueryNewInstance();
+
+    void AddEmitter(ParticleEmittOp&&);
+    void AddInitializer(ParticleInitOp&&);
+    void AddOperator(ParticleOperatorOp&&);
+
+    void AddChild(std::unique_ptr<ParticleSubSystem>&&);
+
+    ParticleSubSystem*       ParentSubsystem() { return m_parent_subsystem; }
+    const ParticleSubSystem* ParentSubsystem() const { return m_parent_subsystem; }
+
+    std::span<const ParticleControlpoint> Controlpoints() const;
+    std::span<ParticleControlpoint>       Controlpoints();
+
+    // OR `kCpReferencedFlag` into the runtime flags of CP slot `idx`.  Indices outside
+    // [0..7] are clamped — the engine accepts any integer and silently maps it to the
+    // nearest valid slot, so the marker behaves the same way.  Called once per CP
+    // reference discovered while parsing operators / initializers.
+    void MarkCpReferenced(int32_t idx);
+
+    // Per-child CP shift authored on the parent's child block (`controlpointstartindex`
+    // in the JSON).  Stored verbatim — the engine applies the shift at chain-resolve
+    // time, layered on top of authored `parent_cp_index` rather than folded into it.
+    // Slots whose authored `parent_cp_index` is 0 (the editor default) resolve through
+    // `parent CP[slot_idx + shift]`; slots that authored an explicit non-zero value
+    // route through that value as-is, so author intent always wins over the shift.
+    void    SetCpStartShift(int32_t s) { m_cp_start_shift = s; }
+    int32_t CpStartShift() const { return m_cp_start_shift; }
+
+    // Resolve per-frame controlpoint offsets by walking the parent chain.  For CPs with
+    // follow_parent_particle + an EVENT_FOLLOW/EVENT_SPAWN instance bound to a live parent
+    // particle, the resolved offset = that particle's position.  For CPs with
+    // parent_cp_index > 0, the resolved offset = parent subsystem's CP[parent_cp_index].resolved
+    // (parent has already been resolved this frame because Emitt runs top-down).  Otherwise the
+    // resolved offset falls back to the static local `offset`.
+    //
+    // `inst` may be null for subsystems without bounded instances (STATIC top-level).
+    void ResolveControlpointsForInstance(const ParticleInstance* inst);
+
+    // Update control points with link_mouse flag to follow mouse position
+    void UpdateMouseControlPoints(double sceneX, double sceneY);
+
+    SpawnType Type() const;
+    u32       MaxInstanceCount() const;
+
+    // Read-only view of the live instance pool.  Used by ParticleSystem::Emitt
+    // to snapshot pre/post particle counts for the global emission budget,
+    // and by unit tests to inspect spawn results without touching internals.
+    // Pointer stability matters here — EVENT_FOLLOW children's bounded_data
+    // points into this vector, so callers must not reallocate via mutation.
+    std::span<const std::unique_ptr<ParticleInstance>> Instances() const {
+        return m_instances;
+    }
+
+    void SetSpriteTrail(u32 trail_capacity, float trail_max_age = 0.0f);
+
+    // Debug label (particle preset basename, e.g. "thunderbolt_glow") plumbed from the
+    // parser.  Used only for rate-limited LOG_INFO diagnostics when investigating
+    // stickiness / clear events.  Empty string = unnamed (top-level from scene.json).
+    void               SetDebugName(std::string name) { m_debug_name = std::move(name); }
+    const std::string& DebugName() const { return m_debug_name; }
+
+    // The scene-graph node that draws this subsystem's mesh, or null when no
+    // node does (spawner-only subsystems never attach their mesh).  Bound by
+    // ParticleSystem::BindHostNodes; a subsystem consults it to find out
+    // whether anything is looking at what it emits.
+    void       SetHostNode(SceneNode* n) { m_host_node = n; }
+    SceneNode* HostNode() const { return m_host_node; }
+
+    // Mesh identity, used by the host-node binding walk to match a subsystem
+    // against the graph node that draws it.
+    const SceneMesh* MeshPtr() const { return m_mesh.get(); }
+
+    // True when a host node is bound and it (or an ancestor) is hidden.  A
+    // subsystem with no host node is never hidden.
+    bool IsHostHidden() const;
+
+    // WE semantics: `starttime` is the number of seconds of simulation the
+    // particle system is advanced BEFORE the first rendered frame, so
+    // particles are already at steady-state distribution on frame 1.  Used
+    // by ParticleSystem::PreSimulate().
+    float StartTime() const { return m_starttime; }
+    void  ClearStartTime() { m_starttime = 0.0f; }
+
+    const std::vector<std::unique_ptr<ParticleSubSystem>>& Children() const {
+        return m_children;
+    }
+
+private:
+    // Shared body for Emitt() and EmittSkipSpawn().  `skip_spawn` gates the
+    // per-instance emitter spawn block; everything else (CP resolve, update,
+    // operators, trails, burst-done) runs identically.
+    void EmittImpl(bool skip_spawn);
+
+    ParticleSystem&            m_sys;
+    std::shared_ptr<SceneMesh> m_mesh;
+    //	std::vector<std::unique_ptr<ParticleEmitter>> m_emiters;
+    std::vector<ParticleEmittOp> m_emiters;
+
+    // std::vector<Particle>           m_particles;
+    std::vector<ParticleInitOp>     m_initializers;
+    std::vector<ParticleOperatorOp> m_operators;
+
+    std::array<ParticleControlpoint, 8> m_controlpoints;
+
+    ParticleRawGenSpecOp m_genSpecOp;
+    u32                  m_maxcount;
+    float                m_starttime;
+    double               m_rate;
+    double               m_time;
+
+    std::vector<std::unique_ptr<ParticleSubSystem>> m_children;
+    ParticleSubSystem* m_parent_subsystem { nullptr };  // set in parent's AddChild()
+    std::vector<std::unique_ptr<ParticleInstance>>  m_instances;
+
+    u32       m_maxcount_instance { 1 };
+    double    m_probability { 1.0f };
+    SpawnType m_spawn_type { SpawnType::STATIC };
+
+    bool  m_is_spritetrail { false };
+    u32   m_trail_capacity { 0 };
+    float m_trail_max_age { 0.0f };
+
+    // Tracks burst-FX completion for the dynamic-asset pool.  Set true by
+    // Emitt() when the subsystem has had at least one live particle since
+    // the last Reset() but currently has none.
+    bool m_burst_done { false };
+    // Edge-trigger ack: per-cycle one-shot consumed by ParticleSystem::Emitt
+    // to publish each burst-done false→true transition exactly once.  Reset
+    // by ClearBurstDone() (consumer side) and by Reset() (re-arming).
+    bool m_burst_done_acked { false };
+    bool m_any_alive_since_reset { false };
+
+    // Owning node id for pool-particle subsystems (mirrored from the
+    // parser's particleSubByNodeId map key).  Default -1 means "no node"
+    // (non-pool subs, children).  Read by ParticleSystem::Emitt() when
+    // collecting burst-done ids onto m_burst_done_this_tick.
+    int32_t m_node_id { -1 };
+
+    // Scripted rate override — see SetDynamicRateMultiplier.
+    std::atomic<double> m_dynamic_rate_multiplier { 1.0 };
+
+    // Audio-reactive rate override — see SetAudioRateMultiplier.  Only ever
+    // pushed when m_audio_reactive is true; otherwise stays at 1.0 (no-op).
+    std::atomic<double>                  m_audio_rate_multiplier { 1.0 };
+    double                               m_audio_smoothed { 0.0 };
+    bool                                 m_audio_reactive { false };
+    audio_reactive::RateMultiplierParams m_audio_params {};
+
+    // Stored CP-slot shift authored on the parent's child block; consumed by the chain
+    // resolver instead of being baked into per-CP `parent_cp_index` at parse time.
+    int32_t m_cp_start_shift { 0 };
+
+    // See SetHostNode.  Raw pointer: the scene graph owns the node and both
+    // outlive this subsystem (Scene owns the ParticleSystem too).
+    SceneNode* m_host_node { nullptr };
+
+    std::string m_debug_name;
+};
+
+class Scene;
+class ParticleSystem : NoCopy, NoMove {
+public:
+    ParticleSystem(Scene& scene): scene(scene) {};
+    ~ParticleSystem() = default;
+
+    void Emitt();
+
+    // Update control points that have link_mouse flag set
+    // mousePos: normalized mouse position (0-1), orthoSize: scene dimensions
+    void UpdateMouseControlPoints(const std::array<float, 2>& mousePos,
+                                  const std::array<int, 2>&   orthoSize);
+
+    // Max `starttime` across every subsystem in this scene (recursive into
+    // children).  0 for particle-less scenes and for scenes whose authors
+    // didn't set starttime.  Drives PreSimulate()'s iteration budget.
+    double MaxStartTime() const;
+
+    // Run the scene's particle systems forward by MaxStartTime() seconds so
+    // each subsystem is at steady-state distribution before the first
+    // rendered frame.  Required for WE "starttime" semantics — e.g. the
+    // shipped shimmering_particles default needs 50s (dustmotes) / 200s
+    // (small_motes) of pre-sim, otherwise the user sees a black screen
+    // waiting for particle emission to ramp up.
+    //
+    // Uses the scene's own clock (`scene.elapsingTime` / `scene.frameTime`)
+    // so per-subsystem `m_starttime` gates stagger correctly during the
+    // pre-sim.  Afterwards, each subsystem's `m_starttime` is cleared and
+    // the scene clock is rewound so rendering sees t=0 with particles
+    // already distributed.
+    //
+    // `dt` is the pre-sim step in seconds; defaults to the 32ms per-frame
+    // cap Emitt() already enforces, so this is "run the same tick the
+    // renderer would have run, minus the draw".  No-op when MaxStartTime
+    // is 0 (the overwhelming majority of wallpapers).
+    void PreSimulate(double dt = 0.032);
+
+    // Walk the scene graph and give every subsystem the node that draws its
+    // mesh, matched on SceneMesh identity (the parser hands the same
+    // shared_ptr<SceneMesh> to the node and to the subsystem).  Emitt calls
+    // this on its first tick; the graph's node set is fixed at parse time, so
+    // one walk covers the scene's lifetime.  A subsystem whose mesh no node
+    // draws stays unbound and keeps simulating unconditionally.
+    void BindHostNodes();
+
+    // Per-tick burst-done collector: filled by Emitt() with the NodeId of
+    // each subsystem whose IsBurstDone() flipped false→true since the last
+    // ack.  Drained by the render-thread draw loop in SceneWallpaper.cpp
+    // (auto-hide the node + ClearBurstDone, which also resets the ack so a
+    // future re-armed burst publishes again).  Empty in the common case
+    // (continuous emitters like rain/snow/fire/ambient particle fields
+    // never burst-done), avoiding the per-frame O(N) walk of
+    // particleSubByNodeId.
+    //
+    // Producer (Emitt) and consumer (drain) run on the same render thread
+    // within the same drawFrame, so no synchronization is needed — a plain
+    // std::vector<int32_t> suffices.  Cleared at the top of each Emitt().
+    const std::vector<int32_t>& BurstDoneThisTick() const {
+        return m_burst_done_this_tick;
+    }
+
+    // Test-only observer of the one-shot global emit warning latch.  Set true
+    // the first time ParticleSystem::Emitt detects aggregate spawning crossing
+    // kMaxParticlesPerFrame; remains sticky for the lifetime of this object so
+    // the LOG_INFO fires exactly once (scene reload re-arms by destroying +
+    // recreating the ParticleSystem).  Atomic so the test harness reading
+    // from the doctest thread doesn't race with the render thread's write.
+    bool GlobalEmitWarned() const { return m_global_emit_warned.load(); }
+
+    Scene& scene;
+
+    std::vector<std::unique_ptr<ParticleSubSystem>> subsystems;
+    std::unique_ptr<IParticleRawGener>              gener;
+
+private:
+    std::vector<int32_t> m_burst_done_this_tick;
+
+    // One-shot latch for BindHostNodes — see its comment.
+    bool m_host_nodes_bound { false };
+
+    // Sticky once-per-lifetime latch for the global emission budget warning.
+    // Atomic guards against concurrent test reader; on x86 the load/store are
+    // essentially free, and on ARM the small fence cost is negligible vs the
+    // work done per tick.
+    std::atomic<bool> m_global_emit_warned { false };
+};
+} // namespace wallpaper

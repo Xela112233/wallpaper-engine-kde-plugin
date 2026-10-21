@@ -1,0 +1,242 @@
+#pragma once
+
+#include "Particle.h"
+
+#include <Eigen/Dense>
+#include <cstdint>
+
+namespace wallpaper
+{
+
+namespace ParticleModify
+{
+
+inline void Move(Particle& p, const Eigen::Vector3d& acc) noexcept {
+    p.position = (p.position.cast<double>() + acc).cast<float>();
+}
+// Vector3f-native overload — skips the Vec3f->Vec3d->Vec3f round-trip when the
+// caller already holds a Vec3f.  Bit-identical to the Vec3d form for inputs
+// that round-trip cleanly through float (|x| < 2^23 → exactly representable);
+// ULP-bounded otherwise.  Particle state is Vec3f, so float precision is the
+// storage ceiling — no precision is lost vs. the promote-then-truncate path.
+inline void Move(Particle& p, const Eigen::Vector3f& acc) noexcept { p.position += acc; }
+inline void Move(Particle& p, double x, double y, double z) noexcept {
+    Move(p, Eigen::Vector3d { x, y, z });
+}
+
+inline void MoveTo(Particle& p, const Eigen::Vector3d& pos) noexcept {
+    p.position = pos.cast<float>();
+}
+inline void MoveTo(Particle& p, double x, double y, double z) noexcept { MoveTo(p, { x, y, z }); }
+
+inline void MoveToNegZ(Particle& p) noexcept { p.position.z() = -std::abs(p.position.z()); }
+
+inline void MoveByTime(Particle& p, double t) noexcept {
+    Move(p, Eigen::Vector3d { p.velocity.cast<double>() * t });
+}
+
+inline void MoveMultiply(Particle& p, const Eigen::Vector3d& para) noexcept {
+    p.position = para.cwiseProduct(p.position.cast<double>()).cast<float>();
+}
+inline void MoveMultiply(Particle& p, double x, double y, double z) noexcept {
+    MoveMultiply(p, { x, y, z });
+}
+
+inline void MoveApplySign(Particle& p, int32_t x, int32_t y, int32_t z) noexcept {
+    if (x != 0) {
+        p.position[0] = std::abs(p.position[0]) * (float)x;
+    }
+    if (y != 0) {
+        p.position[1] = std::abs(p.position[1]) * (float)y;
+    }
+    if (z != 0) {
+        p.position[2] = std::abs(p.position[2]) * (float)z;
+    }
+}
+inline void SphereDirectOffset(Particle& p, const Eigen::Vector3d& base, double direct) noexcept {
+    using namespace Eigen;
+    Vector3d axis  = base.cross(p.position.cast<double>()).normalized();
+    Affine3d trans = Affine3d::Identity();
+    trans.prerotate(AngleAxis<double>(direct, axis));
+    p.position = (trans * p.position.cast<double>()).cast<float>();
+}
+
+inline void RotatePos(Particle& p, double x, double y, double z) noexcept {
+    using namespace Eigen;
+    Affine3d trans = Affine3d::Identity();
+
+    trans.prerotate(AngleAxis<double>(y, Vector3d::UnitY()));  // y
+    trans.prerotate(AngleAxis<double>(x, Vector3d::UnitX()));  // x
+    trans.prerotate(AngleAxis<double>(-z, Vector3d::UnitZ())); // z
+    p.position = (trans * p.position.cast<double>()).cast<float>();
+}
+
+inline void ChangeLifetime(Particle& p, double l) noexcept { p.lifetime += l; }
+
+inline double LifetimePos(const Particle& p) {
+    if (p.lifetime < 0) return 1.0;
+    return 1.0 - (p.lifetime / p.init.lifetime);
+}
+
+inline double LifetimePassed(const Particle& p) noexcept { return p.init.lifetime - p.lifetime; }
+
+inline bool LifetimeOk(const Particle& p) noexcept { return p.lifetime > 0.0f; }
+
+void ChangeRotation(Particle&, float x, float y, float z);
+
+inline void ChangeColor(Particle& p, const Eigen::Vector3d& c) noexcept {
+    p.color = (p.color.cast<double>() + c).cast<float>();
+}
+inline void ChangeColor(Particle& p, const Eigen::Vector3f& c) noexcept { p.color += c; }
+inline void ChangeColor(Particle& p, double r, double g, double b) {
+    ChangeColor(p, Eigen::Vector3d { r, g, b });
+}
+
+inline void ChangeRotation(Particle& p, const Eigen::Vector3d& r) noexcept {
+    p.rotation = (p.rotation.cast<double>() + r).cast<float>();
+}
+inline void ChangeRotation(Particle& p, const Eigen::Vector3f& r) noexcept { p.rotation += r; }
+inline void ChangeRotation(Particle& p, double x, double y, double z) {
+    ChangeRotation(p, Eigen::Vector3d { x, y, z });
+}
+
+inline void ChangeVelocity(Particle& p, const Eigen::Vector3d& v) noexcept {
+    p.velocity = (p.velocity.cast<double>() + v).cast<float>();
+}
+inline void ChangeVelocity(Particle& p, const Eigen::Vector3f& v) noexcept { p.velocity += v; }
+inline void ChangeVelocity(Particle& p, double x, double y, double z) noexcept {
+    ChangeVelocity(p, Eigen::Vector3d { x, y, z });
+}
+inline void Accelerate(Particle& p, const Eigen::Vector3d& acc, double t) noexcept {
+    ChangeVelocity(p, Eigen::Vector3d { acc * t });
+}
+
+inline void ChangeAngularVelocity(Particle& p, const Eigen::Vector3d& v) noexcept {
+    p.angularVelocity = (p.angularVelocity.cast<double>() + v).cast<float>();
+}
+inline void ChangeAngularVelocity(Particle& p, const Eigen::Vector3f& v) noexcept {
+    p.angularVelocity += v;
+}
+inline void ChangeAngularVelocity(Particle& p, double x, double y, double z) noexcept {
+    ChangeAngularVelocity(p, Eigen::Vector3d { x, y, z });
+}
+inline void AngularAccelerate(Particle& p, const Eigen::Vector3d& acc, double t) noexcept {
+    ChangeAngularVelocity(p, Eigen::Vector3d { acc * t });
+}
+
+inline void Rotate(Particle& p, const Eigen::Vector3d& r) noexcept {
+    p.rotation = (p.rotation.cast<double>() + r).cast<float>();
+}
+inline void Rotate(Particle& p, const Eigen::Vector3f& r) noexcept { p.rotation += r; }
+inline void Rotate(Particle& p, double x, double y, double z) noexcept {
+    Rotate(p, Eigen::Vector3d { x, y, z });
+}
+
+inline void RotateByTime(Particle& p, double t) noexcept {
+    Rotate(p, Eigen::Vector3d { p.angularVelocity.cast<double>() * t });
+}
+
+inline void MutiplyAlpha(Particle& p, double a) { p.alpha *= a; }
+inline void MutiplySize(Particle& p, double s) { p.size *= s; }
+
+inline void MutiplyColor(Particle& p, const Eigen::Vector3d& c) {
+    p.color = c.cwiseProduct(p.color.cast<double>()).cast<float>();
+}
+inline void MutiplyColor(Particle& p, double r, double g, double b) {
+    MutiplyColor(p, { r, g, b });
+}
+inline void MutiplyVelocity(Particle& p, double m) { p.velocity *= m; }
+inline void MutiplyAngularVelocity(Particle& p, double m) { p.angularVelocity *= m; }
+
+inline void ChangeSize(Particle& p, double s) { p.size += s; }
+inline void ChangeAlpha(Particle& p, double a) { p.alpha += a; }
+
+inline void InitLifetime(Particle& p, float l) noexcept {
+    p.lifetime      = l;
+    p.init.lifetime = l;
+}
+inline void InitSize(Particle& p, double s) {
+    p.size      = s;
+    p.init.size = s;
+}
+inline void InitAlpha(Particle& p, double a) {
+    p.alpha      = a;
+    p.init.alpha = a;
+}
+inline void InitColor(Particle& p, double r, double g, double b) {
+    Eigen::Vector3d c { r, g, b };
+    p.color      = c.cast<float>();
+    p.init.color = p.color;
+}
+
+inline void InitVelocity(Particle& p, const Eigen::Vector3d& v) { p.velocity = v.cast<float>(); }
+inline void InitPos(Particle& p, double x, double y, double z) {
+    p.position = Eigen::Vector3f(x, y, z);
+}
+inline void InitVelocity(Particle& p, double x, double y, double z) {
+    InitVelocity(p, { x, y, z });
+}
+
+inline void MutiplyInitLifeTime(Particle& p, double m) {
+    p.lifetime *= m;
+    p.init.lifetime = p.lifetime;
+}
+
+// instanceoverride.lifetime is a uniform multiplier on the preset's randomized
+// lifetime across every renderer kind (sprite, halo, rope, ropetrail).  The
+// runtime's per-particle init dispatcher applies it as
+// `init.lifetime_min = jsonMin * over`, `init.lifetime_range = (jsonMax-jsonMin)
+// * over`; default override is 1.0 (identity), so an absent JSON entry leaves
+// the preset values untouched.  `over <= 0` is treated as "no override" as a
+// safety against degenerate authored values.
+inline void ApplyLifetimeOverride(Particle& p, double over) {
+    if (over <= 0.0) return;
+    MutiplyInitLifeTime(p, over);
+}
+
+// Dispatch instanceoverride.color / instanceoverride.colorn to the right
+// semantic.  Both are absolute color replacements of the preset's
+// randomized color; `color` is in 0-255 space, `colorn` is the same
+// quantity in 0-1 normalized space.  An artist authoring `colorn: (0,1,1)`
+// on an amber preset wants bright cyan particles, not "preset filtered to
+// its green+blue channels" (which would be a dim green) — verified against
+// NieR 2B halo where the shipped preview shows cyan sparkles even though
+// the magic_sparkle preset's colorrandom is amber.  Caller passes `true`
+// for at most one of the two (parser enforces mutual exclusivity); when
+// both are false, this is a no-op.
+inline void ApplyColorOverride(Particle& p, bool has_color255, const std::array<float, 3>& color255,
+                               bool has_colorn, const std::array<float, 3>& colorn) {
+    if (has_color255) {
+        InitColor(p, color255[0] / 255.0f, color255[1] / 255.0f, color255[2] / 255.0f);
+    } else if (has_colorn) {
+        InitColor(p, colorn[0], colorn[1], colorn[2]);
+    }
+}
+inline void MutiplyInitAlpha(Particle& p, double m) {
+    p.alpha *= m;
+    p.init.alpha = p.alpha;
+}
+inline void MutiplyInitSize(Particle& p, double m) {
+    p.size *= m;
+    p.init.size = p.size;
+}
+inline void MutiplyInitColor(Particle& p, double r, double g, double b) {
+    MutiplyColor(p, { r, g, b });
+    p.init.color = p.color;
+}
+
+inline void Reset(Particle& p) {
+    p.alpha = p.init.alpha;
+    p.size  = p.init.size;
+    p.color = p.init.color;
+}
+
+inline void MarkOld(Particle& p) { p.mark_new = false; }
+inline bool IsNew(const Particle& p) { return p.mark_new; }
+
+inline const Eigen::Vector3f& GetPos(const Particle& p) { return p.position; }
+inline const Eigen::Vector3f& GetVelocity(const Particle& p) { return p.velocity; }
+inline const Eigen::Vector3f& GetRotation(const Particle& p) { return p.rotation; }
+
+}; // namespace ParticleModify
+} // namespace wallpaper

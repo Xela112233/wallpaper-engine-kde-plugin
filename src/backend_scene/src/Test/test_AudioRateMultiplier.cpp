@@ -1,0 +1,360 @@
+#include <doctest.h>
+
+#include "Particle/AudioRateMultiplier.hpp"
+
+#include <array>
+#include <vector>
+
+using wallpaper::audio_reactive::computeRateMultiplier;
+using wallpaper::audio_reactive::RateMultiplierParams;
+using wallpaper::audio_reactive::RateMultiplierResult;
+
+namespace
+{
+RateMultiplierParams legacy(uint32_t mode = 1) {
+    RateMultiplierParams p;
+    p.mode = mode;
+    return p;
+}
+} // namespace
+
+// ============================================================================
+// Legacy curve (no WE-shape authored) — pre-existing behavior, retained as the
+// default response when an emitter only sets `audioprocessingmode` and none of
+// the optional WE-shape keys (frequencystart/end, bounds, exponent, amount).
+// ============================================================================
+TEST_SUITE("AudioRateMultiplier") {
+
+    TEST_CASE("mode=0 returns 1.0 multiplier and resets smoothed") {
+        std::array<float, 16> spec {};
+        spec.fill(1.0f);
+        auto r = computeRateMultiplier(spec, spec, 0.5, 0.016, legacy(0));
+        CHECK(r.multiplier == doctest::Approx(1.0));
+        CHECK(r.newSmoothed == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("empty spectrum holds previous smoothed and returns 1.0") {
+        auto r = computeRateMultiplier({}, {}, 0.7, 0.016, legacy(1));
+        CHECK(r.multiplier == doctest::Approx(1.0));
+        CHECK(r.newSmoothed == doctest::Approx(0.7));
+    }
+
+    TEST_CASE("silent spectrum decays smoothed toward 0") {
+        std::array<float, 16> silent {};
+        auto r = computeRateMultiplier(silent, silent, 0.5, 0.016, legacy(1));
+        CHECK(r.newSmoothed < 0.5);
+        CHECK(r.newSmoothed >= 0.0);
+    }
+
+    TEST_CASE("loud bass attacks smoothed toward 1.0") {
+        std::array<float, 16> spec {};
+        for (int i = 0; i < 4; i++) spec[i] = 1.0f;
+        auto r = computeRateMultiplier(spec, spec, 0.0, 0.016, legacy(1));
+        CHECK(r.newSmoothed > 0.0);
+        CHECK(r.newSmoothed <= 1.0);
+    }
+
+    TEST_CASE("attack is faster than decay for the same step magnitude") {
+        std::array<float, 16> loud {};
+        std::array<float, 16> silent {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto up   = computeRateMultiplier(loud, loud, 0.0, 0.016, legacy(1));
+        auto down = computeRateMultiplier(silent, silent, 1.0, 0.016, legacy(1));
+        double attackDelta = up.newSmoothed - 0.0;
+        double decayDelta  = 1.0 - down.newSmoothed;
+        CHECK(attackDelta > decayDelta);
+    }
+
+    TEST_CASE("multiplier at smoothed=0 equals floor 0.4") {
+        std::array<float, 16> silent {};
+        auto r = computeRateMultiplier(silent, silent, 0.0, 0.016, legacy(1));
+        CHECK(r.newSmoothed == doctest::Approx(0.0));
+        CHECK(r.multiplier == doctest::Approx(0.4));
+    }
+
+    TEST_CASE("multiplier at smoothed=1 approaches ceiling 2.0") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto r = computeRateMultiplier(loud, loud, 1.0, 0.016, legacy(1));
+        CHECK(r.newSmoothed == doctest::Approx(1.0));
+        CHECK(r.multiplier == doctest::Approx(2.0));
+    }
+
+    TEST_CASE("multiplier monotonically increases with smoothed") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto a = computeRateMultiplier(loud, loud, 0.10, 0.0, legacy(1));
+        auto b = computeRateMultiplier(loud, loud, 0.50, 0.0, legacy(1));
+        auto c = computeRateMultiplier(loud, loud, 0.90, 0.0, legacy(1));
+        CHECK(a.multiplier < b.multiplier);
+        CHECK(b.multiplier < c.multiplier);
+    }
+
+    TEST_CASE("smoothing converges with constant input") {
+        std::array<float, 16> spec {};
+        for (int i = 0; i < 4; i++) spec[i] = 0.5f;
+        double smoothed = 0.0;
+        for (int i = 0; i < 50; i++) {
+            auto r   = computeRateMultiplier(spec, spec, smoothed, 0.016, legacy(1));
+            smoothed = r.newSmoothed;
+        }
+        CHECK(smoothed == doctest::Approx(0.5).epsilon(0.01));
+    }
+
+    TEST_CASE("only bass band (bins 0..3) drives output by default") {
+        std::array<float, 16> highOnly {};
+        for (int i = 4; i < 16; i++) highOnly[i] = 1.0f;
+        auto r = computeRateMultiplier(highOnly, highOnly, 0.0, 0.016, legacy(1));
+        CHECK(r.newSmoothed == doctest::Approx(0.0));
+        CHECK(r.multiplier == doctest::Approx(0.4));
+    }
+}
+
+// ============================================================================
+// Channel mode (Gap #1) — WE's `audioprocessingoptions` enum is shared with the
+// shader-side AUDIOPROCESSING combo: 1=Left, 2=Right, 3=Stereo.  The particle
+// path must source from the matching channel(s); we previously collapsed any
+// non-zero mode to "left only".
+// ============================================================================
+TEST_SUITE("AudioRateMultiplier.channelMode") {
+
+    TEST_CASE("mode=2 ignores left bass") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        std::array<float, 16> silent {};
+        auto r = computeRateMultiplier(loud, silent, 0.0, 0.016, legacy(2));
+        CHECK(r.newSmoothed == doctest::Approx(0.0));
+        CHECK(r.multiplier == doctest::Approx(0.4));
+    }
+
+    TEST_CASE("mode=2 responds to right-channel bass") {
+        std::array<float, 16> silent {};
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto r = computeRateMultiplier(silent, loud, 0.0, 0.016, legacy(2));
+        CHECK(r.newSmoothed > 0.0);
+        CHECK(r.multiplier > 0.4);
+    }
+
+    TEST_CASE("mode=1 ignores right channel") {
+        std::array<float, 16> silent {};
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto r = computeRateMultiplier(silent, loud, 0.0, 0.016, legacy(1));
+        CHECK(r.newSmoothed == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("mode=3 averages left and right") {
+        std::array<float, 16> silent {};
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto half = computeRateMultiplier(silent, loud, 0.0, 0.016, legacy(3));
+        auto full = computeRateMultiplier(loud, loud, 0.0, 0.016, legacy(3));
+        CHECK(half.newSmoothed > 0.0);
+        CHECK(half.newSmoothed < full.newSmoothed);
+    }
+
+    TEST_CASE("mode=3 with both empty holds prev and returns 1.0") {
+        auto r = computeRateMultiplier({}, {}, 0.6, 0.016, legacy(3));
+        CHECK(r.multiplier == doctest::Approx(1.0));
+        CHECK(r.newSmoothed == doctest::Approx(0.6));
+    }
+}
+
+// ============================================================================
+// WE-shape curve (Gap #2) — when an emitter authors any of
+// audioprocessing{frequencystart,frequencyend,bounds,exponent,amount}, the
+// response curve switches from the legacy 0.4..2.0 mapping to the WE-style
+//   smoothstep(bounds, mean(spectrum[freqStart..freqEnd])) ^ exp * amount
+// ============================================================================
+TEST_SUITE("AudioRateMultiplier.weShape") {
+
+    static RateMultiplierParams weShape(uint32_t mode = 1) {
+        RateMultiplierParams p;
+        p.mode            = mode;
+        p.weShapeAuthored = true;
+        p.freqStart       = 0;
+        p.freqEnd         = 4;
+        p.boundsLow       = 0.0f;
+        p.boundsHigh      = 1.0f;
+        p.exponent        = 1.0f;
+        p.amount          = 1.0f;
+        return p;
+    }
+
+    TEST_CASE("custom freq window: mid-band ignores bass-loud spectrum") {
+        std::array<float, 16> bassLoud {};
+        for (int i = 0; i < 4; i++) bassLoud[i] = 1.0f;
+        std::array<float, 16> midLoud {};
+        for (int i = 8; i < 12; i++) midLoud[i] = 1.0f;
+
+        auto p       = weShape();
+        p.freqStart  = 8;
+        p.freqEnd    = 12;
+        auto bassResp = computeRateMultiplier(bassLoud, bassLoud, 0.0, 0.016, p);
+        auto midResp  = computeRateMultiplier(midLoud, midLoud, 0.0, 0.016, p);
+        CHECK(bassResp.newSmoothed == doctest::Approx(0.0));
+        CHECK(midResp.newSmoothed > 0.0);
+    }
+
+    TEST_CASE("smoothstep bounds=[0.5, 1.0] gates input below 0.5 to zero output") {
+        std::array<float, 16> low {};
+        for (int i = 0; i < 4; i++) low[i] = 0.3f;
+        auto p        = weShape();
+        p.boundsLow   = 0.5f;
+        p.boundsHigh  = 1.0f;
+        auto r = computeRateMultiplier(low, low, 0.0, 0.016, p);
+        CHECK(r.multiplier == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("amount=0.5 halves output relative to amount=1.0 at saturation") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto p1 = weShape();
+        auto p2 = weShape();
+        p2.amount = 0.5f;
+        auto a = computeRateMultiplier(loud, loud, 1.0, 0.016, p1);
+        auto b = computeRateMultiplier(loud, loud, 1.0, 0.016, p2);
+        CHECK(a.multiplier == doctest::Approx(1.0));
+        CHECK(b.multiplier == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("exponent=2.0 reduces mid input vs exponent=1.0") {
+        std::array<float, 16> mid {};
+        for (int i = 0; i < 4; i++) mid[i] = 0.5f;
+        auto pLin = weShape();
+        auto pSqr = weShape();
+        pSqr.exponent = 2.0f;
+        auto a = computeRateMultiplier(mid, mid, 0.5, 0.0, pLin); // dt=0 → smoothed=prev
+        auto b = computeRateMultiplier(mid, mid, 0.5, 0.0, pSqr);
+        CHECK(a.multiplier == doctest::Approx(0.5));
+        CHECK(b.multiplier == doctest::Approx(0.25));
+    }
+
+    TEST_CASE("WE-shape silence yields 0 (no legacy 0.4 floor)") {
+        std::array<float, 16> silent {};
+        auto p = weShape();
+        auto r = computeRateMultiplier(silent, silent, 0.0, 0.016, p);
+        CHECK(r.multiplier == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("WE-shape amount=2.0 reaches ceiling 2.0 at saturation") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto p   = weShape();
+        p.amount = 2.0f;
+        auto r = computeRateMultiplier(loud, loud, 1.0, 0.016, p);
+        CHECK(r.multiplier == doctest::Approx(2.0));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Long-tail mutation killers — pin down boundary semantics that survive
+    // against the existing "happy-path" suite.
+    // ---------------------------------------------------------------------------
+
+    // smoothstep degenerate: edge1 == edge0 with x exactly on the edge.  Original
+    // takes the early-return branch (`x >= edge1 ? 1 : 0`) and returns 1.  Under
+    // cxx_le_to_lt the guard becomes `<` and the function falls through to the
+    // (x-edge0)/(edge1-edge0) formula → 0/0 → NaN → multiplier=NaN, killed by
+    // an Approx(1.0) check (NaN != 1).
+    TEST_CASE("WE-shape with bounds collapsed and mean == bounds returns 1.0 (kills smoothstep <= mutants)") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 0.5f; // mean(bass) = 0.5
+        auto p       = weShape();
+        p.boundsLow  = 0.5f;
+        p.boundsHigh = 0.5f; // degenerate
+        p.amount     = 1.0f;
+        // dt=0 anchors smoothed=prev=0.5, so the smoothstep input is exactly 0.5.
+        auto r = computeRateMultiplier(loud, loud, 0.5, 0.0, p);
+        CHECK(r.multiplier == doctest::Approx(1.0));
+    }
+
+    // Same degenerate bounds but mean strictly below.  Original returns 0 via the
+    // ternary; mutated `>` (cxx_ge_to_gt) returns 0 (since 0.3 > 0.5 false), still
+    // 0.  Mutated `<` (cxx_ge_to_lt) returns 0 either way.  The case where
+    // original=1 but mutated=0 is killed by the test above.
+    TEST_CASE("WE-shape with bounds collapsed and mean below returns 0.0") {
+        std::array<float, 16> low {};
+        for (int i = 0; i < 4; i++) low[i] = 0.3f;
+        auto p       = weShape();
+        p.boundsLow  = 0.5f;
+        p.boundsHigh = 0.5f;
+        auto r = computeRateMultiplier(low, low, 0.3, 0.0, p);
+        CHECK(r.multiplier == doctest::Approx(0.0));
+    }
+
+    // Non-unit bounds span exposes div→mul and sub→add mutations on the
+    // smoothstep formula.  edge0=0, edge1=2 with x=0.5: original t=0.25,
+    // smoothstep≈0.156.  Under div→mul: 0.5*2=1.0, smoothstep=1, mult=1.
+    TEST_CASE("WE-shape bounds=[0, 2] (clamped span) verifies smoothstep division") {
+        std::array<float, 16> spec {};
+        // mean(0..3) = 0.5
+        for (int i = 0; i < 4; i++) spec[i] = 0.5f;
+        auto p       = weShape();
+        p.boundsLow  = 0.0f;
+        p.boundsHigh = 2.0f; // edge1-edge0 = 2 (non-unit)
+        // dt=0 → smoothed = prev = 0.5
+        auto r = computeRateMultiplier(spec, spec, 0.5, 0.0, p);
+        // t = clamp(0.5/2, 0, 1) = 0.25; smoothstep = 0.25^2*(3-0.5) = 0.15625
+        CHECK(r.multiplier == doctest::Approx(0.15625));
+    }
+
+    // Off-zero edge0 exposes the (edge1-edge0) subtraction.  edge0=0.2,
+    // edge1=1.0: original (x-0.2)/0.8.  Under sub→add: (x-0.2)/1.2.
+    TEST_CASE("WE-shape bounds=[0.2, 1.0] verifies edge1-edge0 subtraction") {
+        std::array<float, 16> spec {};
+        for (int i = 0; i < 4; i++) spec[i] = 0.6f; // mean = 0.6
+        auto p       = weShape();
+        p.boundsLow  = 0.2f;
+        p.boundsHigh = 1.0f; // span 0.8
+        // dt=0 anchors smoothed = prev = 0.6
+        auto r = computeRateMultiplier(spec, spec, 0.6, 0.0, p);
+        // t = (0.6-0.2)/(1.0-0.2) = 0.4/0.8 = 0.5; smoothstep = 0.5
+        CHECK(r.multiplier == doctest::Approx(0.5));
+    }
+
+    // bandMean degenerate hi==lo (freqStart == freqEnd) — original returns 0
+    // via the `if (hi <= lo) return 0.0` guard.  Under cxx_le_to_lt the guard
+    // becomes `< lo` and falls through to a 0/0 division → NaN.
+    TEST_CASE("WE-shape with freqStart == freqEnd returns 0 mean (kills hi<=lo guard mutant)") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto p      = weShape();
+        p.freqStart = 2;
+        p.freqEnd   = 2; // empty band
+        auto r = computeRateMultiplier(loud, loud, 0.0, 0.016, p);
+        // smoothstep(0,1,0) = 0 → mult = 0 (not NaN)
+        CHECK(r.multiplier == doctest::Approx(0.0));
+        CHECK(r.newSmoothed == doctest::Approx(0.0));
+    }
+
+    // bandMean with non-zero `lo` exposes the `hi - lo` subtraction in the
+    // average computation.  Setting freqStart=2, freqEnd=4 with two non-zero
+    // bins of value 1 each: original sum/(4-2)=2/2=1; under sub→add we'd
+    // get sum/(4+2)=2/6≈0.333.
+    TEST_CASE("bandMean with offset window verifies (hi-lo) division (kills sub→add mutant)") {
+        std::array<float, 16> spec {};
+        // bins 2..3 are non-zero (other bins zero).
+        spec[2] = 1.0f;
+        spec[3] = 1.0f;
+        auto p      = weShape();
+        p.freqStart = 2;
+        p.freqEnd   = 4; // window = bins 2,3 → mean = 1.0
+        // dt=0 anchors smoothed = prev = 1.0
+        auto r = computeRateMultiplier(spec, spec, 1.0, 0.0, p);
+        // smoothstep(0,1,1)=1, exponent=1, amount=1 → mult=1.
+        CHECK(r.multiplier == doctest::Approx(1.0));
+    }
+
+    // mode==2 with empty right channel must trigger the noData guard and
+    // return 1.0 (hold).  Under cxx_eq_to_ne on `params.mode == 2`, the
+    // noData clause becomes `mode != 2 && noRight` — false for mode=2 — so
+    // the function continues and produces a smoothed/legacy output.
+    TEST_CASE("mode=2 with empty right span holds prev (kills mode==2 → !=2 mutant)") {
+        std::array<float, 16> loud {};
+        for (int i = 0; i < 4; i++) loud[i] = 1.0f;
+        auto r = computeRateMultiplier(loud, {}, 0.5, 0.016, legacy(2));
+        CHECK(r.multiplier == doctest::Approx(1.0));
+        CHECK(r.newSmoothed == doctest::Approx(0.5));
+    }
+}

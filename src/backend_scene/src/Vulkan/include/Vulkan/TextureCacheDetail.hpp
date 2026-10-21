@@ -1,0 +1,316 @@
+#pragma once
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <vulkan/vulkan.h>
+
+namespace wallpaper
+{
+namespace vulkan
+{
+namespace detail
+{
+
+// Cumulative-offset table for packing the mip levels of a single texture
+// into one contiguous staging buffer.  offsets[i] is the byte position at
+// which mip i starts in the packed buffer.
+//
+// Alignment: VkBufferImageCopy::bufferOffset must be a multiple of the
+// format's texel block size (1 for uncompressed RGBA8/R8/RG8/RGBA16F etc.;
+// 8 for BC1/BC4; 16 for BC2/BC3/BC5/BC6H/BC7).  The helper rounds each
+// per-mip starting offset up to blockSize.  Default blockSize = 1 leaves
+// the cumulative sum untouched (uncompressed fast path).
+//
+// Returns an offsets table the same length as mip_sizes.  Empty input
+// yields an empty table.
+inline std::vector<std::size_t> mipOffsets(std::span<const std::size_t> mip_sizes,
+                                           std::size_t                  blockSize = 1) {
+    std::vector<std::size_t> offsets(mip_sizes.size());
+    std::size_t              cumul = 0;
+    for (std::size_t j = 0; j < mip_sizes.size(); ++j) {
+        if (blockSize > 1) {
+            cumul = (cumul + blockSize - 1) / blockSize * blockSize;
+        }
+        offsets[j] = cumul;
+        cumul += mip_sizes[j];
+    }
+    return offsets;
+}
+
+// Total bytes required to hold all mip levels (last offset + last mip
+// size, with the final block-size round-up already applied by mipOffsets
+// for any earlier mip; the trailing mip needs no further rounding because
+// no offset follows it).
+inline std::size_t packedTotalBytes(std::span<const std::size_t> mip_sizes,
+                                    std::span<const std::size_t> offsets) {
+    if (mip_sizes.empty()) return 0;
+    return offsets.back() + mip_sizes.back();
+}
+
+// Bytes per texel block for the formats this engine actually loads (see
+// src/Vulkan/include/Vulkan/TexFormatVk.hpp).  For uncompressed formats
+// the engine fills mip sizes as width*height*bytes_per_pixel, all of
+// which are already 4-aligned for the worst-case (RGBA8) — return
+// 1 so the offset table tracks the raw cumulative sum.  For block-
+// compressed formats return the actual block byte count so the per-mip
+// VkBufferImageCopy::bufferOffset honours
+// VUID-vkCmdCopyBufferToImage-bufferOffset-01558.
+inline std::size_t bytesPerBlockForFormat(VkFormat fmt) {
+    switch (fmt) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK:
+        return 8;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return 16;
+    default:
+        return 1;
+    }
+}
+
+// Pack a sequence of mip-source byte arrays into a destination buffer at
+// the offsets computed by mipOffsets().  Mirrors the memcpy loop in
+// TextureCache::CreateTex(Image&) so the loop can be exercised without a
+// Vulkan device.
+//
+// Callers pass dst as a pre-sized buffer (at least packedTotalBytes() bytes).
+inline void packMipsIntoBuffer(std::span<const std::pair<const std::uint8_t*, std::size_t>> mips,
+                               std::span<const std::size_t>                                 offsets,
+                               std::uint8_t*                                                dst) {
+    for (std::size_t j = 0; j < mips.size(); ++j) {
+        std::memcpy(dst + offsets[j], mips[j].first, mips[j].second);
+    }
+}
+
+// Which step of a staging acquire refused, so the caller can name the failing
+// Vulkan call in its log rather than reporting a generic upload failure.
+enum class StagingMapStatus
+{
+    Ok,
+    CreateFailed,
+    MapFailed,
+};
+
+struct MappedStaging {
+    void*            data { nullptr };
+    StagingMapStatus status { StagingMapStatus::Ok };
+};
+
+// Reuse-or-allocate a host-visible staging buffer and map it, stopping at the
+// first refusal.  Both stops matter under memory pressure: mapping a buffer
+// whose allocation failed reaches VMA through a null allocator (VMA_ASSERT is
+// compiled out in release builds, so it segfaults the host process instead of
+// tripping), and copying after a failed map pushes a whole frame through a
+// pointer the driver never wrote.  A success that yields no pointer is treated
+// as a failure for the same reason.
+//
+// `create` returns false when the allocation failed; `map` writes the host
+// pointer through its out-param and returns false on a non-success VkResult.
+// Injecting both keeps the ordering testable without a Vulkan device or an
+// allocation-failure injector.
+template<class CreateFn, class MapFn>
+inline MappedStaging acquireMappedStaging(bool reusable, CreateFn&& create, MapFn&& map) {
+    if (! reusable && ! std::forward<CreateFn>(create)()) {
+        return MappedStaging { nullptr, StagingMapStatus::CreateFailed };
+    }
+    void* data = nullptr;
+    if (! std::forward<MapFn>(map)(&data) || data == nullptr) {
+        return MappedStaging { nullptr, StagingMapStatus::MapFailed };
+    }
+    return MappedStaging { data, StagingMapStatus::Ok };
+}
+
+// What to do with a texture upload once the per-slot loop has stopped.
+//
+// CreateTex builds a texture one slot at a time and bails out of the loop on
+// the first refusal (image create, staging alloc, staging map).  Two things
+// hang off that: whether the built slots may be published to the cache map,
+// and whether the decoded CPU mip bytes may be freed.  Publishing a half-built
+// slot vector turns a transient allocation failure into a permanent one — the
+// next CreateTex for that key hits the cache and hands back null VkImage
+// handles — and freeing the CPU bytes destroys the only copy a retry could
+// upload from.
+struct UploadPublish {
+    bool cache;   // insert the built slots into the cache map
+    bool release; // free the decoded CPU mip bytes
+};
+
+// `may_release` is the caller's own policy for the image (video placeholders
+// keep their bytes; an env escape hatch can force-keep everything).  An
+// incomplete build overrides it: those bytes are the retry's source.
+inline UploadPublish planUploadPublish(std::size_t slots_built, std::size_t slots_total,
+                                       bool may_release) {
+    const bool complete = slots_built >= slots_total;
+    return UploadPublish { complete, complete && may_release };
+}
+
+// Whether a re-upload source mip carries pixels. An Image whose CPU bytes the
+// cache already freed after its first upload has size 0 and no pointer;
+// staging that would ask Vulkan for a zero-size VkBuffer, which is invalid.
+inline bool mipHasPayload(long long size, const void* data) { return size > 0 && data != nullptr; }
+
+// Rate-limit a per-texture upload-failure log.  `prior_failures` is how many
+// times in a row this texture already refused.  Video textures re-upload every
+// frame and a text layer retries every frame until it lands, so a permanently
+// unusable texture would otherwise write a line per frame forever; a transient
+// one still shows up immediately.  Log the first few, then one per long
+// interval so the condition stays visible without drowning the journal.
+inline bool shouldLogUploadFailure(std::uint64_t prior_failures) {
+    constexpr std::uint64_t verbose_head = 3;
+    constexpr std::uint64_t interval     = 600; // ~10 s at 60 fps
+    if (prior_failures < verbose_head) return true;
+    return (prior_failures - verbose_head) % interval == 0;
+}
+
+// Parse WEK_TEXCACHE_QUERY_CAP-style env override into a uint32_t soft cap.
+// Returns the default when env is null, empty, malformed, or out of the
+// accepted [min_cap, max_cap] band.  Out-of-band values must fall back to
+// the default — a cap too small thrashes the pool (eviction every frame),
+// a cap too large defeats the purpose entirely.  Bounds + default are
+// caller-supplied so the helper stays testable in isolation.
+//
+// `env` mirrors std::getenv()'s return shape (NUL-terminated cstr or
+// nullptr); pass a closure in tests, std::getenv in production.
+inline std::uint32_t parseQueryCapEnv(const char* env, std::uint32_t default_cap,
+                                      std::uint32_t min_cap = 8,
+                                      std::uint32_t max_cap = 4096) {
+    if (env == nullptr || env[0] == '\0') return default_cap;
+    char*               endp = nullptr;
+    const unsigned long val  = std::strtoul(env, &endp, 10);
+    if (endp == nullptr || *endp != '\0') return default_cap;
+    if (val < min_cap || val > max_cap) return default_cap;
+    return static_cast<std::uint32_t>(val);
+}
+
+// Whether the query-texture pool has outgrown its soft cap and is worth an
+// eviction pass.
+inline bool queryPoolOverCap(std::size_t size, std::size_t soft_cap) { return size > soft_cap; }
+
+// Choose which non-persist query-tex entries to evict so the pool shrinks
+// back to <= soft_cap.  Pure function — operates on a parallel ticks/persist
+// view of the cache so it can be unit-tested without a live VkDevice or VMA
+// allocator.
+//
+// `lru_ticks[i]` is RtSlot[i].lru_tick; `persist[i]` is RtSlot[i].persist.
+// Returns the indices of victims, sorted DESCENDING by index — callers walk
+// the result in order and erase by index without needing to renumber.
+//
+// Eviction policy: oldest-non-persist-first.  Persist=true entries are never
+// touched; if every entry is persist=true, the result is empty and the pool
+// stays above the cap (intentional — the cap is soft).
+inline std::vector<std::size_t> selectEvictionVictims(std::span<const std::uint64_t> lru_ticks,
+                                                     std::span<const std::uint8_t>  persist,
+                                                     std::size_t soft_cap) {
+    if (lru_ticks.size() <= soft_cap) return {};
+    if (lru_ticks.size() != persist.size()) return {};
+
+    // Collect indices of non-persist entries, paired with their lru_tick so
+    // we can sort by recency without sorting the original pool in-place.
+    std::vector<std::pair<std::uint64_t, std::size_t>> cold;
+    cold.reserve(lru_ticks.size());
+    for (std::size_t i = 0; i < lru_ticks.size(); ++i) {
+        if (! persist[i]) cold.emplace_back(lru_ticks[i], i);
+    }
+    if (cold.empty()) return {};
+
+    // Sort ascending by lru_tick — oldest first.
+    std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+    const std::size_t       overflow = lru_ticks.size() - soft_cap;
+    const std::size_t       take     = std::min(overflow, cold.size());
+    std::vector<std::size_t> victims;
+    victims.reserve(take);
+    for (std::size_t i = 0; i < take; ++i) victims.push_back(cold[i].second);
+
+    // Erase-by-index callers want descending order so earlier erases don't
+    // invalidate later indices.
+    std::sort(victims.begin(), victims.end(), std::greater<std::size_t>());
+    return victims;
+}
+
+// Combine each query-tex's explicit persist flag with current-generation
+// liveness into the effective persist mask fed to selectEvictionVictims.  A
+// query-tex requested during the current render-graph generation is a LIVE
+// render target — its image backs a framebuffer bound by CustomShaderPass, so
+// evicting it is a use-after-free however cold its lru_tick looks.  Entry i is
+// protected iff it is already persist OR its last_gen == current_gen; only
+// prior-generation (previous-scene) entries stay eligible for reclaim.  Pure
+// so it is unit-testable without a live VkDevice.  Size mismatch → empty
+// (defensive; selectEvictionVictims then also returns empty).
+inline std::vector<std::uint8_t> effectiveEvictionPersist(std::span<const std::uint8_t>  persist,
+                                                          std::span<const std::uint64_t> last_gen,
+                                                          std::uint64_t current_gen) {
+    if (persist.size() != last_gen.size()) return {};
+    std::vector<std::uint8_t> out(persist.size());
+    for (std::size_t i = 0; i < persist.size(); ++i) {
+        out[i] = (persist[i] || last_gen[i] == current_gen) ? std::uint8_t { 1 } : std::uint8_t { 0 };
+    }
+    return out;
+}
+
+// Slot ids come from a counter, never from a position in the slot vector:
+// evictColdQueryTexs erases entries, and every pass analysis keys on the id.
+inline std::uint32_t AllocateSlotId(std::uint32_t& next) { return next++; }
+
+// The erase step of query-tex eviction.  `victims` is sorted descending (what
+// selectEvictionVictims returns), so each erase leaves the remaining indices
+// valid.  Every lookup-map key still pointing at a victim is removed before
+// the owning pointer is destroyed, or the map would hold a dangling pointer.
+// Pure over any vector of owning pointers with a `query_keys` member and any
+// map keyed by those strings, so the test runs the production code.
+template<typename Slots, typename KeyMap>
+void eraseEvictedSlots(Slots& slots, KeyMap& by_key, const std::vector<std::size_t>& victims) {
+    for (std::size_t v : victims) {
+        for (const auto& mapped_key : slots[v]->query_keys) by_key.erase(mapped_key);
+        slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(v));
+    }
+}
+
+// WEKDE_RT_RESIDENCY=0 keeps every render target resident from load (the
+// behaviour before on-demand creation), for A/B runs and field triage.
+inline bool residencyEnabledFromEnv(const char* env) {
+    return ! (env != nullptr && env[0] == '0' && env[1] == '\0');
+}
+
+// Give a slot a fresh image.  The generation tells passes holding handle
+// copies that they are stale; the counters restart because the slot was
+// needed this frame and the create succeeded.
+template<typename Slot, typename Img>
+void attachImage(Slot& slot, Img&& image) {
+    slot.image.emplace(std::forward<Img>(image));
+    ++slot.generation;
+    slot.idle_frames        = 0;
+    slot.create_fail_streak = 0;
+}
+
+// Whether a pass must skip for want of an output to draw into: the slot is
+// managed and either has no image or nobody needs it this frame.  Persistent
+// targets are always there, so they never gate.
+inline bool outputAbsent(bool managed, bool resident, bool needed) {
+    return managed && (! resident || ! needed);
+}
+
+} // namespace detail
+} // namespace vulkan
+} // namespace wallpaper

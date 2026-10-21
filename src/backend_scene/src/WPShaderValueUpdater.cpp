@@ -1,0 +1,858 @@
+#include "WPShaderValueUpdater.hpp"
+#include "Eigen/src/Core/Matrix.h"
+#include "Eigen/src/Geometry/Transform.h"
+#include "Scene/CameraShakeGate.h"
+#include "Scene/Scene.h"
+#include "Scene/SceneCamera.h"
+#include "Scene/SpriteSnapshotGate.h"
+#include "SpriteAnimation.hpp"
+#include "SpecTexs.hpp"
+#include "Audio/AudioAnalyzer.h"
+#include "Core/ArrayHelper.hpp"
+#include "Utils/Algorism.h"
+#include "NormalMatrix.hpp"
+#include "Utils/SceneProfiler.h"
+
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+#include <iostream>
+#include <chrono>
+#include <ctime>
+#include <cstdlib>
+#include <set>
+#include <map>
+
+namespace
+{
+// WEKDE_DEBUG_SHAKE=1 dumps the camera-shake decision: the offset the
+// sum-of-sinusoids produced, and per node whether the shake branch was actually
+// taken.  Which nodes sway is otherwise invisible: the split falls along camera
+// names the scene file never mentions, so a layer standing still while the rest
+// of the picture moves gives no clue why.  Read once, so the getenv cost stays
+// off the per-node path.
+bool shakeDiagEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("WEKDE_DEBUG_SHAKE");
+        return v != nullptr && v[0] != '\0' && std::string_view(v) != "0";
+    }();
+    return on;
+}
+
+// Is this camera one of the followers the scene re-clones from a global-view
+// camera ("global" or its 3D-scene "global_ortho" companion) every frame?
+// Only the per-node cameras a compose effect creates land in one of those
+// lists, and only for them does the answer need looking up — the scene-wide
+// names and the post-process camera decide on their own, so skip the scan
+// for those.
+bool followsLinkedGlobalCamera(const wallpaper::Scene& scene, std::string_view cam_name) {
+    if (wallpaper::isGlobalViewCameraName(cam_name) || wallpaper::isPostProcessCameraName(cam_name))
+        return false;
+    return wallpaper::isLinkedToGlobalView(cam_name, scene.linkedCameras);
+}
+} // namespace
+
+using namespace wallpaper;
+using namespace Eigen;
+
+void WPShaderValueUpdater::FrameBegin() {
+    WEK_PROFILE_SCOPE("WPShaderValueUpdater::FrameBegin");
+    /*
+        using namespace std::chrono;
+        auto nowTime = system_clock::to_time_t(system_clock::now());
+        auto cTime   = std::localtime(&nowTime);
+        m_dayTime =
+            (((cTime->tm_hour * 60) + cTime->tm_min) * 60 + cTime->tm_sec) / (24.0f * 60.0f
+       * 60.0f);
+    */
+    double new_time    = m_mouseDelayedTime + m_scene->frameTime;
+    new_time           = new_time > m_parallax.delay ? m_parallax.delay : new_time;
+    m_mouseDelayedTime = new_time;
+    // A zero delay means "the mouse follows instantly", so snap t to 1 instead
+    // of dividing.  Wallpaper Engine really does ship cameraparallaxdelay: 0,
+    // and 0/0 would put NaN into m_mousePos permanently — lerp is a + t*(b-a),
+    // so no later t recovers once a is NaN, and the NaN reaches every
+    // mouse-linked particle control point.  `> 0.0` also catches a negative
+    // delay.
+    double t   = m_parallax.delay > 0.0f ? new_time / m_parallax.delay : 1.0;
+    m_mousePos = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
+                              (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
+
+    // Compute camera shake offset (sum-of-sinusoids pseudo-noise)
+    if (m_shake.enable) {
+        // Wrap before the float32 narrowing for the same reason as g_Time; the
+        // shake speed multiplier would otherwise push it out of precision even
+        // sooner. Shake is pure sum-of-sinusoids, so a per-period phase seam is
+        // the only cost.
+        float t = wrappedSceneTimeF(m_scene->elapsingTime) * m_shake.speed;
+        float r = m_shake.roughness;
+        float sx =
+            std::sin(t * 1.0f) + std::sin(t * 2.3f + 1.7f) * r + std::sin(t * 4.7f + 3.1f) * r * r;
+        float sy = std::cos(t * 1.3f + 0.5f) + std::cos(t * 2.7f + 2.1f) * r +
+                   std::cos(t * 5.1f + 0.9f) * r * r;
+        float norm    = 1.0f + r + r * r;
+        m_shakeOffset = Vector2f(sx, sy) * (m_shake.amplitude / norm);
+    }
+
+    if (shakeDiagEnabled()) {
+        static int s_shake_log = 0;
+        if (++s_shake_log % 120 == 1) {
+            LOG_INFO("[SHAKE] enable=%d amp=%.4f speed=%.3f rough=%.3f offset=(%.5f,%.5f) "
+                     "parallax=%d ortho=%dx%d t=%.2f",
+                     (int)m_shake.enable,
+                     (double)m_shake.amplitude,
+                     (double)m_shake.speed,
+                     (double)m_shake.roughness,
+                     (double)m_shakeOffset.x(),
+                     (double)m_shakeOffset.y(),
+                     (int)m_parallax.enable,
+                     (int)m_scene->ortho[0],
+                     (int)m_scene->ortho[1],
+                     m_scene->elapsingTime);
+        }
+    }
+
+    // Advance camera path animation
+    if (m_scene->activeCamera && m_scene->activeCamera->HasPaths()) {
+        m_scene->activeCamera->AdvanceTime(m_scene->frameTime);
+    }
+    // Keep reflected camera in sync
+    if (auto it = m_scene->cameras.find("reflected_perspective"); it != m_scene->cameras.end()) {
+        if (it->second->HasPaths()) {
+            it->second->AdvanceTime(m_scene->frameTime);
+        }
+    }
+}
+
+void WPShaderValueUpdater::FrameEnd() {}
+
+void WPShaderValueUpdater::MouseInput(double x, double y) {
+    using namespace std::chrono;
+
+    auto   now_time = steady_clock::now();
+    double new_time = m_mouseDelayedTime -
+                      duration_cast<duration<double>>(now_time - m_last_mouse_input_time).count();
+    m_mouseDelayedTime = new_time < 0.0f ? 0.0f : new_time;
+
+    m_mousePosInput[0] = (float)x;
+    m_mousePosInput[1] = (float)y;
+
+    m_last_mouse_input_time = now_time;
+}
+
+void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp& existsOp) {
+    m_nodeUniformInfoMap[pNode] = WPUniformInfo();
+    auto& info                  = m_nodeUniformInfoMap[pNode];
+    info.has_MI                 = existsOp(G_MI);
+    info.has_NM                 = existsOp(G_NM);
+    info.has_M                  = existsOp(G_M);
+    info.has_AM                 = existsOp(G_AM);
+    info.has_MVP                = existsOp(G_MVP);
+    info.has_MVPI               = existsOp(G_MVPI);
+    info.has_ETVP               = existsOp(G_ETVP);
+    info.has_ETVPI              = existsOp(G_ETVPI);
+
+    info.has_VP = existsOp(G_VP);
+
+    info.has_BONES              = existsOp(G_BONES);
+    info.has_TIME               = existsOp(G_TIME);
+    info.has_DAYTIME            = existsOp(G_DAYTIME);
+    info.has_POINTERPOSITION    = existsOp(G_POINTERPOSITION);
+    info.has_PARALLAXPOSITION   = existsOp(G_PARALLAXPOSITION);
+    info.has_TEXELSIZE          = existsOp(G_TEXELSIZE);
+    info.has_TEXELSIZEHALF      = existsOp(G_TEXELSIZEHALF);
+    info.has_SCREEN             = existsOp(G_SCREEN);
+    info.has_LIGHTAMBIENTCOLOR  = existsOp(G_LIGHTAMBIENTCOLOR);
+    info.has_LIGHTSKYLIGHTCOLOR = existsOp(G_LIGHTSKYLIGHTCOLOR);
+    info.has_LP                 = existsOp(G_LP);
+    info.has_LCR                = existsOp(G_LCR);
+    info.has_EYEPOSITION        = existsOp(G_EYEPOSITION);
+
+    info.has_AUDIOSPECTRUM16LEFT  = existsOp(G_AUDIOSPECTRUM16LEFT);
+    info.has_AUDIOSPECTRUM16RIGHT = existsOp(G_AUDIOSPECTRUM16RIGHT);
+    info.has_AUDIOSPECTRUM32LEFT  = existsOp(G_AUDIOSPECTRUM32LEFT);
+    info.has_AUDIOSPECTRUM32RIGHT = existsOp(G_AUDIOSPECTRUM32RIGHT);
+    info.has_AUDIOSPECTRUM64LEFT  = existsOp(G_AUDIOSPECTRUM64LEFT);
+    info.has_AUDIOSPECTRUM64RIGHT = existsOp(G_AUDIOSPECTRUM64RIGHT);
+
+    if (info.has_AUDIOSPECTRUM16LEFT || info.has_AUDIOSPECTRUM16RIGHT ||
+        info.has_AUDIOSPECTRUM32LEFT || info.has_AUDIOSPECTRUM32RIGHT ||
+        info.has_AUDIOSPECTRUM64LEFT || info.has_AUDIOSPECTRUM64RIGHT) {
+        m_hasAudioUniform = true; // scene-level aggregate FFT gate
+        LOG_INFO("Audio spectrum uniforms detected for node %d", pNode->ID());
+    }
+
+    for (size_t i = 0; i < info.texs.size(); ++i) {
+        info.texs[i].has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[i]);
+        info.texs[i].has_mipmap     = existsOp(WE_GLTEX_MIPMAPINFO_NAMES[i]);
+    }
+
+    // Pre-resolve render-target names to their (width, height, mipmap_level)
+    // tuple once, here, instead of every frame inside UpdateUniforms.  The
+    // tuple is parse-time-immutable post-WPSceneParser (the lone post-parse
+    // mutation — CopyPass::prepare flipping allowReuse — never touches
+    // dimensions or mip-level), and InitUniforms runs once per pass at
+    // CustomShaderPass::prepare AFTER WPSceneParser has called SetNodeData,
+    // so nodeData.renderTargets is already populated when we get here.
+    //
+    // If SetNodeData hasn't run for this node yet (legitimate for a node
+    // with no RT-name uniforms), find() returns end() and Apply has nothing
+    // to upload — same behaviour as the original block's `exists()` gate.
+    auto nodeDataIt = m_nodeDataMap.find(pNode);
+    if (nodeDataIt != m_nodeDataMap.end()) {
+        const auto& nodeData = nodeDataIt->second;
+        for (const auto& el : nodeData.renderTargets) {
+            if (el.first >= info.texs.size()) continue;
+            // Link textures ("_rt_link_N") aren't in renderTargets directly;
+            // resolve to the corresponding "_rt_offscreen_N" so the slot's
+            // dimensions come from the real RT.
+            std::string_view rtName = el.second;
+            std::string      resolved;
+            if (IsSpecLinkTex(rtName)) {
+                resolved = GenOffscreenRT(ParseLinkTex(rtName));
+                rtName   = resolved;
+            }
+            auto rtIt = m_scene->renderTargets.find(std::string(rtName));
+            if (rtIt == m_scene->renderTargets.end()) {
+                // Diagnostic log: moved from per-frame to per-prepare so it
+                // fires once at scene build instead of once per frame.
+                // Still one-shot per (key, process) via the static set, so
+                // log volume is unchanged or strictly reduced.
+                thread_local std::set<std::string> _rt_miss_logged;
+                if (_rt_miss_logged.insert(el.second).second) {
+                    LOG_INFO("RT miss: tex[%zu]='%s' resolved='%s' NOT in renderTargets",
+                             el.first,
+                             el.second.c_str(),
+                             std::string(rtName).c_str());
+                }
+                continue;
+            }
+            const auto& rt                      = rtIt->second;
+            info.texs[el.first].rt_valid        = true;
+            info.texs[el.first].rt_width        = rt.width;
+            info.texs[el.first].rt_height       = rt.height;
+            info.texs[el.first].rt_mipmap_level = rt.mipmap_level;
+
+            thread_local std::set<std::string> _rt_res_logged;
+            if (IsSpecLinkTex(el.second) && _rt_res_logged.insert(el.second).second) {
+                LOG_INFO("RT resolution upload: tex[%zu]='%s' → '%s' (%dx%d)",
+                         el.first,
+                         el.second.c_str(),
+                         std::string(rtName).c_str(),
+                         rt.width,
+                         rt.height);
+            }
+        }
+    }
+}
+
+void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprites,
+                                          const UpdateUniformOp& updateOp) {
+    UpdateUniforms(pNode, sprites, updateOp, "");
+}
+
+void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprites,
+                                          const UpdateUniformOp& updateOp,
+                                          const std::string&     camera_override) {
+    WEK_PROFILE_SCOPE("WPShaderValueUpdater::UpdateUniforms");
+    if (! pNode->Mesh()) return;
+
+    pNode->UpdateTrans();
+
+    const SceneCamera* camera;
+    std::string_view   cam_name;
+    if (! camera_override.empty()) {
+        cam_name = camera_override;
+        camera   = m_scene->cameras.at(camera_override).get();
+    } else {
+        cam_name = pNode->Camera();
+        if (! cam_name.empty()) {
+            camera = m_scene->cameras.at(std::string(cam_name)).get();
+        } else
+            camera = m_scene->activeCamera;
+    }
+
+    if (! camera) return;
+
+    auto* material = pNode->Mesh()->Material();
+    if (! material) return;
+    // auto& shadervs = material->customShader.updateValueList;
+    // const auto& valueSet = material->customShader.valueSet;
+
+    // Explicit guard replacing a data-driven assert that compiled out under
+    // -DNDEBUG in every shipped build.  Without it, operator[] on an absent
+    // node would silently default-construct a zeroed UniformInfo entry and
+    // render with garbage uniforms (silent corruption).  Use .at() after the
+    // existence check so no entry is ever inserted.
+    if (! exists(m_nodeUniformInfoMap, pNode)) {
+        LOG_ERROR("no uniform info for node %d, skipping uniform update", pNode->ID());
+        return;
+    }
+    const auto& info = m_nodeUniformInfoMap.at(pNode);
+
+    // RT name resolution + dimension / mipmap lookup happened at
+    // InitUniforms.  Upload the cached tuple — no string alloc, no
+    // unordered_map probe per frame.  Iterates the fixed-size info.texs
+    // directly; rt_valid filters out slots whose RT wasn't found at prepare
+    // (matches the old `continue` branch).
+    for (usize i = 0; i < info.texs.size(); i++) {
+        const auto& unifrom_tex = info.texs[i];
+        if (! unifrom_tex.rt_valid) continue;
+        if (unifrom_tex.has_resolution) {
+            std::array<i32, 4> resolution_uint({ unifrom_tex.rt_width,
+                                                 unifrom_tex.rt_height,
+                                                 unifrom_tex.rt_width,
+                                                 unifrom_tex.rt_height });
+            updateOp(WE_GLTEX_RESOLUTION_NAMES[i], ShaderValue(array_cast<float>(resolution_uint)));
+        }
+        if (unifrom_tex.has_mipmap) {
+            updateOp(WE_GLTEX_MIPMAPINFO_NAMES[i], (float)unifrom_tex.rt_mipmap_level);
+        }
+    }
+
+    bool hasNodeData = exists(m_nodeDataMap, pNode);
+    if (hasNodeData) {
+        auto& nodeData = m_nodeDataMap.at(pNode);
+        if (nodeData.puppet_layer.hasPuppet() && info.has_BONES) {
+            auto        data          = nodeData.puppet_layer.genFrame(m_scene->frameTime);
+            static bool _bones_logged = false;
+            if (! _bones_logged) {
+                LOG_INFO("uploading g_Bones: %zu bones, frameTime=%.4f",
+                         data.size(),
+                         m_scene->frameTime);
+                _bones_logged = true;
+            }
+            // A puppet whose skeleton parsed to ZERO bones makes genFrame()
+            // return an empty span; uploading it would index `data[0]` on an
+            // empty std::span and abort the whole process (plasmashell crash
+            // loop on totoro 2891663007, "uploading g_Bones: 0 bones").
+            // boneAffinesAsUploadFloats() returns an empty span for the no-bone
+            // case — upload only when non-empty (see WPPuppet.hpp).
+            if (auto boneFloats = boneAffinesAsUploadFloats(data); ! boneFloats.empty()) {
+                updateOp(G_BONES, boneFloats);
+            }
+            // Collect keyframe events fired during updateInterpolation inside
+            // genFrame(); forwarded to the owning node's SceneScript via the
+            // QML-side drain on the next evaluation tick.
+            auto events = nodeData.puppet_layer.drainEvents();
+            if (! events.empty()) {
+                PushAnimationEvents(pNode->ID(), std::move(events));
+            }
+        } else {
+            static bool _no_bones_logged = false;
+            if (! _no_bones_logged && (nodeData.puppet_layer.hasPuppet() || info.has_BONES)) {
+                LOG_INFO("BONES NOT uploaded: hasPuppet=%d has_BONES=%d",
+                         (int)nodeData.puppet_layer.hasPuppet(),
+                         (int)info.has_BONES);
+                _no_bones_logged = true;
+            }
+        }
+    }
+
+    bool reqMI    = info.has_MI;
+    bool reqM     = info.has_M;
+    bool reqNM    = info.has_NM;
+    bool reqAM    = info.has_AM;
+    bool reqMVP   = info.has_MVP;
+    bool reqMVPI  = info.has_MVPI;
+    bool reqETVP  = info.has_ETVP;
+    bool reqETVPI = info.has_ETVPI;
+
+    // ---- matrix/VP uniform block: recompute only when something moved ----
+    // Parallax mutates the model matrix from live mouse input every frame;
+    // camera-shake mutates the VP of every camera showing the global view.  Both
+    // must stay volatile (never served from the static cache).  The flags
+    // mirror the exact runtime conditions of the parallax/shake math below.
+    const bool linkedToGlobal = followsLinkedGlobalCamera(*m_scene, cam_name);
+    const bool parallaxActive = m_parallax.enable && hasNodeData && cam_name != "effect";
+    const bool shakeActive    = m_shake.enable && cameraFollowsGlobalView(cam_name, linkedToGlobal);
+
+    auto&      mc        = m_nodeMatrixCache[{ pNode, std::string(cam_name) }];
+    const bool recompute = uniformMatricesShouldRecompute(! mc.valid,
+                                                          parallaxActive,
+                                                          shakeActive,
+                                                          pNode->TransEpoch(),
+                                                          mc.node_epoch,
+                                                          camera->VpEpoch(),
+                                                          mc.vp_epoch);
+
+    // Recompute-vs-cached counter (gated on WEKDE_DEBUG_UNIFORM): confirms a
+    // static scene logs ~100% cached after the first frame and a parallax
+    // scene logs ~100% recompute, without instrumenting the production path.
+    {
+        static const bool _unf_dbg = std::getenv("WEKDE_DEBUG_UNIFORM") != nullptr;
+        if (_unf_dbg) {
+            static uint64_t _unf_recompute = 0, _unf_cached = 0;
+            if (recompute)
+                ++_unf_recompute;
+            else
+                ++_unf_cached;
+            if ((_unf_recompute + _unf_cached) % 90 == 0) {
+                LOG_INFO("uniform matrix gate: recompute=%llu cached=%llu",
+                         (unsigned long long)_unf_recompute,
+                         (unsigned long long)_unf_cached);
+            }
+        }
+    }
+
+    if (! recompute) {
+        // Static fast path: re-upload the cached matrices, skipping the
+        // recompute AND both double 4x4 inverses.
+        if (info.has_VP && mc.has_vp) updateOp(G_VP, mc.vp);
+        if (reqM && mc.has_m) updateOp(G_M, mc.m);
+        if (reqAM && mc.has_am) updateOp(G_AM, mc.am);
+        if (reqMI && mc.has_mi) updateOp(G_MI, mc.mi);
+        if (reqNM && mc.has_nm) updateOp(G_NM, mc.nm);
+        if (reqMVP && mc.has_mvp) updateOp(G_MVP, mc.mvp);
+        if (reqMVPI && mc.has_mvpi) updateOp(G_MVPI, mc.mvpi);
+    } else {
+        WEK_PROFILE_SCOPE("UpdateUniforms::matrixRecompute");
+        Matrix4d viewProTrans = camera->GetViewProjectionMatrix();
+
+        // Camera shake: translate the view-projection so all scene objects shift together.
+        // Reuses the dirty-gate flag verbatim — the two must never diverge, or a node the
+        // gate thinks is static gets shaken once and then frozen at that offset.
+        const bool shakeApplied = shakeActive;
+        if (shakeDiagEnabled()) {
+            // First sighting of each node only — a %N sample just re-prints the
+            // busiest nodes and never shows the full shaken/unshaken split.
+            static std::set<std::pair<int, std::string>> s_seen_nodes;
+            auto key = std::make_pair(pNode->ID(), std::string(cam_name));
+            if (s_seen_nodes.size() < 400 && s_seen_nodes.insert(key).second) {
+                LOG_INFO("[SHAKE] node=%d cam='%s' applied=%d persp=%d offscreen=%d",
+                         pNode->ID(),
+                         std::string(cam_name).c_str(),
+                         (int)shakeApplied,
+                         (int)camera->IsPerspective(),
+                         (int)pNode->IsOffscreen());
+            }
+        }
+        if (shakeApplied) {
+            Vector2f shakeVec;
+            if (camera->IsPerspective()) {
+                // Perspective: m_shakeOffset already contains amplitude, use directly
+                // as world-space translation (typical amplitude 0.01 ≈ subtle shift)
+                shakeVec = m_shakeOffset;
+            } else {
+                // Ortho: scale by ortho dimensions for pixel-space shake
+                Vector2f ortho { (float)m_scene->ortho[0], (float)m_scene->ortho[1] };
+                shakeVec = m_shakeOffset.cwiseProduct(ortho) * 0.01f;
+            }
+            if (shakeDiagEnabled()) {
+                static int s_vec_log = 0;
+                if (++s_vec_log % 500 == 1) {
+                    LOG_INFO("[SHAKE] node=%d VP translate=(%.4f,%.4f)",
+                             pNode->ID(),
+                             (double)shakeVec.x(),
+                             (double)shakeVec.y());
+                }
+            }
+            viewProTrans =
+                viewProTrans *
+                Affine3d(Translation3d(Vector3d(shakeVec.x(), shakeVec.y(), 0.0f))).matrix();
+        }
+
+        if (info.has_VP) {
+            mc.vp     = ShaderValue::fromMatrix(viewProTrans);
+            mc.has_vp = true;
+            updateOp(G_VP, mc.vp);
+        }
+        if (reqM || reqMVP || reqMI || reqMVPI || reqNM) {
+            Matrix4d modelTrans = pNode->ModelTrans();
+            if (hasNodeData && cam_name != "effect") {
+                const auto& nodeData = m_nodeDataMap.at(pNode);
+                if (m_parallax.enable) {
+                    Vector3f nodePos = pNode->Translate();
+                    Vector2f depth(&nodeData.parallaxDepth[0]);
+                    Vector2f ortho { (float)m_scene->ortho[0], (float)m_scene->ortho[1] };
+                    // flip mouse y axis
+                    Vector2f mouseVec =
+                        Scaling(1.0f, -1.0f) * (Vector2f { 0.5f, 0.5f } - Vector2f(&m_mousePos[0]));
+                    mouseVec        = mouseVec.cwiseProduct(ortho) * m_parallax.mouseinfluence;
+                    Vector3f camPos = camera->GetPosition().cast<float>();
+                    // WE parallax: position-based + mouse-based shift, both
+                    // scaled by per-layer parallaxDepth and scene amount.  The
+                    // position-based term (nodePos - camPos) is intentional —
+                    // WE's editor preview shows layers already at their shifted
+                    // position (so authors place layers KNOWING about the
+                    // parallax bake-in).  Removing it causes layers authored
+                    // for the shifted position (e.g. 2866203962 'Cyberpunk' R
+                    // below Lucy's chin) to render above their intended spot.
+                    Vector2f paraVec =
+                        (nodePos.head<2>() - camPos.head<2>() + mouseVec).cwiseProduct(depth) *
+                        m_parallax.amount;
+                    modelTrans =
+                        Affine3d(Translation3d(Vector3d(paraVec.x(), paraVec.y(), 0.0f))).matrix() *
+                        modelTrans;
+                }
+            }
+
+            if (reqM) {
+                mc.m     = ShaderValue::fromMatrix(modelTrans);
+                mc.has_m = true;
+                updateOp(G_M, mc.m);
+            }
+            if (reqAM) {
+                mc.am     = ShaderValue::fromMatrix(modelTrans);
+                mc.has_am = true;
+                updateOp(G_AM, mc.am);
+            }
+            if (reqMI) {
+                mc.mi     = ShaderValue::fromMatrix(modelTrans.inverse());
+                mc.has_mi = true;
+                updateOp(G_MI, mc.mi);
+            }
+            if (reqNM) {
+                mc.nm     = ShaderValue::fromMatrix(NormalMatrixFrom(modelTrans));
+                mc.has_nm = true;
+                updateOp(G_NM, mc.nm);
+            }
+
+            // Diagnostic for nodes using separate M + VP (3D models with custom shaders)
+            if (reqM && info.has_VP && ! reqMVP && cam_name.empty()) {
+                thread_local std::set<SceneNode*> _mvp_sep_logged;
+                if (_mvp_sep_logged.insert(pNode).second) {
+                    Vector4d center = viewProTrans * modelTrans * Vector4d(0, 0, 0, 1);
+                    auto     t      = pNode->Translate();
+                    auto     eyePos = camera->GetPosition();
+                    LOG_INFO("M+VP diag id=%d translate=(%.1f,%.1f,%.1f) "
+                             "clip_center=(%.3f,%.3f,%.3f,%.3f) "
+                             "ndc=(%.3f,%.3f) eye=(%.3f,%.3f,%.3f) "
+                             "depth=%d cull=%s",
+                             pNode->ID(),
+                             t.x(),
+                             t.y(),
+                             t.z(),
+                             center.x(),
+                             center.y(),
+                             center.z(),
+                             center.w(),
+                             center.x() / center.w(),
+                             center.y() / center.w(),
+                             eyePos.x(),
+                             eyePos.y(),
+                             eyePos.z(),
+                             (int)material->depthTest,
+                             material->cullmode.c_str());
+                }
+            }
+            if (reqMVP) {
+                Matrix4d mvpTrans = viewProTrans * modelTrans;
+                mc.mvp            = ShaderValue::fromMatrix(mvpTrans);
+                mc.has_mvp        = true;
+                updateOp(G_MVP, mc.mvp);
+                if (reqMVPI) {
+                    mc.mvpi     = ShaderValue::fromMatrix(mvpTrans.inverse());
+                    mc.has_mvpi = true;
+                    updateOp(G_MVPI, mc.mvpi);
+                }
+                // One-time diagnostic: log MVP info for nodes with empty camera (final composites)
+                thread_local std::set<SceneNode*> _mvp_logged;
+                if (cam_name.empty() && _mvp_logged.insert(pNode).second) {
+                    Vector4d center = mvpTrans * Vector4d(0, 0, 0, 1);
+                    auto     t      = pNode->Translate();
+                    LOG_INFO(
+                        "MVP diag id=%d cam='' translate=(%.1f,%.1f) model=[%.3f,%.3f,%.3f,%.3f] "
+                        "clip_center=(%.3f,%.3f) blend=%d",
+                        pNode->ID(),
+                        t.x(),
+                        t.y(),
+                        modelTrans(0, 0),
+                        modelTrans(1, 1),
+                        modelTrans(0, 3),
+                        modelTrans(1, 3),
+                        center.x() / center.w(),
+                        center.y() / center.w(),
+                        (int)material->blenmode);
+                }
+            }
+            if (reqETVP || reqETVPI) {
+                /*
+                Vector3d nodePos = pNode->Translate().cast<double>();
+                nodePos.z()      = 1.0f;
+                Matrix4d etvpTrans =
+                    viewProTrans * modelTrans * Affine3d(Eigen::Scaling(nodePos)).matrix();
+                if (reqETVPI) updateOp(G_ETVP, ShaderValue::fromMatrix(etvpTrans));
+                if (reqETVPI) updateOp(G_ETVPI, ShaderValue::fromMatrix(etvpTrans.inverse()));
+                */
+            }
+        }
+        mc.node_epoch = pNode->TransEpoch();
+        mc.vp_epoch   = camera->VpEpoch();
+        mc.valid      = true;
+    }
+    // ---- end matrix/VP block; per-frame-volatile uniforms continue below ----
+
+    //	g_EffectTextureProjectionMatrix
+    // shadervs.push_back({"g_EffectTextureProjectionMatrixInverse",
+    // ShaderValue::ValueOf(Eigen::Matrix4f::Identity())});
+    if (info.has_TIME) updateOp(G_TIME, wrappedSceneTimeF(m_scene->elapsingTime));
+
+    if (info.has_DAYTIME) updateOp(G_DAYTIME, (float)m_dayTime);
+
+    if (info.has_POINTERPOSITION) updateOp(G_POINTERPOSITION, m_mousePos);
+
+    if (info.has_TEXELSIZE) updateOp(G_TEXELSIZE, m_texelSize);
+
+    if (info.has_TEXELSIZEHALF)
+        updateOp(G_TEXELSIZEHALF, std::array { m_texelSize[0] / 2.0f, m_texelSize[1] / 2.0f });
+
+    if (info.has_SCREEN)
+        updateOp(G_SCREEN,
+                 std::array<float, 3> {
+                     m_screen_size[0], m_screen_size[1], m_screen_size[0] / m_screen_size[1] });
+
+    if (info.has_PARALLAXPOSITION) {
+        // g_ParallaxPosition is the mouse-driven [0,1] input that effect
+        // shaders (e.g. depthparallax) consume as "where is the viewer
+        // looking".  Mouse at screen center (0.5, 0.5) must produce (0.5,
+        // 0.5) so depth-based pixel displacement is zero — otherwise the
+        // depth map shifts foreground pixels relative to background even
+        // at rest, creating gaps between adjacent layers of differing
+        // depth (3363252053 dress (foreground) vs water/ground (background)
+        // showed a ~7-pixel horizontal seam because the prior formula
+        // `Scaling(1,-1) * mouseY - 0.5` evaluated to -1 at mouseY=0.5,
+        // giving g_ParallaxPosition.y = 0.5 + (-1) * 0.30 = 0.20).
+        //
+        // Correct Y-flip is `1 - mouseY` (mouse Y is 0-at-top while world
+        // Y is up), then offset from center scaled by mouseinfluence.
+        Vector2f mouseCentered { m_mousePos[0] - 0.5f, 0.5f - m_mousePos[1] };
+        Vector2f para =
+            Vector2f { 0.5f, 0.5f } + mouseCentered * m_parallax.mouseinfluence;
+        updateOp(G_PARALLAXPOSITION, std::array { para[0], para[1] });
+    }
+
+    // Apply SceneScript-driven sprite frame pinning before the per-frame
+    // GetAnimateFrame call.  Each pass holds its own copy of the sprite
+    // animation (sprites_map is by value), so the pin must be applied
+    // every frame for every pass that renders this node.  See
+    // Scene::nodeSpriteFrame for the source-of-truth map populated by
+    // SceneScript writes through SceneWallpaper::setLayerSpriteFrame.
+    if (pNode) {
+        auto sfit = m_scene->nodeSpriteFrame.find(pNode->ID());
+        if (sfit != m_scene->nodeSpriteFrame.end()) {
+            const auto& [wantsManual, frameIdx] = sfit->second;
+            for (auto& [i, sp] : sprites) {
+                if (wantsManual)
+                    sp.SetManualFrame(frameIdx);
+                else if (sp.isManualFrame())
+                    sp.ClearManualFrame();
+            }
+        } else {
+            // No override entry — make sure any prior manual pin is released.
+            for (auto& [i, sp] : sprites) {
+                if (sp.isManualFrame()) sp.ClearManualFrame();
+            }
+        }
+    }
+    for (auto& [i, sp] : sprites) {
+        const auto& f      = sp.GetAnimateFrame(m_scene->frameTime);
+        auto        grot   = WE_GLTEX_ROTATION_NAMES[i];
+        auto        gtrans = WE_GLTEX_TRANSLATION_NAMES[i];
+        updateOp(grot, std::array { f.xAxis[0], f.xAxis[1], f.yAxis[0], f.yAxis[1] });
+        updateOp(gtrans, std::array { f.x, f.y });
+    }
+
+    // Publish a per-node sprite snapshot for the SceneScript bridge
+    // (thisLayer.getTextureAnimation().frameCount / duration / getFrame() /
+    // isPlaying()).  Uses the first sprite as the representative — multiple
+    // sprites on the same layer share authored frametimes and advance in
+    // lock-step within a tick, so the first is faithful for read-back.
+    // Consumer-gate: skip the publication (mutex + map probe + 4 writes) when
+    // no SceneScript has called thisLayer.getTextureAnimation() yet.  Sticky-on
+    // once a consumer appears; first-frame stale-zero on the consumer side is
+    // harmless (default-constructed NodeSpriteSnapshot matches the pre-existing
+    // cache-miss return path).
+    if (pNode && ! sprites.empty() && spriteSnapshotShouldPublish(m_scene->needsSpriteSnapshot)) {
+        const auto&                   first_sp = sprites.begin()->second;
+        std::lock_guard<std::mutex>   lock(m_scene->nodeSpriteSnapshotMutex);
+        auto&                         snap     = m_scene->nodeSpriteSnapshot[pNode->ID()];
+        snap.numFrames                         = (u32)first_sp.numFrames();
+        snap.currentFrame                      = (u32)first_sp.curFrameIndex();
+        snap.duration                          = first_sp.totalDuration();
+        snap.isManualPin                       = first_sp.isManualFrame();
+    }
+
+    if (info.has_LP || info.has_LCR) {
+        std::array<float, 16> lights { 0 };
+        std::array<float, 16> lights_color_radius { 0 };
+        std::array<float, 12> lights_color { 0 };
+        uint                  i              = 0;
+        bool                  reflect_lights = (cam_name == "reflected_perspective");
+        for (auto& l : m_scene->lights) {
+            if (i == 4) break;
+            // assert() compiles out under NDEBUG (the default Release build),
+            // so a null light node would otherwise fall straight through to
+            // the unconditional dereference below with zero diagnostic in a
+            // shipped binary.
+            if (! l->node()) continue;
+            if (! l->node()->IsVisible()) continue;
+            // Walk the parent chain so parented lights upload their WORLD
+            // translation, not the always-zero local Translate().  Real-Time
+            // Earth (3557068717) drives this: 2 point lights parented to the
+            // animated SUN m5 node — without world-position upload they read
+            // back as (0,0,0) and the planet's outward normals dot to zero,
+            // rendering the surface pure black.  UpdateTrans() is a no-op
+            // when not dirty, so the per-frame cost on flat scenes is one
+            // cache hit.
+            l->node()->UpdateTrans();
+            const auto& world = l->node()->ModelTrans();
+            lights[i * 4 + 0] = (float)world(0, 3);
+            lights[i * 4 + 1] = (float)world(1, 3);
+            lights[i * 4 + 2] = (float)world(2, 3);
+            // Pack per-light falloff exponent into .w — the modern WE pipeline
+            // convention.  PerformLighting_V1 reads it as the `exponent`
+            // argument to ComputePBRLightShadow's `pow(saturate(1-d/r), e)`
+            // falloff.  SceneLight defaults exponent to 1.0 (linear) for
+            // legacy scenes; Real-Time Earth authors 0.1 for soft long-tail.
+            lights[i * 4 + 3] = l->exponent();
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+            // The world position a light actually reaches the shader with.  A
+            // light parented to an animated node is easy to get wrong by a
+            // whole hemisphere, and the symptom — terminator on the side away
+            // from the light — reads as a normal-matrix or winding problem
+            // instead.  Throttled rather than one-shot because the first
+            // upload happens before any script has moved the light.
+            {
+                thread_local std::map<usize, u64> _lp_ticks;
+                if (_lp_ticks[i]++ % 1800 == 0) {
+                    LOG_INFO("light[%zu] world=(%.2f,%.2f,%.2f) radius=%.1f exponent=%.3f",
+                             i,
+                             lights[i * 4 + 0],
+                             lights[i * 4 + 1],
+                             lights[i * 4 + 2],
+                             l->radius(),
+                             l->exponent());
+                }
+            }
+#endif
+            // Reflect light Y about the floor plane so the underside of
+            // objects receives the dominant lighting in the reflection.
+            if (reflect_lights) lights[i * 4 + 1] = -lights[i * 4 + 1];
+            // g_LightsColorRadius: vec4(color * intensity, radius)
+            const auto& ci                 = l->colorIntensity();
+            lights_color_radius[i * 4 + 0] = ci[0];
+            lights_color_radius[i * 4 + 1] = ci[1];
+            lights_color_radius[i * 4 + 2] = ci[2];
+            lights_color_radius[i * 4 + 3] = l->radius();
+            if (i < 3) {
+                const auto& color = l->premultipliedColor();
+                std::copy(color.begin(), color.end(), lights_color.begin() + i * 4);
+            }
+            i++;
+        }
+        updateOp(G_LP, lights);
+        updateOp(G_LCR, lights_color_radius);
+        updateOp(G_LCP, lights_color);
+    }
+
+    if (info.has_LIGHTAMBIENTCOLOR) updateOp(G_LIGHTAMBIENTCOLOR, m_scene->ambientColor);
+    if (info.has_LIGHTSKYLIGHTCOLOR) updateOp(G_LIGHTSKYLIGHTCOLOR, m_scene->skylightColor);
+
+    if (info.has_EYEPOSITION && camera->IsPerspective()) {
+        auto pos = camera->GetPosition();
+        updateOp(G_EYEPOSITION, std::array { (float)pos.x(), (float)pos.y(), (float)pos.z() });
+    }
+
+    // Audio spectrum uniforms — write zeros when no data available to avoid
+    // uninitialized UBO reads that produce noise in audio visualizer effects.
+    if (m_audioAnalyzer && m_audioAnalyzer->HasData()) {
+        if (info.has_AUDIOSPECTRUM16LEFT)
+            updateOp(G_AUDIOSPECTRUM16LEFT, m_audioAnalyzer->GetSpectrum16Left());
+        if (info.has_AUDIOSPECTRUM16RIGHT)
+            updateOp(G_AUDIOSPECTRUM16RIGHT, m_audioAnalyzer->GetSpectrum16Right());
+        if (info.has_AUDIOSPECTRUM32LEFT)
+            updateOp(G_AUDIOSPECTRUM32LEFT, m_audioAnalyzer->GetSpectrum32Left());
+        if (info.has_AUDIOSPECTRUM32RIGHT)
+            updateOp(G_AUDIOSPECTRUM32RIGHT, m_audioAnalyzer->GetSpectrum32Right());
+        if (info.has_AUDIOSPECTRUM64LEFT)
+            updateOp(G_AUDIOSPECTRUM64LEFT, m_audioAnalyzer->GetSpectrum64Left());
+        if (info.has_AUDIOSPECTRUM64RIGHT)
+            updateOp(G_AUDIOSPECTRUM64RIGHT, m_audioAnalyzer->GetSpectrum64Right());
+    } else {
+        // Zero-fill when audio analyzer isn't ready yet
+        static const std::array<float, 64> zeros {};
+        if (info.has_AUDIOSPECTRUM16LEFT) updateOp(G_AUDIOSPECTRUM16LEFT, zeros);
+        if (info.has_AUDIOSPECTRUM16RIGHT) updateOp(G_AUDIOSPECTRUM16RIGHT, zeros);
+        if (info.has_AUDIOSPECTRUM32LEFT) updateOp(G_AUDIOSPECTRUM32LEFT, zeros);
+        if (info.has_AUDIOSPECTRUM32RIGHT) updateOp(G_AUDIOSPECTRUM32RIGHT, zeros);
+        if (info.has_AUDIOSPECTRUM64LEFT) updateOp(G_AUDIOSPECTRUM64LEFT, zeros);
+        if (info.has_AUDIOSPECTRUM64RIGHT) updateOp(G_AUDIOSPECTRUM64RIGHT, zeros);
+    }
+}
+
+void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
+    m_nodeDataMap[nodeAddr] = data;
+}
+
+void WPShaderValueUpdater::PushAnimationEvents(i32                                      nodeId,
+                                               std::vector<WPPuppetLayer::PendingEvent> events) {
+    if (events.empty()) return;
+    std::lock_guard<std::mutex> lock(m_anim_events_mtx);
+    m_anim_events.reserve(m_anim_events.size() + events.size());
+    for (auto& e : events) {
+        m_anim_events.push_back({ nodeId, e.frame, std::move(e.name) });
+    }
+}
+
+std::vector<PendingAnimationEvent> WPShaderValueUpdater::DrainAnimationEvents() {
+    std::vector<PendingAnimationEvent> out;
+    std::lock_guard<std::mutex>        lock(m_anim_events_mtx);
+    out.swap(m_anim_events);
+    return out;
+}
+
+void WPShaderValueUpdater::UpdateVolumetricLightUniforms(const WritePerLightVarOp& op) {
+    WEK_PROFILE_SCOPE("WPShaderValueUpdater::UpdateVolumetricLightUniforms");
+    if (! m_scene) return;
+    // candidate_idx aligns with WPSceneParser-populated
+    // volumetricsConfig.per_light: both arrays are built by walking
+    // scene.lights with the same isVolumetricEmitterCandidate() predicate in
+    // the same order, so the Nth emitter here is per_light[N] over there.
+    int candidate_idx = 0;
+    for (auto& l : m_scene->lights) {
+        if (! l) continue;
+        // Single predicate (cast-flag + kind ∈ {Point, LPoint}) so this
+        // writer agrees with parser-side per_light gating + the public
+        // Scene::volumetricLights() accessor.
+        if (! l->isVolumetricEmitterCandidate()) continue;
+        if (! l->node()) continue;
+        l->node()->UpdateTrans();
+        const auto& world = l->node()->ModelTrans();
+
+        // g_RenderVar0: shadowmap transforms - no shadow path in v1.
+        std::array<float, 4> r0 { 0.0f, 0.0f, 0.0f, 0.0f };
+        // Visibility gate lives here, not as an early `continue` -- candidate_idx
+        // must advance for every emitter regardless of visibility (it indexes
+        // scene.volumetricsConfig.per_light, built unconditionally at parse
+        // time; skipping the index here would desync PumpVolumetricFrame's
+        // `assert(pl.light == l)`). Re-zero every frame rather than skip the
+        // write so a hidden light can't keep its last-visible-frame values
+        // once visibility toggling stops being parse-time-only.
+        const bool visible = l->node()->IsVisible();
+        // g_RenderVar1: (radius, spot_inner, spot_outer, intensity).
+        // v1 only emits Point/LPoint; spot inner/outer stay at 0.
+        std::array<float, 4> r1 { l->radius(), 0.0f, 0.0f, visible ? l->intensity() : 0.0f };
+        // g_RenderVar2: (world_origin.xyz, density).
+        std::array<float, 4> r2 { (float)world(0, 3),
+                                  (float)world(1, 3),
+                                  (float)world(2, 3),
+                                  visible ? l->volumetric().density : 0.0f };
+        // g_RenderVar3: (forward.xyz, point_proj_info).
+        // Point/LPoint have no orientation; pack (0, 0, 1, 0) for shader-side
+        // determinism.
+        std::array<float, 4> r3 { 0.0f, 0.0f, 1.0f, 0.0f };
+        // g_RenderVar4: (color * intensity, volumetricsexponent).
+        const auto&          ci = l->colorIntensity();
+        std::array<float, 4> r4 { visible ? ci[0] : 0.0f,
+                                  visible ? ci[1] : 0.0f,
+                                  visible ? ci[2] : 0.0f,
+                                  l->volumetric().exponent };
+
+        op(l.get(), candidate_idx, 0, r0);
+        op(l.get(), candidate_idx, 1, r1);
+        op(l.get(), candidate_idx, 2, r2);
+        op(l.get(), candidate_idx, 3, r3);
+        op(l.get(), candidate_idx, 4, r4);
+        ++candidate_idx;
+    }
+}

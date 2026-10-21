@@ -1,3 +1,27 @@
-[submodule "src/backend_scene"]
-	path = src/backend_scene
-	url = https://github.com/CaptSilver/wallpaper-scene-renderer.git
+[submodule "src/backend_scene/third_party/SPIRV-Reflect"]
+	path = src/backend_scene/third_party/SPIRV-Reflect
+	url = https://github.com/KhronosGroup/SPIRV-Reflect.git
+	shallow = true
+[submodule "src/backend_scene/third_party/nlohmann"]
+	path = src/backend_scene/third_party/nlohmann
+	url = https://github.com/nlohmann/json.git
+	shallow = true
+[submodule "src/backend_scene/third_party/miniaudio"]
+	path = src/backend_scene/third_party/miniaudio
+	url = https://github.com/mackron/miniaudio.git
+	shallow = true
+[submodule "src/backend_scene/third_party/glslang"]
+	path = src/backend_scene/third_party/glslang
+	url = https://github.com/KhronosGroup/glslang.git
+	shallow = true
+[submodule "src/backend_scene/third_party/Eigen"]
+	path = src/backend_scene/third_party/Eigen
+	url = https://gitlab.com/libeigen/eigen.git
+	shallow = true
+[submodule "src/backend_scene/third_party/kissfft"]
+	path = src/backend_scene/third_party/kissfft
+	url = https://github.com/mborgerding/kissfft.git
+[submodule "src/backend_scene/third_party/rapidcheck"]
+	path = src/backend_scene/third_party/rapidcheck
+	url = https://github.com/emil-e/rapidcheck.git
+	shallow = true

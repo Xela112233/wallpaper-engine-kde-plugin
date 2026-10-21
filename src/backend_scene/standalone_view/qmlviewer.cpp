@@ -1,0 +1,532 @@
+#include "SceneBackend.hpp"
+#include <QtGlobal>
+#include <QGuiApplication>
+#include <QtQml>
+#include <QtQuick/QQuickView>
+#include <QTimer>
+#include <QMetaObject>
+#include <QDateTime>
+#include <iostream>
+#include <string>
+#include <cstdio>
+#include <csignal>
+#include <atomic>
+#include <filesystem>
+#include <cstdlib>
+#include <sys/statfs.h>
+#include <linux/magic.h>
+#include "arg.hpp"
+#include "Vulkan/SwapchainPolicy.hpp"
+
+// Returns true iff `p` is on a RAM-backed filesystem (tmpfs / ramfs).  Pass
+// dumps default to /tmp on many systems, which IS tmpfs on Bazzite — 128 HDR
+// RTs × 29 MB each is 3.7 GB of staging *plus* the PPM output, all competing
+// for the same RAM pool.  Warning the user here lets them redirect to a
+// disk-backed dir before we OOM.
+static bool path_is_ramfs(const std::string& p) {
+    struct statfs sfs;
+    if (statfs(p.c_str(), &sfs) != 0) return false;
+    // linux/magic.h: TMPFS_MAGIC=0x01021994, RAMFS_MAGIC=0x858458f6
+    return sfs.f_type == TMPFS_MAGIC || sfs.f_type == RAMFS_MAGIC;
+}
+
+// Clean-exit signal handler: sets an atomic flag that a QTimer polls from
+// the Qt event loop.  Calling QMetaObject::invokeMethod from inside a
+// signal handler is not async-signal-safe, so we stay minimal here.
+// Hooked for SIGINT + SIGTERM so `timeout --signal=INT` flushes the profile.
+static std::atomic<bool> g_quit_requested { false };
+static void              qmlviewer_sigint_handler(int) {
+    if (g_quit_requested.exchange(true)) {
+        // Second signal: force-exit in case the event loop is wedged.
+        std::_Exit(130);
+    }
+}
+
+int main(int argc, char** argv) {
+    argparse::ArgumentParser program("sceneviewer-script");
+    setAndParseArg(program, argc, argv);
+
+#if (QT_VERSION < QT_VERSION_CHECK(6, 0, 0))
+    QCoreApplication::setAttribute(Qt::AA_DisableHighDpiScaling);
+#endif
+    QGuiApplication app(argc, argv);
+
+    std::signal(SIGINT, qmlviewer_sigint_handler);
+    std::signal(SIGTERM, qmlviewer_sigint_handler);
+
+    // Poll the signal-flag every 100ms.  On a first flag flip we call quit();
+    // wallpapers with very busy render threads (e.g. 3body) can otherwise
+    // delay processing of a queued-connection quit past the timeout's grace.
+    auto* quit_poll = new QTimer(&app);
+    QObject::connect(quit_poll, &QTimer::timeout, [&app]() {
+        if (g_quit_requested.load()) app.quit();
+    });
+    quit_poll->start(100);
+
+    qmlRegisterType<scenebackend::SceneObject>("scenetest", 1, 0, "SceneViewer");
+    QQuickView view;
+    {
+        auto [w_width, w_height] = program.get<Resolution>(OPT_RESOLUTION);
+        view.setWidth(w_width);
+        view.setHeight(w_height);
+        view.setResizeMode(QQuickView::SizeRootObjectToView);
+        view.setSource(QUrl("qrc:///pkg/main.qml"));
+    }
+
+    QObject*                   obj = view.rootObject();
+    scenebackend::SceneObject* sv  = obj->findChild<scenebackend::SceneObject*>();
+    if (program.get<bool>(OPT_VALID_LAYER)) sv->enableVulkanValid();
+    if (program.get<bool>(OPT_GRAPHVIZ)) sv->enableGenGraphviz();
+    if (program.get<bool>(OPT_DETERMINISTIC)) sv->enableDeterministic();
+    sv->setProperty("assets", QUrl::fromLocalFile(program.get<std::string>(ARG_ASSETS).c_str()));
+    {
+        // Set BEFORE source so the first scene load sees the override.  The
+        // bloom pipeline is selected at parse time; setting after source would
+        // require a scene reload.
+        const std::string pp = program.get<std::string>(OPT_POSTPROCESSING);
+        if (! pp.empty()) {
+            sv->setProperty("postprocessingOverride", QString::fromStdString(pp));
+        }
+    }
+    // --hide-pattern must be set BEFORE source so it's applied at scene-parse time
+    {
+        std::string hide_pattern = program.get<std::string>("--hide-pattern");
+        if (! hide_pattern.empty()) {
+            std::cout << "--hide-pattern: " << hide_pattern << std::endl;
+            QMetaObject::invokeMethod(
+                sv, "setHidePattern", Q_ARG(QString, QString::fromStdString(hide_pattern)));
+        }
+    }
+    // --cache-path must be set BEFORE source so the shader-cache VFS mount
+    // point is already correct when the first scene loads.
+    {
+        std::string cache_path = program.get<std::string>(OPT_CACHE_PATH);
+        if (! cache_path.empty()) {
+            std::cout << "cache path override: " << cache_path << std::endl;
+            sv->setCachePath(cache_path);
+        }
+    }
+    sv->setProperty("source", QUrl::fromLocalFile(program.get<std::string>(ARG_SCENE).c_str()));
+    // Match the GLFW viewer's clamp: SceneWallpaper drops an fps < 5 message
+    // outright, so an unclamped value silently leaves the timer at main.qml's
+    // default instead of reporting anything.
+    {
+        auto fps_val = program.get<int32_t>(OPT_FPS);
+        if (fps_val < 5) fps_val = 60;
+        sv->setProperty("fps", fps_val);
+    }
+    // 0 leaves the screen-detected rate in place; a non-zero value overrides it.
+    {
+        const auto mhz = program.get<int32_t>(OPT_REFRESH_MHZ);
+        if (mhz != 0) {
+            std::cout << "refresh override: " << mhz << " mHz" << std::endl;
+            sv->setProperty("outputRefreshMillihertz", mhz);
+        }
+    }
+    // The QML viewer renders offscreen and Qt presents, so this is recorded
+    // but cannot reach a swapchain — only sceneviewer (GLFW) applies it.
+    {
+        const auto pm = program.get<int32_t>(OPT_PRESENT_MODE);
+        if (! wallpaper::vulkan::IsValidPresentModePolicy(pm)) {
+            std::cerr << "--present-mode must be 0..4, got " << pm << std::endl;
+            return 1;
+        }
+        sv->setProperty("presentMode", pm);
+    }
+    sv->setProperty("hdrOutput", program.get<bool>(OPT_HDR));
+    // Pin the Vulkan render target to the exact -R physical pixel size.
+    // Set before the first updatePaintNode (show() below triggers it) so
+    // initVulkan picks these up instead of the racy item-size × dpr path.
+    {
+        auto [rw, rh] = program.get<Resolution>(OPT_RESOLUTION);
+        sv->setProperty("renderPixelWidth", (int)rw);
+        sv->setProperty("renderPixelHeight", (int)rh);
+    }
+
+    // --user-props + --set key=value overrides, applied before scripts start.
+    std::string user_props = BuildUserPropsJson(program);
+    if (! user_props.empty()) {
+        std::cout << "user props: " << user_props << std::endl;
+        sv->setProperty("userProperties", QString::fromStdString(user_props));
+    }
+
+    // --set-runtime key=value (repeatable): change a user property AFTER
+    // load, through the exact SceneObject::userProperties path Scene.qml
+    // binds for the live plugin (backend/Scene.qml:105) -- lets a CLI run
+    // exercise applyUserPropsRuntime's instant-toggle path instead of
+    // reinstalling the plugin and clicking the settings panel.
+    {
+        std::vector<std::string> runtime_sets =
+            program.get<std::vector<std::string>>(OPT_SET_RUNTIME);
+        if (! runtime_sets.empty()) {
+            std::string json    = BuildRuntimeUserPropsJson(runtime_sets);
+            const int   delay_ms = DelayMs(program.get<double>(OPT_SET_RUNTIME_DELAY), 2.0);
+            QTimer::singleShot(delay_ms, sv, [sv, json]() {
+                std::cout << "set-runtime: " << json << std::endl;
+                sv->setProperty("userProperties", QString::fromStdString(json));
+            });
+        }
+    }
+
+    // --set-runtime-at SEC:key=value (repeatable): the same runtime path, each
+    // change at its own time.  With --shot-after-set DIR the frames right after
+    // each change are captured by exact frame index; the burst is armed BEFORE
+    // the property is set so the change cannot slip past the first armed frame.
+    {
+        const std::string shot_dir = program.get<std::string>(OPT_SHOT_AFTER_SET);
+        if (! shot_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(shot_dir, ec);
+            if (ec) {
+                std::cerr << "cannot create --shot-after-set directory " << shot_dir << ": "
+                          << ec.message() << std::endl;
+                return 1;
+            }
+        }
+        for (const auto& spec : program.get<std::vector<std::string>>(OPT_SET_RUNTIME_AT)) {
+            auto parsed = ParseRuntimeSetAt(spec);
+            if (! parsed) {
+                std::cerr << "skipping malformed --set-runtime-at (expected SEC:key=value): "
+                          << spec << std::endl;
+                continue;
+            }
+            const std::string json = BuildRuntimeUserPropsJson({ parsed->set });
+            const std::string set  = parsed->set;
+            QTimer::singleShot(DelayMs(parsed->delay_s, 0.0), sv, [sv, json, set, shot_dir]() {
+                if (! shot_dir.empty()) {
+                    qint64 base = 0;
+                    QMetaObject::invokeMethod(
+                        sv, "frameIndex", Qt::DirectConnection, Q_RETURN_ARG(qint64, base));
+                    // frameIndex() counts completed frames: 0 before the first one, -1
+                    // when there is no scene object yet.
+                    if (base <= 0)
+                        std::cerr << "set-runtime-at: " << set
+                                  << " came before the first frame; the captures are still "
+                                     "taken but may not bracket the change"
+                                  << std::endl;
+                    for (uint64_t f : CaptureBurstFrames((uint64_t)std::max<qint64>(0, base))) {
+                        QMetaObject::invokeMethod(
+                            sv,
+                            "requestScreenshotAtFrame",
+                            Q_ARG(QString,
+                                  QString::fromStdString(ShotAfterSetPath(shot_dir, set, f))),
+                            Q_ARG(qint64, (qint64)f));
+                    }
+                }
+                std::cout << "set-runtime-at: " << json << std::endl;
+                sv->setProperty("userProperties", QString::fromStdString(json));
+            });
+        }
+    }
+
+    sv->setAcceptMouse(true);
+    sv->setAcceptHover(true);
+
+    // --dump-passes-dir: schedule a one-shot per-pass RT dump N seconds
+    // after startup.  Used to pinpoint where text / colour corruption
+    // first enters the effect chain on wallpapers like 2866203962.
+    //
+    // Default path when the flag is absent but --dump-passes-delay was set:
+    // $HOME/.cache/wekde/pass-dump.  Disk-backed on typical distros (avoids
+    // tmpfs RAM competition with the VMA staging pool).  We erase the dir
+    // contents before arming so consecutive runs don't pile up stale PPMs.
+    {
+        std::string dump_dir = program.get<std::string>(OPT_DUMP_PASSES_DIR);
+
+        // Infer whether the user asked for a dump even without naming a dir —
+        // i.e., they passed a non-default --dump-passes-delay.  argparse has
+        // no is_used() here, so we treat a non-default delay as intent.
+        const double delay_raw = program.get<double>(OPT_DUMP_PASSES_DELAY);
+        const bool   delay_set = delay_raw != 2.0; // 2.0 is the argparse default
+
+        if (dump_dir.empty() && delay_set) {
+            const char* home = std::getenv("HOME");
+            if (home && home[0]) {
+                dump_dir = std::string(home) + "/.cache/wekde/pass-dump";
+                std::cout << "dump-passes: no --dump-passes-dir set, using default " << dump_dir
+                          << std::endl;
+            }
+        }
+
+        if (! dump_dir.empty()) {
+            std::error_code ec;
+            // Create parent directory.  If the dir exists, erase stale files
+            // first so /tmp doesn't keep growing across consecutive invocations.
+            std::filesystem::create_directories(dump_dir, ec);
+            if (std::filesystem::exists(dump_dir)) {
+                size_t erased = 0;
+                for (auto& ent : std::filesystem::directory_iterator(dump_dir, ec)) {
+                    if (ent.is_regular_file()) {
+                        std::filesystem::remove(ent.path(), ec);
+                        if (! ec) erased++;
+                    }
+                }
+                if (erased > 0) {
+                    std::cout << "dump-passes: erased " << erased << " stale file(s) from "
+                              << dump_dir << std::endl;
+                }
+            }
+
+            // tmpfs warning — pass dumping can be several GB of RAM between
+            // staging buffers and PPM output, which will OOM on tmpfs.
+            if (path_is_ramfs(dump_dir)) {
+                std::cerr << "dump-passes: WARNING " << dump_dir
+                          << " is on a RAM-backed filesystem (tmpfs/ramfs). "
+                          << "Several GB of PPMs will compete with VMA staging for RAM; "
+                          << "redirect to a disk-backed path if the dump OOMs." << std::endl;
+            }
+
+            QTimer::singleShot(DelayMs(delay_raw, 2.0), sv, [sv, dump_dir]() {
+                std::cout << "dump-passes: requesting dump to " << dump_dir << std::endl;
+                QMetaObject::invokeMethod(
+                    sv, "requestPassDump", Q_ARG(QString, QString::fromStdString(dump_dir)));
+            });
+        }
+    }
+
+    // --js-eval "src"   inject arbitrary JS into the SceneScript engine
+    // once after --js-eval-delay seconds.  Useful to force state machine
+    // transitions that are normally gated on user input (e.g. 3body's
+    // `shared.rst=1` would need a cursor click on the warning button).
+    {
+        std::string js_src = program.get<std::string>("--js-eval");
+        if (! js_src.empty()) {
+            const int delay_ms = DelayMs(program.get<double>("--js-eval-delay"), 2.0);
+            QTimer::singleShot(delay_ms, sv, [sv, js_src]() {
+                QString rv;
+                QMetaObject::invokeMethod(sv,
+                                          "debugEvalJs",
+                                          Qt::DirectConnection,
+                                          Q_RETURN_ARG(QString, rv),
+                                          Q_ARG(QString, QString::fromStdString(js_src)));
+                std::cout << "js-eval: " << js_src << " -> " << rv.toStdString() << std::endl;
+            });
+        }
+    }
+
+    // --media-thumbnail a.png,none,b.png   drive the "Now Playing" texture and
+    // mediaThumbnailChanged scripts without a real MPRIS player, one entry
+    // per --media-interval. Colours are left zero; only the art matters here.
+    {
+        const QString list = QString::fromStdString(program.get<std::string>("--media-thumbnail"));
+        if (! list.isEmpty()) {
+            const QStringList entries  = list.split(',', Qt::SkipEmptyParts);
+            const double      delay_s  = program.get<double>("--media-delay");
+            const double      interval = program.get<double>("--media-interval");
+            if (! MediaScheduleOk(delay_s, interval, (std::size_t)entries.size())) {
+                std::cerr << "--media-delay " << delay_s << " and --media-interval " << interval
+                          << " must put every entry between 0 and 86400 seconds" << std::endl;
+                return 1;
+            }
+            for (qsizetype i = 0; i < entries.size(); i++) {
+                const QString entry = entries[i].trimmed();
+                const int     at_ms = DelayMs(delay_s + interval * (double)i, 2.0);
+                QTimer::singleShot(at_ms, sv, [sv, entry]() {
+                    QImage image;
+                    if (entry != QLatin1String("none")) {
+                        image = QImage(entry);
+                        if (image.isNull()) {
+                            std::cerr << "media-thumbnail: cannot load " << entry.toStdString()
+                                      << std::endl;
+                            return;
+                        }
+                    }
+                    const bool has = ! image.isNull();
+                    std::cout << "media-thumbnail: " << entry.toStdString()
+                              << " hasThumbnail=" << has << std::endl;
+                    QMetaObject::invokeMethod(sv,
+                                              "mediaThumbnailChanged",
+                                              Q_ARG(bool, has),
+                                              Q_ARG(QVariantList, QVariantList()),
+                                              Q_ARG(QImage, image));
+                });
+            }
+        }
+    }
+
+    // --media-properties "title|artist|album"   one track-info event, so text
+    // layers bound to the media title/artist/album have something to draw.
+    {
+        const QString props =
+            QString::fromStdString(program.get<std::string>("--media-properties"));
+        if (! props.isEmpty()) {
+            const QStringList parts   = props.split('|');
+            const double      delay_s = program.get<double>("--media-delay");
+            QTimer::singleShot(DelayMs(delay_s, 2.0), sv, [sv, parts, props]() {
+                std::cout << "media-properties: " << props.toStdString() << std::endl;
+                auto at = [&parts](qsizetype i) {
+                    return i < parts.size() ? parts[i] : QString();
+                };
+                QMetaObject::invokeMethod(sv,
+                                          "mediaPropertiesChanged",
+                                          Q_ARG(QString, at(0)),
+                                          Q_ARG(QString, at(1)),
+                                          Q_ARG(QString, at(2)),
+                                          Q_ARG(QString, QString()),
+                                          Q_ARG(QString, QString()),
+                                          Q_ARG(double, 0.0));
+            });
+        }
+    }
+
+    // --cursor X,Y   repeat cursor hover at that widget-space position each
+    //                second (keeps hover-driven UI visible for screenshots).
+    // --click  X,Y   fire a single click event 1s after startup.
+    // --screenshot PATH  same PPM dump as the GLFW viewer, for parity.
+    {
+        auto cursor_spec = program.present<std::string>("--cursor");
+        if (cursor_spec) {
+            double cx = 0, cy = 0;
+            if (std::sscanf(cursor_spec->c_str(), "%lf,%lf", &cx, &cy) == 2) {
+                auto* hover_timer = new QTimer(&app);
+                QObject::connect(hover_timer, &QTimer::timeout, [sv, cx, cy]() {
+                    QMetaObject::invokeMethod(
+                        sv, "simulateHoverAt", Q_ARG(double, cx), Q_ARG(double, cy));
+                });
+                hover_timer->start(500);
+            }
+        }
+        const int click_delay_ms = DelayMs(program.get<double>("--click-delay"), 1.5);
+        auto      click_spec     = program.present<std::string>("--click");
+        if (click_spec) {
+            double cx = 0, cy = 0;
+            if (std::sscanf(click_spec->c_str(), "%lf,%lf", &cx, &cy) == 2) {
+                QTimer::singleShot(click_delay_ms, sv, [sv, cx, cy]() {
+                    QMetaObject::invokeMethod(
+                        sv, "simulateClickAt", Q_ARG(double, cx), Q_ARG(double, cy));
+                });
+            }
+        }
+        auto drag_spec = program.present<std::string>("--drag");
+        if (drag_spec) {
+            double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            if (std::sscanf(drag_spec->c_str(), "%lf,%lf:%lf,%lf", &x1, &y1, &x2, &y2) == 4) {
+                QTimer::singleShot(click_delay_ms, sv, [sv, x1, y1, x2, y2]() {
+                    QMetaObject::invokeMethod(sv,
+                                              "simulateDragAt",
+                                              Q_ARG(double, x1),
+                                              Q_ARG(double, y1),
+                                              Q_ARG(double, x2),
+                                              Q_ARG(double, y2));
+                });
+            } else {
+                std::cerr << "--drag: expected 'x1,y1:x2,y2', got: " << *drag_spec << std::endl;
+            }
+        }
+        std::string screenshot_path = program.get<std::string>(OPT_SCREENSHOT);
+        double      interval_s      = program.get<double>(OPT_SCREENSHOT_INTERVAL);
+        double      max_time_s      = program.get<double>(OPT_SCREENSHOT_MAX_TIME);
+
+        if (! screenshot_path.empty() && interval_s > 0.0) {
+            // Interval (time-lapse) mode.  Fire a screenshot every
+            // interval_s seconds; each one writes to `<base>_<ms>.ppm`
+            // where <ms> is wall-clock elapsed since start (zero-padded
+            // 6 digits so `ls` sorts chronologically).  Exit when
+            // max_time_s has elapsed.  Default max_time to 10 intervals
+            // if unset so a user typing just --screenshot-interval gets
+            // a bounded run.
+            if (max_time_s <= 0.0) max_time_s = interval_s * 10.0;
+
+            // Find a sensible base name: strip any trailing .ppm so the
+            // suffixed filenames still end with .ppm.
+            std::string base = screenshot_path;
+            std::string ext  = ".ppm";
+            if (base.size() > 4 && base.compare(base.size() - 4, 4, ".ppm") == 0) {
+                base = base.substr(0, base.size() - 4);
+            }
+
+            auto* start      = new qint64 { 0 };
+            auto* shot_timer = new QTimer(&app);
+            shot_timer->setSingleShot(false);
+            QObject::connect(
+                shot_timer,
+                &QTimer::timeout,
+                [sv, base, ext, max_time_s, start, shot_timer, &app]() {
+                    qint64 now = QDateTime::currentMSecsSinceEpoch();
+                    if (*start == 0) *start = now;
+                    double elapsed_ms = (double)(now - *start);
+                    char   name_buf[32];
+                    std::snprintf(name_buf, sizeof(name_buf), "_%06d", (int)elapsed_ms);
+                    std::string path = base + name_buf + ext;
+                    std::cout << "interval screenshot @ " << (elapsed_ms / 1000.0) << "s -> "
+                              << path << std::endl;
+                    QMetaObject::invokeMethod(
+                        sv, "requestScreenshot", Q_ARG(QString, QString::fromStdString(path)));
+                    if (elapsed_ms / 1000.0 >= max_time_s) {
+                        shot_timer->stop();
+                        // give the last capture time to flush before quitting
+                        QTimer::singleShot(500, &app, [&app]() {
+                            app.quit();
+                        });
+                    }
+                });
+            shot_timer->start(DelayMs(interval_s, 1.0));
+
+            // Small initial delay so the scene has some frames under its belt.
+            QTimer::singleShot(300, sv, [shot_timer]() {
+                // fire the first capture immediately, then keep cadence
+                QMetaObject::invokeMethod(shot_timer, "timeout");
+            });
+        } else if (! screenshot_path.empty()) {
+            // Polls screenshotDone() every 20ms and force-quits after 30s
+            // regardless — shared by both capture modes below.  Bumped to
+            // 30s so heavy scenes (~80 effects, ~200 shaders — SAO,
+            // Cyberpunk Lucy, NieR 2B) have time to finish parsing before
+            // main unwinds. Otherwise the parser thread is still mid-Parse
+            // when atexit handlers fire and tear down glslang's static
+            // keyword unordered_set, producing a teardown UAF in
+            // tokenizeIdentifier.  See glslang-thread-safety.md.
+            auto arm_poll = [sv, &app]() {
+                auto* poll = new QTimer(&app);
+                QObject::connect(poll, &QTimer::timeout, [sv, poll, &app]() {
+                    bool done = false;
+                    QMetaObject::invokeMethod(
+                        sv, "screenshotDone", Qt::DirectConnection, Q_RETURN_ARG(bool, done));
+                    if (done) {
+                        poll->stop();
+                        app.quit();
+                    }
+                });
+                poll->start(20);
+                QTimer::singleShot(30000, &app, [&app]() {
+                    app.quit();
+                });
+            };
+
+            int32_t at_frame = program.get<int32_t>(OPT_SCREENSHOT_AT_FRAME);
+            if (at_frame > 0) {
+                // Frame-exact capture: arm it now, no wall-clock sleep — the
+                // render thread's own monotonic frame counter fires the
+                // readback when it reaches at_frame, so a slow cold run and
+                // a fast warm run capture the same scene-frame regardless of
+                // shader-compile time.  Mirrors glfwviewer.cpp.
+                std::cout << "screenshot: arming frame-exact capture at frame " << at_frame
+                          << " to " << screenshot_path << std::endl;
+                QMetaObject::invokeMethod(sv,
+                                          "requestScreenshotAtFrame",
+                                          Q_ARG(QString, QString::fromStdString(screenshot_path)),
+                                          Q_ARG(qint64, (qint64)at_frame));
+                arm_poll();
+            } else {
+                int32_t frames_to_wait = program.get<int32_t>(OPT_SCREENSHOT_FRAMES);
+                int32_t fps_val        = program.get<int32_t>(OPT_FPS);
+                if (fps_val < 5) fps_val = 60;
+                if (frames_to_wait < 1) frames_to_wait = 30;
+                int delay_ms = DelayMs((double)frames_to_wait / fps_val + 0.3, 1.3);
+                std::cout << "screenshot: will request in " << delay_ms << "ms to "
+                          << screenshot_path << std::endl;
+                QTimer::singleShot(delay_ms, sv, [sv, screenshot_path, arm_poll]() {
+                    std::cout << "screenshot: firing requestScreenshot now" << std::endl;
+                    QMetaObject::invokeMethod(
+                        sv,
+                        "requestScreenshot",
+                        Q_ARG(QString, QString::fromStdString(screenshot_path)));
+                    arm_poll();
+                });
+            }
+        }
+    }
+
+    view.show();
+    return QGuiApplication::exec();
+}

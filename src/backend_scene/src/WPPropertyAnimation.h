@@ -1,0 +1,217 @@
+#pragma once
+#include <algorithm>
+#include <cmath>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "Core/Literals.hpp"
+
+namespace wallpaper
+{
+
+// Named keyframe track targeting a scalar node property (currently "alpha").
+// Parsed from WE scene.json layer properties that embed:
+//   "<prop>": { "animation": { "c0":[{frame,value,…}], "options":{…} }, "value": <init> }
+// Exposed to SceneScript via thisScene.getLayer(name).getAnimation(animName).
+struct PropertyAnimKeyframe {
+    float frame { 0.0f };
+    float value { 0.0f };
+    // Bezier handle data is present in WE's keyframes (`front`, `back`) but we
+    // only implement linear interpolation today.  Faithful matching of WE's
+    // tangent-based easing is a future refinement.
+};
+
+enum class PropertyAnimMode
+{
+    Loop,   // restart from frame 0
+    Mirror, // bounce 0→length→0→length…
+    Single  // play once, then hold last frame
+};
+
+inline PropertyAnimMode ParsePropertyAnimMode(std::string_view s) {
+    if (s == "mirror") return PropertyAnimMode::Mirror;
+    if (s == "single") return PropertyAnimMode::Single;
+    return PropertyAnimMode::Loop;
+}
+
+struct PropertyAnimation {
+    std::string name;     // animation name (from options.name) — script lookup key
+    std::string property; // target property — scalars ("alpha"), vec3 components
+                          // ("origin.x", "origin.y", "origin.z", "scale.*",
+                          // "angles.*") for multi-channel WE tracks that store
+                          // c0/c1/c2 keyframe arrays on the same animation.
+
+    PropertyAnimMode mode { PropertyAnimMode::Loop };
+    float            fps { 30.0f };
+    float            length { 0.0f }; // in frames
+    bool             startPaused { false };
+
+    // For vec3 component anims: when true the keyframe values are *deltas*
+    // applied on top of `initialValue` (the JSON `value` field for that
+    // component).  When false the keyframe values replace the component
+    // outright.  Maps WE's per-vec3-animation `relative` flag; the Rella
+    // whale (3363252053 id=173) authors a relative origin animation that
+    // drifts the school of fish around its base origin.
+    bool relative { false };
+
+    // WE's animation.options.wraploop flag.  When true (and mode=Loop), the
+    // segment from the LAST authored keyframe back to length-frames is
+    // interpolated linearly from kf.back().value to kf.front().value, so the
+    // cycle closes smoothly instead of holding the last value and snapping
+    // back at the period boundary.  Rella whale (3363252053) authors c1 with
+    // keys at 0/60 over length=120 plus wraploop:true — without this the
+    // whale dives down (frame 0→60) then *holds* the down position for
+    // another 2s and snaps up — visibly jumpy.
+    bool wraploop { false };
+
+    std::vector<PropertyAnimKeyframe> keyframes;
+
+    // Fallback value when no keyframes or playback hasn't started.  For
+    // vec3-component anims this holds the corresponding axis of the JSON
+    // `value` string so `relative` mode can add deltas onto the base.
+    float initialValue { 1.0f };
+
+    // Runtime state (mutated on the render thread only).
+    bool   playing { false };
+    double time { 0.0 };
+};
+
+// Evaluate the animation curve at a given playback time (seconds).
+// Pure function — safe to exercise from tests.
+//
+// Implementation notes (mutation hardening):
+// - `std::lower_bound` for keyframe lookup eliminates the linear-scan
+//   boundary mutants (`i + 1 < kf.size()` equivalents) that survive because
+//   the front/back guards trap exactly the frames that would otherwise hit
+//   the loop's boundary indices.
+// - Mirror mode uses strict `<` (not `<=`) on the period midpoint so the
+//   `u == period` case has a single canonical path (returns u==period
+//   regardless, but the comparison is observable to == vs < mutators).
+inline float EvaluatePropertyAnimation(const PropertyAnimation& anim, double time) {
+    const auto& kf = anim.keyframes;
+    if (kf.empty()) return anim.initialValue;
+    if (kf.size() == 1) return kf[0].value;
+
+    if (anim.fps <= 0.0f) return kf[0].value;
+    const double period = (double)anim.length / (double)anim.fps;
+    if (period <= 0.0) return kf[0].value;
+
+    double t = time;
+    switch (anim.mode) {
+    case PropertyAnimMode::Loop: {
+        t = std::fmod(time, period);
+        if (t < 0.0) t += period;
+        break;
+    }
+    case PropertyAnimMode::Mirror: {
+        const double T = period * 2.0;
+        double u = std::fmod(time, T);
+        if (u < 0.0) u += T;
+        t = (u < period) ? u : (T - u);
+        break;
+    }
+    case PropertyAnimMode::Single: t = std::clamp(time, 0.0, period); break;
+    }
+
+    const float frame = (float)(t * (double)anim.fps);
+    if (frame <= kf.front().frame) return kf.front().value;
+    // Wraploop (Loop mode only): instead of holding the last keyframe value
+    // until the cycle restarts (which produces a visible snap), interpolate
+    // from kf.back() back to kf.front() across the segment
+    // [kf.back().frame, length].  Mirror/Single ignore wraploop — Mirror
+    // already closes its cycle, Single intentionally holds at the end.
+    if (anim.wraploop && anim.mode == PropertyAnimMode::Loop && anim.length > kf.back().frame &&
+        frame >= kf.back().frame) {
+        const float span = anim.length - kf.back().frame;
+        if (span <= 0.0f) return kf.back().value;
+        const float frac = std::min(1.0f, (frame - kf.back().frame) / span);
+        return kf.back().value + frac * (kf.front().value - kf.back().value);
+    }
+    if (frame >= kf.back().frame) return kf.back().value;
+
+    auto it = std::lower_bound(kf.begin(), kf.end(), frame,
+                               [](const PropertyAnimKeyframe& k, float f) { return k.frame < f; });
+    auto prev = it - 1;
+    const float span = it->frame - prev->frame;
+    if (span <= 0.0f) return prev->value;
+    const float frac = (frame - prev->frame) / span;
+    return prev->value + frac * (it->value - prev->value);
+}
+
+// Place an evaluated curve value against the property's static value.
+// `relative` tracks author their keyframes as deltas around that base;
+// absolute ones overwrite it.  Alpha and vec3 components both come through
+// here so the rule has one home.
+inline float ComposePropertyAnimation(const PropertyAnimation& anim, double time) {
+    // A curve-less animation already evaluates to the base — adding it again
+    // would double a relative track.
+    if (anim.keyframes.empty()) return anim.initialValue;
+    const float value = EvaluatePropertyAnimation(anim, time);
+    return anim.relative ? anim.initialValue + value : value;
+}
+
+// A keyframed effect shader constant ("alpha", "scale", a tint colour): its
+// current value, which starts at the authored base, and one curve per animated
+// channel (WE's c0..c3). Channels without a curve keep their base.
+struct ConstantAnimation {
+    std::vector<float>                               value;
+    std::vector<std::pair<usize, PropertyAnimation>> tracks;
+};
+
+// Advances every playing track by `dt` seconds and writes each channel's
+// composed value. Returns true when any channel moved, so the caller uploads
+// the uniform only then -- a finished single-shot fade holds still and stops
+// invalidating the passes that read it.
+inline bool TickConstantAnimation(ConstantAnimation& anim, double dt) {
+    bool changed = false;
+    for (auto& [channel, track] : anim.tracks) {
+        if (channel >= anim.value.size()) continue;
+        if (track.playing) track.time += dt;
+        const float v = ComposePropertyAnimation(track, track.time);
+        if (v != anim.value[channel]) {
+            anim.value[channel] = v;
+            changed             = true;
+        }
+    }
+    return changed;
+}
+
+// The axis (0/1/2 = x/y/z) and base property name ("origin"/"scale"/"angles")
+// a vec3-component animation targets, parsed from WE's flat "<base>.<axis>"
+// property naming (e.g. "origin.x").  Separated from the SceneNode lookup and
+// mutation that follow it so the string parsing has its own test.
+struct Vec3AnimTarget {
+    int              axis;
+    std::string_view base;
+};
+
+inline std::optional<Vec3AnimTarget> ParseVec3AnimProperty(std::string_view property) {
+    if (property.size() < 3) return std::nullopt;
+    int axis = -1;
+    if (property.ends_with(".x"))
+        axis = 0;
+    else if (property.ends_with(".y"))
+        axis = 1;
+    else if (property.ends_with(".z"))
+        axis = 2;
+    if (axis < 0) return std::nullopt;
+    return Vec3AnimTarget { axis, property.substr(0, property.size() - 2) };
+}
+
+// "play"/"pause"/"stop" mutate playback state; every other command is a
+// deliberate no-op (see the call site for why that's safe today).
+inline void ApplyPropertyAnimCommand(PropertyAnimation& anim, std::string_view cmd) {
+    if (cmd == "play") {
+        anim.playing = true;
+    } else if (cmd == "pause") {
+        anim.playing = false;
+    } else if (cmd == "stop") {
+        anim.playing = false;
+        anim.time    = 0.0;
+    }
+}
+
+} // namespace wallpaper

@@ -1,0 +1,674 @@
+#include <doctest.h>
+
+#include "Particle/ParticleEmitter.h"
+#include "Particle/ParticleModify.h"
+#include "Particle/Particle.h"
+#include "Core/Random.hpp"
+
+#include <vector>
+
+using namespace wallpaper;
+
+// All tests use emitSpeed values that yield an exactly-representable emitDur
+// (1/2 = 0.5, 1/4 = 0.25, …) so the `if (emitDur > timer) return 0` early-out
+// in GetEmitNum doesn't fire on rounding.
+
+namespace
+{
+
+auto MarkInit(float color_r) {
+    return [color_r](Particle& p, double /*duration*/) {
+        p.color.x() = color_r;
+    };
+}
+
+ParticleBoxEmitterArgs MakeBox() {
+    ParticleBoxEmitterArgs a;
+    a.directions    = { 1.0f, 1.0f, 1.0f };
+    a.minDistance   = { 0.0f, 0.0f, 0.0f };
+    a.maxDistance   = { 0.0f, 0.0f, 0.0f }; // collapse position randomness
+    a.emitSpeed     = 2.0f;                 // emitDur = 0.5
+    a.orgin         = { 0.0f, 0.0f, 0.0f };
+    a.one_per_frame = false;
+    a.sort          = false;
+    a.instantaneous = 0u;
+    a.minSpeed      = 0.0f;
+    a.maxSpeed      = 0.0f;
+    a.batchSize     = 1u;
+    a.burstRate     = 0.0f;
+    return a;
+}
+
+ParticleSphereEmitterArgs MakeSphere() {
+    ParticleSphereEmitterArgs a;
+    a.directions    = { 1.0f, 1.0f, 1.0f };
+    a.minDistance   = 0.0f;
+    a.maxDistance   = 0.0f;
+    a.emitSpeed     = 2.0f;
+    a.orgin         = { 0.0f, 0.0f, 0.0f };
+    a.sign          = { 0, 0, 0 };
+    a.one_per_frame = false;
+    a.sort          = false;
+    a.instantaneous = 0u;
+    a.minSpeed      = 0.0f;
+    a.maxSpeed      = 0.0f;
+    a.batchSize     = 1u;
+    a.burstRate     = 0.0f;
+    return a;
+}
+
+} // namespace
+
+// ============================================================================
+// ParticleBoxEmitter — continuous mode
+// ============================================================================
+
+TEST_SUITE("ParticleBoxEmitter") {
+    TEST_CASE("continuous mode — single emission per emitDur") {
+        auto args = MakeBox();
+        auto op   = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis { MarkInit(0.5f) };
+
+        op(ps, inis, /*maxcount*/ 100u, /*timepass*/ 0.5);
+        CHECK(ps.size() == 1u);
+        CHECK(ps[0].color.x() == doctest::Approx(0.5f));
+    }
+
+    TEST_CASE("continuous mode — sub-emitDur tick produces nothing") {
+        auto args = MakeBox();
+        auto op   = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.25); // < emitDur
+        CHECK(ps.size() == 0u);
+    }
+
+    TEST_CASE("continuous mode — accumulates timer across calls") {
+        auto args = MakeBox();
+        auto op   = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.25);
+        op(ps, inis, 100u, 0.25); // total 0.5 → 1 emit
+        CHECK(ps.size() == 1u);
+    }
+
+    TEST_CASE("continuous mode — large timepass emits multiple") {
+        auto args = MakeBox();
+        auto op   = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 2.5); // 5 emitDurs worth
+        CHECK(ps.size() == 5u);
+    }
+
+    TEST_CASE("continuous mode — capped at maxcount") {
+        auto args      = MakeBox();
+        args.emitSpeed = 100.0f; // emitDur = 0.01 (exact-ish; many emits)
+        auto op        = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, /*maxcount*/ 3u, /*timepass*/ 1.0);
+        CHECK(ps.size() == 3u);
+    }
+
+    TEST_CASE("instantaneous mode — first call on empty spawns N") {
+        auto args          = MakeBox();
+        args.emitSpeed     = 1.0f;
+        args.instantaneous = 7u;
+        auto op            = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, /*maxcount*/ 100u, /*timepass*/ 0.0);
+        CHECK(ps.size() == 7u);
+    }
+
+    TEST_CASE("instantaneous mode — does not retrigger when ps non-empty") {
+        auto args          = MakeBox();
+        args.emitSpeed     = 1.0f;
+        args.instantaneous = 5u;
+        auto op            = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle> ps;
+        ps.emplace_back();
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, /*maxcount*/ 100u, /*timepass*/ 0.0);
+        // emit_num falls back to GetEmitNum which is 0 for timepass=0.
+        CHECK(ps.size() == 1u);
+    }
+
+    TEST_CASE("one_per_frame — clamps emit_num to 1") {
+        auto args          = MakeBox();
+        args.emitSpeed     = 100.0f;
+        args.one_per_frame = true;
+        auto op            = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 1.0); // would be 100 without clamp
+        CHECK(ps.size() == 1u);
+    }
+
+    TEST_CASE("batchSize > 1 in continuous mode — also clamps to 1") {
+        auto args      = MakeBox();
+        args.emitSpeed = 100.0f;
+        args.batchSize = 5u;
+        auto op        = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 1.0);
+        CHECK(ps.size() == 1u);
+    }
+
+    TEST_CASE("burst mode — starts exhausted, first call before burstRate emits 0") {
+        auto args      = MakeBox();
+        args.emitSpeed = 100.0f;
+        args.batchSize = 3u;
+        args.burstRate = 1.0f;
+        auto op        = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.001);
+        CHECK(ps.size() == 0u);
+    }
+
+    TEST_CASE("burst mode — after burst window resets and emits up to batchSize") {
+        auto args      = MakeBox();
+        args.emitSpeed = 4.0f; // emitDur = 0.25
+        args.batchSize = 3u;
+        args.burstRate = 10.0f; // long burst window so we drive a single one
+        auto op        = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+
+        // Drive past initial exhausted phase — initial burstTimer is in
+        // [0, burstRate], so a single tick of `burstRate` guarantees the
+        // wrap branch fires.
+        op(ps, inis, 100u, args.burstRate);
+
+        // After the wrap, ticks of emitDur=0.25 fire at most one particle per
+        // call (one_per_frame clamp inside burst mode).  Drive enough ticks
+        // to fill the batch.
+        for (int i = 0; i < 50 && ps.size() < args.batchSize; ++i) {
+            op(ps, inis, 100u, 0.25);
+        }
+        CHECK(ps.size() == args.batchSize);
+    }
+
+    TEST_CASE("burst mode — remaining-batch cap blocks further emits within burst") {
+        auto args      = MakeBox();
+        args.emitSpeed = 100.0f; // would emit many per frame without cap
+        args.batchSize = 2u;
+        args.burstRate = 100.0f; // ample window so no second wrap
+        auto op        = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, args.burstRate); // wrap into a fresh burst
+        // Within this single burst, ticks must never exceed batchSize.
+        for (int i = 0; i < 30; ++i) op(ps, inis, 100u, 0.01);
+        CHECK(ps.size() == args.batchSize);
+    }
+
+    TEST_CASE("burst mode construction must not consume Random (thread-affinity bug)") {
+        // WEK_DETERMINISTIC seeds Random on the render thread; this factory runs on the
+        // scene-parse thread — drawing burstTimer's initial phase at construction would
+        // silently ignore that seed.
+        auto args      = MakeBox();
+        args.burstRate = 5.0f;
+
+        Random::seed(1234);
+        double baseline = Random::get(0.0, 1.0);
+
+        Random::seed(1234);
+        auto op = ParticleBoxEmitterArgs::MakeEmittOp(args);
+        (void)op;
+        double afterConstruction = Random::get(0.0, 1.0);
+
+        CHECK(afterConstruction == baseline);
+
+        // The phase must still be drawn, just later — deferring it must not become
+        // dropping it.  The burst window has not elapsed and the batch starts exhausted,
+        // so the closure emits nothing and the phase is the only thing that can move the
+        // engine on this first call.
+        Random::seed(1234);
+        auto                        phased = ParticleBoxEmitterArgs::MakeEmittOp(args);
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        phased(ps, inis, 100u, 0.0);
+        REQUIRE(ps.empty());
+        CHECK(Random::get(0.0, 1.0) != baseline);
+    }
+
+    TEST_CASE("sort=true — dead particle slots get reused before pushing new") {
+        auto args = MakeBox();
+        args.sort = true;
+        auto op   = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle> ps;
+        ps.resize(2);
+        ps[0].lifetime = -1.0f; // dead
+        ps[0].mark_new = false;
+        ps[1].lifetime = 0.5f;
+        ps[1].mark_new = false;
+        std::vector<ParticleInitOp> inis;
+
+        op(ps, inis, 100u, 0.5);
+        REQUIRE(ps.size() == 2u); // no push, just slot reuse
+        bool any_new = false;
+        for (const auto& p : ps) {
+            if (ParticleModify::IsNew(p)) any_new = true;
+        }
+        CHECK(any_new);
+    }
+
+    TEST_CASE("sort=true — pushes new particle when no dead slots") {
+        auto args = MakeBox();
+        args.sort = true;
+        auto op   = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle> ps;
+        ps.resize(1);
+        ps[0].lifetime = 1.0f;
+        ps[0].mark_new = false;
+        std::vector<ParticleInitOp> inis;
+
+        op(ps, inis, 100u, 0.5);
+        CHECK(ps.size() == 2u);
+    }
+
+    TEST_CASE("origin offset is applied to spawned position") {
+        auto args  = MakeBox();
+        args.orgin = { 5.0f, -3.0f, 2.0f };
+        auto op    = ParticleBoxEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.5);
+        REQUIRE(ps.size() == 1u);
+        CHECK(ps[0].position.x() == doctest::Approx(5.0f));
+        CHECK(ps[0].position.y() == doctest::Approx(-3.0f));
+        CHECK(ps[0].position.z() == doctest::Approx(2.0f));
+    }
+}
+
+// ============================================================================
+// ParticleSphereEmitter — sign mask + GenSphere
+// ============================================================================
+
+TEST_SUITE("ParticleSphereEmitter") {
+    TEST_CASE("continuous mode — single emission per emitDur") {
+        auto args = MakeSphere();
+        auto op   = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.5);
+        CHECK(ps.size() == 1u);
+    }
+
+    TEST_CASE("continuous mode — capped at maxcount") {
+        auto args      = MakeSphere();
+        args.emitSpeed = 100.0f;
+        auto op        = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 4u, 1.0);
+        CHECK(ps.size() == 4u);
+    }
+
+    TEST_CASE("instantaneous mode on empty") {
+        auto args          = MakeSphere();
+        args.instantaneous = 6u;
+        auto op            = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.0);
+        CHECK(ps.size() == 6u);
+    }
+
+    TEST_CASE("one_per_frame clamp") {
+        auto args          = MakeSphere();
+        args.emitSpeed     = 100.0f;
+        args.one_per_frame = true;
+        auto op            = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 1.0);
+        CHECK(ps.size() == 1u);
+    }
+
+    TEST_CASE("batchSize > 1 in continuous mode clamps to 1") {
+        auto args      = MakeSphere();
+        args.emitSpeed = 100.0f;
+        args.batchSize = 4u;
+        auto op        = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 1.0);
+        CHECK(ps.size() == 1u);
+    }
+
+    TEST_CASE("burst mode — starts exhausted") {
+        auto args      = MakeSphere();
+        args.emitSpeed = 100.0f;
+        args.batchSize = 2u;
+        args.burstRate = 1.0f;
+        auto op        = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.001);
+        CHECK(ps.size() == 0u);
+    }
+
+    TEST_CASE("burst mode — fires up to batchSize after burst window") {
+        auto args      = MakeSphere();
+        args.emitSpeed = 4.0f;
+        args.batchSize = 3u;
+        args.burstRate = 0.5f;
+        auto op        = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 2.0 * args.burstRate);
+        for (int i = 0; i < 50 && ps.size() < args.batchSize; ++i) {
+            op(ps, inis, 100u, 0.25);
+        }
+        CHECK(ps.size() == args.batchSize);
+    }
+
+    TEST_CASE("burst mode construction must not consume Random (thread-affinity bug)") {
+        auto args      = MakeSphere();
+        args.burstRate = 5.0f;
+
+        Random::seed(1234);
+        double baseline = Random::get(0.0, 1.0);
+
+        Random::seed(1234);
+        auto op = ParticleSphereEmitterArgs::MakeEmittOp(args);
+        (void)op;
+        double afterConstruction = Random::get(0.0, 1.0);
+
+        CHECK(afterConstruction == baseline);
+
+        // As with the box emitter: deferring the phase draw must not become dropping it.
+        Random::seed(1234);
+        auto                        phased = ParticleSphereEmitterArgs::MakeEmittOp(args);
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        phased(ps, inis, 100u, 0.0);
+        REQUIRE(ps.empty());
+        CHECK(Random::get(0.0, 1.0) != baseline);
+    }
+
+    TEST_CASE("ApplySign — non-zero sign forces axis sign") {
+        auto args        = MakeSphere();
+        args.minDistance = 1.0f;
+        args.maxDistance = 1.0f;
+        args.sign        = { 1, -1, 0 };
+        args.directions  = { 1.0f, 1.0f, 1.0f };
+        args.orgin       = { 0.0f, 0.0f, 0.0f };
+        auto op          = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        // One large tick — exact emit count is irrelevant; we only check the
+        // sign property of every spawned particle.
+        op(ps, inis, 100u, 5.0);
+        REQUIRE(ps.size() >= 1u);
+        for (const auto& p : ps) {
+            CHECK(p.position.x() >= 0.0f); // sign[0] = +1
+            CHECK(p.position.y() <= 0.0f); // sign[1] = -1
+        }
+    }
+
+    TEST_CASE("origin offset is applied to spawned position") {
+        auto args  = MakeSphere();
+        args.orgin = { 4.0f, 5.0f, 6.0f };
+        auto op    = ParticleSphereEmitterArgs::MakeEmittOp(args);
+
+        std::vector<Particle>       ps;
+        std::vector<ParticleInitOp> inis;
+        op(ps, inis, 100u, 0.5);
+        REQUIRE(ps.size() == 1u);
+        CHECK(ps[0].position.x() == doctest::Approx(4.0f));
+        CHECK(ps[0].position.y() == doctest::Approx(5.0f));
+        CHECK(ps[0].position.z() == doctest::Approx(6.0f));
+    }
+}
+
+// ============================================================================
+// Hostile emit rates
+//
+// A scene.pkg is untrusted input: "rate" comes straight out of workshop JSON,
+// and instanceoverride.count can flip its sign.  A rate <= 0 must degrade to
+// "emits nothing", never wedge the caller.  These run on a watchdog thread
+// because the pre-fix failure is an infinite loop inside GetEmitNum, which
+// would hang the whole test binary instead of failing this case.
+// ============================================================================
+
+#include <chrono>
+#include <future>
+#include <memory>
+#include <thread>
+#include <utility>
+
+namespace
+{
+constexpr int kEmitHangTimeoutMs = 5000;
+
+struct EmitCall {
+    std::vector<Particle>       ps;
+    std::vector<ParticleInitOp> inis;
+};
+
+// Runs one emit tick under a timeout. Returns {returned_in_time, spawned}.
+// State is heap-owned and captured by value so a detached (spinning) worker
+// cannot dangle into this frame's stack after a timeout.
+std::pair<bool, size_t> emitTick(ParticleEmittOp op, double timepass, u32 maxcount = 100u) {
+    auto                       state = std::make_shared<EmitCall>();
+    std::packaged_task<void()> task([op, state, timepass, maxcount]() mutable {
+        op(state->ps, state->inis, maxcount, timepass);
+    });
+    auto                       fut = task.get_future();
+    std::thread                worker(std::move(task));
+    bool                       done =
+        fut.wait_for(std::chrono::milliseconds(kEmitHangTimeoutMs)) == std::future_status::ready;
+    if (! done) {
+        worker.detach(); // a spinning thread cannot be killed safely
+        return { false, 0u };
+    }
+    fut.get();
+    worker.join();
+    return { true, state->ps.size() };
+}
+} // namespace
+
+TEST_SUITE("ParticleEmitter hostile emit rates") {
+    TEST_CASE("box emitter: negative rate emits nothing instead of spinning forever") {
+        auto args                = MakeBox();
+        args.emitSpeed           = -1.0f; // scene.json "rate": -1
+        auto [returned, spawned] = emitTick(ParticleBoxEmitterArgs::MakeEmittOp(args), 0.5);
+        REQUIRE(returned);
+        CHECK(spawned == 0u);
+    }
+
+    TEST_CASE("sphere emitter: negative rate emits nothing instead of spinning forever") {
+        auto args                = MakeSphere();
+        args.emitSpeed           = -1.0f;
+        auto [returned, spawned] = emitTick(ParticleSphereEmitterArgs::MakeEmittOp(args), 0.5);
+        REQUIRE(returned);
+        CHECK(spawned == 0u);
+    }
+
+    TEST_CASE("box emitter: negative zero rate emits nothing") {
+        auto args                = MakeBox();
+        args.emitSpeed           = -0.0f; // 1/-0.0 is -inf, which is not > timer
+        auto [returned, spawned] = emitTick(ParticleBoxEmitterArgs::MakeEmittOp(args), 0.5);
+        REQUIRE(returned);
+        CHECK(spawned == 0u);
+    }
+
+    TEST_CASE("box emitter: positive rate still emits (control)") {
+        auto args                = MakeBox(); // emitSpeed = 2.0 -> emitDur 0.5
+        auto [returned, spawned] = emitTick(ParticleBoxEmitterArgs::MakeEmittOp(args), 0.5);
+        REQUIRE(returned);
+        CHECK(spawned == 1u);
+    }
+}
+
+TEST_SUITE("EmitScheduler") {
+    TEST_CASE("continuous mode — single emission per emitDur") {
+        EmitScheduleParams p {
+            .emitSpeed = 2.0f, .one_per_frame = false, .batchSize = 1u, .burstRate = 0.0f
+        };
+        EmitScheduler sched(p);
+        CHECK(sched.Next(p, 0.5) == 1u);
+    }
+
+    TEST_CASE("continuous mode — an exact-multiple tick doesn't leave a phantom "
+              "emission for the next call") {
+        EmitScheduleParams p {
+            .emitSpeed = 2.0f, .one_per_frame = false, .batchSize = 1u, .burstRate = 0.0f
+        };
+        EmitScheduler sched(p);
+        // timepass lands exactly on emitDur (0.5) -- the boundary GetEmitNum's
+        // strict '<' leaves undrained.
+        CHECK(sched.Next(p, 0.5) == 1u);
+        // No further time passes.  If the boundary case correctly reset the
+        // internal timer to zero, a second call with zero elapsed time must
+        // emit nothing.
+        CHECK(sched.Next(p, 0.0) == 0u);
+    }
+
+    TEST_CASE("continuous mode with batchSize > 1 clamps to 1 per call") {
+        EmitScheduleParams p {
+            .emitSpeed = 100.0f, .one_per_frame = false, .batchSize = 5u, .burstRate = 0.0f
+        };
+        EmitScheduler sched(p);
+        CHECK(sched.Next(p, 1.0) == 1u);
+    }
+
+    TEST_CASE("burst mode — resets batchEmitted and timer after window, caps to batchSize") {
+        EmitScheduleParams p {
+            .emitSpeed = 4.0f, .one_per_frame = false, .batchSize = 3u, .burstRate = 10.0f
+        };
+        EmitScheduler sched(p);
+
+        u32 total = 0;
+        // Drive past the initial exhausted phase -- initial burstTimer is drawn from
+        // [0, burstRate), so a single tick of `burstRate` always pushes it past
+        // burstRate and guarantees the wrap branch fires exactly once here (this call
+        // may itself already emit -- the wrap and the first batch tick share one call,
+        // same as in the production MakeEmittOp path this mirrors).
+        total += sched.Next(p, p.burstRate);
+
+        // Ticks of emitDur=0.25 fire at most one particle per call inside burst mode.
+        // Stop as soon as the target is hit, mirroring the equivalent MakeEmittOp-level
+        // test (test_ParticleEmitter.cpp:184): an unbounded loop would legitimately
+        // start a second batch once cumulative elapsed time crosses burstRate again,
+        // which is not what this test is pinning.
+        for (int i = 0; i < 50 && total < p.batchSize; ++i) {
+            total += sched.Next(p, 0.25);
+        }
+        CHECK(total == p.batchSize);
+    }
+
+    TEST_CASE("burst mode — a fresh scheduler starts exhausted even with time to spare") {
+        // Construction must leave batchEmitted at batchSize (not 0) whenever
+        // burstRate is positive, or the very first tick would emit before
+        // any burst window has elapsed at all.  A big burstRate keeps this
+        // call from also crossing the wrap boundary, isolating the check to
+        // construction's own starting state.
+        EmitScheduleParams p {
+            .emitSpeed = 1000.0f, .one_per_frame = false, .batchSize = 5u, .burstRate = 1e6f
+        };
+        EmitScheduler sched(p);
+        CHECK(sched.Next(p, 1.0) == 0u);
+    }
+
+    TEST_CASE("burst mode — a tick within the batch cap emits only what it earned, not the "
+              "whole remaining room") {
+        // remaining exists to cap emit_num when it would overrun the batch;
+        // it must not itself become the emitted count on ticks that have
+        // plenty of room left.
+        EmitScheduleParams p {
+            .emitSpeed = 100.0f, .one_per_frame = false, .batchSize = 5u, .burstRate = 1000.0f
+        };
+        EmitScheduler sched(p);
+        // Wrap and take the first emission in the same call: burstTimer
+        // starts below 1000, so += 1000 guarantees the wrap fires regardless
+        // of the random initial phase, landing well past (not needing to hit
+        // exactly) burstRate.
+        CHECK(sched.Next(p, 1000.0) == 1u); // capped to one per frame, four slots still open
+    }
+
+    TEST_CASE("burst mode — landing exactly on burstRate still wraps") {
+        // The wrap gate is burstTimer >= burstRate; the two only disagree at
+        // exact equality, which real per-frame elapsed time never lands on
+        // by chance.  Construct it deliberately: draw the random initial
+        // phase with a known seed (same technique as the Random-consumption
+        // test below), then hand the scheduler exactly (burstRate - phase)
+        // as the next tick's elapsed time so burstTimer lands bit-exact on
+        // burstRate.  The round-trip is checked at runtime, not assumed --
+        // if a future RNG change ever makes it inexact, the REQUIRE below
+        // fails loudly instead of the test silently proving nothing.
+        EmitScheduleParams p {
+            .emitSpeed = 1000.0f, .one_per_frame = false, .batchSize = 3u, .burstRate = 4.0f
+        };
+
+        Random::seed(1);
+        double phase = Random::get(0.0, (double)p.burstRate);
+        double delta = (double)p.burstRate - phase;
+        REQUIRE(phase + delta == (double)p.burstRate);
+
+        Random::seed(1);
+        EmitScheduler sched(p);
+        // First call draws the same phase and adds no time -- still short of
+        // burstRate, batch starts exhausted, nothing emits yet.
+        CHECK(sched.Next(p, 0.0) == 0u);
+        // Second call's elapsed time lands burstTimer exactly on burstRate.
+        // The wrap must fire on this call (batchEmitted resets to 0), so the
+        // now-available batch emits one particle (capped per frame).
+        CHECK(sched.Next(p, delta) == 1u);
+    }
+
+    TEST_CASE("burst mode construction must not consume Random") {
+        EmitScheduleParams p {
+            .emitSpeed = 2.0f, .one_per_frame = false, .batchSize = 1u, .burstRate = 5.0f
+        };
+
+        Random::seed(1234);
+        double baseline = Random::get(0.0, 1.0);
+
+        Random::seed(1234);
+        EmitScheduler sched(p);
+        double        afterConstruction = Random::get(0.0, 1.0);
+        CHECK(afterConstruction == baseline);
+
+        // The phase must still be drawn, just later -- deferring it must not become
+        // dropping it. The burst window hasn't elapsed and the batch starts exhausted,
+        // so Next() emits nothing and the phase draw is the only thing that can move
+        // the engine on this first call.
+        Random::seed(1234);
+        EmitScheduler phased(p);
+        u32           n = phased.Next(p, 0.0);
+        REQUIRE(n == 0u);
+        CHECK(Random::get(0.0, 1.0) != baseline);
+    }
+}

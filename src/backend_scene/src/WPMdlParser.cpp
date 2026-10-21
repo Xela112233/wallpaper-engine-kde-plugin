@@ -1,0 +1,990 @@
+#include "WPMdlParser.hpp"
+#include <nlohmann/json.hpp>
+#include "Fs/VFS.h"
+#include "Fs/IBinaryStream.h"
+#include "Fs/MemBinaryStream.h"
+#include "WPCommon.hpp"
+#include "WPJson.hpp"
+#include "Utils/Logging.h"
+#include "Utils/SceneProfiler.h"
+#include "Scene/SceneMesh.h"
+#include "SpecTexs.hpp"
+#include "wpscene/WPMaterial.h"
+#include "WPShaderParser.hpp"
+
+using namespace wallpaper;
+
+namespace
+{
+
+WPPuppet::PlayMode ToPlayMode(std::string_view m) {
+    if (m == "loop" || m.empty()) return WPPuppet::PlayMode::Loop;
+    if (m == "mirror") return WPPuppet::PlayMode::Mirror;
+    if (m == "single") return WPPuppet::PlayMode::Single;
+
+    LOG_ERROR("unknown puppet animation play mode \"%s\"", m.data());
+    assert(m == "loop");
+    return WPPuppet::PlayMode::Loop;
+}
+
+// An index past the end of the vertex array fetches undefined memory on the
+// GPU.  RADV clamps it, so it shows up as visual corruption rather than a
+// device-lost — i.e. it reads like a rendering bug and costs an afternoon.
+// Drop the offending triangles and say how many, rather than dropping the
+// whole mesh: the rest of the submesh is still good geometry.
+void DropOutOfRangeTriangles(std::vector<std::array<uint32_t, 3>>& indices, uint32_t vertex_num,
+                             uint32_t submesh) {
+    auto out_of_range = [vertex_num](const std::array<uint32_t, 3>& tri) {
+        return tri[0] >= vertex_num || tri[1] >= vertex_num || tri[2] >= vertex_num;
+    };
+    auto first_bad = std::remove_if(indices.begin(), indices.end(), out_of_range);
+    if (first_bad == indices.end()) return;
+
+    const auto dropped = static_cast<std::size_t>(std::distance(first_bad, indices.end()));
+    indices.erase(first_bad, indices.end());
+    LOG_ERROR("mdl: dropped %zu triangle(s) indexing past %u vertices, submesh=%u",
+              dropped,
+              vertex_num,
+              submesh);
+}
+
+// A 16-bit array packs two indices per 32-bit slot — that is what the UINT16
+// bind expects.  A wide array keeps one per slot and says so, so the bind can
+// switch to UINT32.
+SceneIndexArray MakeIndexArray(const std::vector<std::array<uint32_t, 3>>& tris, bool wide) {
+    const std::size_t elems = tris.size() * 3;
+
+    if (wide) {
+        std::vector<uint32_t> flat(elems);
+        for (std::size_t i = 0; i < tris.size(); i++)
+            for (int j = 0; j < 3; j++) flat[i * 3 + j] = tris[i][j];
+        return SceneIndexArray(flat, SceneIndexArray::IndexWidth::U32);
+    }
+
+    std::vector<uint16_t> narrow(elems);
+    for (std::size_t i = 0; i < tris.size(); i++)
+        for (int j = 0; j < 3; j++) narrow[i * 3 + j] = (uint16_t)tris[i][j];
+
+    std::vector<uint32_t> slots(U32SlotsForU16Triangles(tris.size()));
+    memcpy(slots.data(), narrow.data(), U16BytesForTriangles(tris.size()));
+    return SceneIndexArray(slots, SceneIndexArray::IndexWidth::U16);
+}
+} // namespace
+
+// bytes * size
+constexpr uint32_t singile_vertex                      = 4 * (3 + 4 + 4 + 2);
+constexpr uint32_t singile_indices                     = 2 * 3;
+constexpr uint32_t wide_indices_stride                 = 4 * 3;
+constexpr uint32_t std_format_vertex_size_herald_value = 0x01800009;
+
+// number of bytes in an MDAT attachment after the attachment name
+constexpr uint32_t mdat_attachment_data_byte_length = 64;
+
+// alternative consts for alternative mdl format
+constexpr uint32_t alt_singile_vertex                  = 4 * (3 + 4 + 4 + 2 + 7);
+constexpr uint32_t alt_format_vertex_size_herald_value = 0x0180000F;
+
+// Non-puppet model vertex sizes (no blend indices/weights)
+// Flag 9:  position(3) + texcoord(2) = 5 floats = 20 bytes
+constexpr uint32_t model_vertex_flag9 = 4 * (3 + 2);
+// Flag 11: position(3) + normal(3) + texcoord(2) = 8 floats = 32 bytes
+constexpr uint32_t model_vertex_flag11 = 4 * (3 + 3 + 2);
+// Flag 15: position(3) + normal(3) + tangent4(4) + texcoord(2) = 12 floats = 48 bytes
+constexpr uint32_t model_vertex_flag15 = 4 * (3 + 3 + 4 + 2);
+// Flag 39: position(3) + normal(3) + tangent4(4) + texcoord0(2) + texcoord1(2) = 14 floats = 56
+// bytes
+constexpr uint32_t model_vertex_flag39 = 4 * (3 + 3 + 4 + 2 + 2);
+
+constexpr uint32_t singile_bone_frame = 4 * 9;
+
+bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl, bool force_puppet) {
+    WEK_PROFILE_SCOPE("WPMdlParser::Parse");
+    auto str_path = std::string(path);
+    auto pfile    = vfs.Open("/assets/" + str_path);
+    if (! pfile) return false;
+    auto memfile = fs::MemBinaryStream(*pfile);
+    return ParseStream(memfile, path, mdl, force_puppet);
+}
+
+bool WPMdlParser::ParseStream(fs::IBinaryStream& f, std::string_view path, WPMdl& mdl,
+                              bool force_puppet) {
+    mdl.mdlv = ReadMDLVesion(f);
+
+    int32_t mdl_flag = f.ReadInt32();
+
+    // Non-puppet model formats: simple mesh data, no skeleton.
+    // Flag is a bitmask: bit0=position, bit1=normal, bit2=tangent4, bit3=texcoord,
+    // bit5=texcoord1 (lightmap UVs).  v23+ puppets also store flag=9 at byte 9
+    // even though the layout is puppet-shaped — callers that know the file is
+    // a puppet (via `force_puppet=true`) skip this branch.
+    if (! force_puppet &&
+        (mdl_flag == 9 || mdl_flag == 11 || mdl_flag == 15 || mdl_flag == 39)) {
+        f.ReadInt32(); // unk, always 1
+        uint32_t submesh_count = f.ReadUint32();
+
+        if (! CountFitsStream(f, submesh_count)) {
+            LOG_ERROR("mdl: submesh_count %u exceeds stream", submesh_count);
+            return false;
+        }
+        mdl.is_puppet = false;
+        mdl.submeshes.resize(submesh_count);
+
+        // Versions 17+ add per-submesh bounding box and flags before vertex
+        // data (bbox_min(3f) + bbox_max(3f) + flags_repeat(u32) = 28 bytes).
+        // V23+ also has 6 bytes padding after index data.  V16 only has the
+        // flags_repeat uint32 before vertex_size — no bbox.  Reading the
+        // flags_repeat as vertex_size would produce vertex_size=15 which fails
+        // the stride check.
+        // Drivers: Starscape (3047596375, v17), Falling Deeper (3061226599,
+        // v19) — bbox before vertex_size, NO trailing pad.  3body's Hollow
+        // Cylinder.mdl (v16) is flags-only.
+        const bool has_bbox     = (mdl.mdlv >= 17);
+        const bool v23          = (mdl.mdlv >= 23);
+        const bool v_flags_only = (mdl.mdlv == 16);
+
+        for (uint32_t si = 0; si < submesh_count; si++) {
+            auto& sub         = mdl.submeshes[si];
+            sub.mat_json_file = f.ReadStr();
+            // Index width: 0 = uint16, 1 = uint32.  A mesh with more than
+            // 65535 vertices cannot be addressed by a 16-bit index at all, so
+            // wide meshes set this.  Reading a wide block as u16 splits every
+            // index into its low and high half — which stays in bounds and
+            // leaves the stream aligned, so no other check can catch it.
+            const bool wide_flag = (f.ReadInt32() != 0);
+
+            // The byte at +9 is `mdl_flag` (entry-point dispatch flag).
+            // The byte AFTER bbox is `flags_repeat` — the actual vertex
+            // stride flag.  These are usually equal (Starscape v17:
+            // 15/15), but for v23 puppets misclassified as models the
+            // entry flag is 9 while flags_repeat is 15 (Hatsune Miku
+            // 3354366708).  Read flags_repeat and prefer it over the
+            // entry flag when sane.
+            uint32_t effective_flag = (uint32_t)mdl_flag;
+            if (has_bbox) {
+                // Skip bbox_min(3f) + bbox_max(3f) = 24 bytes; read
+                // flags_repeat explicitly so we can switch stride mid-stream.
+                f.SeekCur(24);
+                uint32_t flags_repeat = f.ReadUint32();
+                if (flags_repeat == 9 || flags_repeat == 11 ||
+                    flags_repeat == 15 || flags_repeat == 39)
+                    effective_flag = flags_repeat;
+            } else if (v_flags_only) {
+                // Older format: just skip the 4-byte flags_repeat.
+                f.SeekCur(4);
+            }
+
+            uint32_t vertex_size = f.ReadUint32();
+
+            uint32_t vert_stride;
+            if (effective_flag == 39)
+                vert_stride = model_vertex_flag39;
+            else if (effective_flag == 15)
+                vert_stride = model_vertex_flag15;
+            else if (effective_flag == 11)
+                vert_stride = model_vertex_flag11;
+            else
+                vert_stride = model_vertex_flag9;
+
+            if (vertex_size % vert_stride != 0) {
+                LOG_ERROR("unsupported model vertex size %d for flag=%d submesh=%d",
+                          vertex_size,
+                          mdl_flag,
+                          si);
+                return false;
+            }
+
+            uint32_t vertex_num = vertex_size / vert_stride;
+            if (! CountFitsStream(f, vertex_num)) {
+                LOG_ERROR("mdl: vertex_num %u exceeds stream submesh=%d", vertex_num, si);
+                return false;
+            }
+            sub.vertexs.resize(vertex_num);
+
+            if (effective_flag == 39) {
+                sub.has_normals   = true;
+                sub.has_tangents  = true;
+                sub.has_texcoord1 = true;
+                for (auto& vert : sub.vertexs) {
+                    for (auto& v : vert.position) v = f.ReadFloat();
+                    for (auto& v : vert.normal) v = f.ReadFloat();
+                    for (auto& v : vert.tangent) v = f.ReadFloat();
+                    for (auto& v : vert.texcoord) v = f.ReadFloat();
+                    for (auto& v : vert.texcoord1) v = f.ReadFloat();
+                }
+            } else if (effective_flag == 15) {
+                sub.has_normals  = true;
+                sub.has_tangents = true;
+                for (auto& vert : sub.vertexs) {
+                    for (auto& v : vert.position) v = f.ReadFloat();
+                    for (auto& v : vert.normal) v = f.ReadFloat();
+                    for (auto& v : vert.tangent) v = f.ReadFloat();
+                    for (auto& v : vert.texcoord) v = f.ReadFloat();
+                }
+            } else if (effective_flag == 11) {
+                sub.has_normals = true;
+                for (auto& vert : sub.vertexs) {
+                    for (auto& v : vert.position) v = f.ReadFloat();
+                    for (auto& v : vert.normal) v = f.ReadFloat();
+                    for (auto& v : vert.texcoord) v = f.ReadFloat();
+                }
+            } else {
+                for (auto& vert : sub.vertexs) {
+                    for (auto& v : vert.position) v = f.ReadFloat();
+                    for (auto& v : vert.texcoord) v = f.ReadFloat();
+                }
+            }
+
+            uint32_t indices_size = f.ReadUint32();
+
+            // A zero flag on a mesh too large for 16-bit indices contradicts
+            // itself.  Trust the vertex count, but only when the byte count
+            // actually divides into u32 triangles.
+            bool wide = wide_flag;
+            if (! wide && vertex_num > 0xFFFFu && indices_size % wide_indices_stride == 0)
+                wide = true;
+            sub.wide_indices = wide;
+
+            const uint32_t idx_stride = wide ? wide_indices_stride : singile_indices;
+            if (indices_size % idx_stride != 0) {
+                LOG_ERROR("unsupported model indices size %d submesh=%d", indices_size, si);
+                return false;
+            }
+
+            uint32_t indices_num = indices_size / idx_stride;
+            if (! CountFitsStream(f, indices_num, idx_stride)) {
+                LOG_ERROR("mdl: indices_num %u exceeds stream submesh=%d", indices_num, si);
+                return false;
+            }
+            sub.indices.resize(indices_num);
+            for (auto& id : sub.indices) {
+                for (auto& v : id) v = wide ? f.ReadUint32() : (uint32_t)f.ReadUint16();
+            }
+            DropOutOfRangeTriangles(sub.indices, vertex_num, si);
+
+            if (v23) {
+                // 6 bytes trailing padding per submesh
+                f.SeekCur(6);
+            }
+
+            LOG_INFO("read model: mdlv: %d, flag: %d, submesh: %d/%d, verts: %d, tris: %d, "
+                     "normals: %d, tangents: %d, mat: %s",
+                     mdl.mdlv,
+                     mdl_flag,
+                     si,
+                     submesh_count,
+                     vertex_num,
+                     indices_num,
+                     (int)sub.has_normals,
+                     (int)sub.has_tangents,
+                     sub.mat_json_file.c_str());
+        }
+        return true;
+    }
+
+    // Puppet format (flag=11, 15+herald, etc.)
+    mdl.is_puppet = true;
+    f.ReadInt32(); // unk, 1
+    f.ReadInt32(); // unk, 1
+
+    mdl.mat_json_file = f.ReadStr();
+    // 0
+    f.ReadInt32();
+
+    // Puppet pre-vertex-size skip:
+    //   v16 :  0 bytes (no bbox).  Chill Time (2925278995).
+    //   v17+:  24 bytes (bbox only).  Totoro (2891663007, v19), Hatsune Miku
+    //          test fixture v23.
+    // NOTE: Real-world v23 puppets with flag=9 (e.g. Hatsune Miku 3354366708)
+    // are actually model-shaped and never enter this branch — they are caught
+    // by the non-puppet `(flag in {9,11,15,39})` dispatch above.
+    if (mdl.mdlv >= 17) {
+        f.SeekCur(24);
+    }
+
+    bool     alt_mdl_format = false;
+    uint32_t curr           = f.ReadUint32();
+
+    // if the uint at the normal vertex size position is 0, then this file
+    // uses the alternative MDL format, therefore the actual vertex size is
+    // located after the herald value, and we'll need to account for other differences later on.
+    if (curr == 0) {
+        alt_mdl_format = true;
+        while (curr != alt_format_vertex_size_herald_value) {
+            if (f.Tell() >= f.Size()) {
+                LOG_ERROR("mdl: EOF scanning for alt-format herald in '%s'", path.data());
+                return false;
+            }
+            curr = f.ReadUint32();
+        }
+        curr = f.ReadUint32();
+    } else if (curr == std_format_vertex_size_herald_value) {
+        curr = f.ReadUint32();
+    } else if (curr == alt_format_vertex_size_herald_value) {
+        alt_mdl_format = true;
+        curr           = f.ReadUint32();
+    }
+
+    uint32_t vertex_size = curr;
+    if (vertex_size % (alt_mdl_format ? alt_singile_vertex : singile_vertex) != 0) {
+        LOG_ERROR("unsupport mdl vertex size %d", vertex_size);
+        return false;
+    }
+
+    // if using the alternative MDL format, vertexes contain 7 extra 32-bit chunks between
+    // position and blend indices
+    uint32_t vertex_num = vertex_size / (alt_mdl_format ? alt_singile_vertex : singile_vertex);
+    if (! CountFitsStream(f, vertex_num)) {
+        LOG_ERROR("mdl: puppet vertex_num %u exceeds stream", vertex_num);
+        return false;
+    }
+    mdl.vertexs.resize(vertex_num);
+    for (auto& vert : mdl.vertexs) {
+        for (auto& v : vert.position) v = f.ReadFloat();
+        if (alt_mdl_format) {
+            // 7 extra u32 = 28 bytes between position and blend_indices
+            f.SeekCur(28);
+        }
+        for (auto& v : vert.blend_indices) v = f.ReadUint32();
+        for (auto& v : vert.weight) v = f.ReadFloat();
+        for (auto& v : vert.texcoord) v = f.ReadFloat();
+    }
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+    // Log mesh bounds + texcoord bounds to verify MDL vertex & UV ranges.
+    // Pure diagnostic — the min/max/LOG_INFO calls have no effect on parse
+    // output so mutation instruments would produce unkillable survivors.
+    if (vertex_num > 0) {
+        float minX = 1e30f, maxX = -1e30f, minY = 1e30f, maxY = -1e30f;
+        float minU = 1e30f, maxU = -1e30f, minV = 1e30f, maxV = -1e30f;
+        for (const auto& vert : mdl.vertexs) {
+            minX = std::min(minX, vert.position[0]);
+            maxX = std::max(maxX, vert.position[0]);
+            minY = std::min(minY, vert.position[1]);
+            maxY = std::max(maxY, vert.position[1]);
+            minU = std::min(minU, vert.texcoord[0]);
+            maxU = std::max(maxU, vert.texcoord[0]);
+            minV = std::min(minV, vert.texcoord[1]);
+            maxV = std::max(maxV, vert.texcoord[1]);
+        }
+        LOG_INFO("  mdl '%.*s' vert bounds: X=[%.1f, %.1f] (w=%.1f) Y=[%.1f, %.1f] (h=%.1f) "
+                 "UV=[%.3f-%.3f, %.3f-%.3f] n=%u",
+                 (int)path.size(),
+                 path.data(),
+                 minX,
+                 maxX,
+                 maxX - minX,
+                 minY,
+                 maxY,
+                 maxY - minY,
+                 minU,
+                 maxU,
+                 minV,
+                 maxV,
+                 (unsigned)vertex_num);
+    }
+#endif
+
+    uint32_t indices_size = f.ReadUint32();
+    if (indices_size % singile_indices != 0) {
+        LOG_ERROR("unsupport mdl indices size %d", indices_size);
+        return false;
+    }
+
+    uint32_t indices_num = indices_size / singile_indices;
+    if (! CountFitsStream(f, indices_num)) {
+        LOG_ERROR("mdl: puppet indices_num %u exceeds stream", indices_num);
+        return false;
+    }
+    mdl.indices.resize(indices_num);
+    for (auto& id : mdl.indices) {
+        for (auto& v : id) v = f.ReadUint16();
+    }
+
+    // Newer MDL formats (MDLV >= 23 / PKGV0022+) insert extra sections between
+    // the mesh data and the skeleton.  Scan forward byte-by-byte for the "MDLS"
+    // tag rather than assuming it immediately follows the index data.
+    {
+        char ring[4] = { 0, 0, 0, 0 };
+        char c;
+        while (f.Read(&c, 1) == 1) {
+            ring[0] = ring[1];
+            ring[1] = ring[2];
+            ring[2] = ring[3];
+            ring[3] = c;
+            if (ring[0] == 'M' && ring[1] == 'D' && ring[2] == 'L' && ring[3] == 'S') {
+                // Read the remaining 5 bytes of the 9-byte version tag (4 digits + NUL).
+                char ver_tail[6] = {};
+                f.Read(ver_tail, 5);
+                int v = 0;
+                std::from_chars(ver_tail, ver_tail + 4, v);
+                mdl.mdls = v;
+                break;
+            }
+        }
+    }
+
+    size_t bones_file_end = f.ReadUint32();
+    (void)bones_file_end;
+
+    uint16_t bones_num = f.ReadUint16();
+    // 1 byte
+    f.ReadUint16(); // unk
+
+    mdl.puppet  = std::make_shared<WPPuppet>();
+    auto& bones = mdl.puppet->bones;
+    auto& anims = mdl.puppet->anims;
+
+    if (! CountFitsStream(f, bones_num)) {
+        LOG_ERROR("mdl: bones_num %u exceeds stream", (unsigned)bones_num);
+        return false;
+    }
+    bones.resize(bones_num);
+    LOG_INFO("  mdl '%.*s': reading %u bones", (int)path.size(), path.data(), (unsigned)bones_num);
+    for (uint i = 0; i < bones_num; i++) {
+        auto&       bone = bones[i];
+        std::string name = f.ReadStr();
+        f.ReadInt32(); // unk
+
+        bone.parent = f.ReadUint32();
+        if (bone.parent >= i && ! bone.noParent()) {
+            LOG_ERROR("mdl wrong bone parent index %d, treating as root bone", bone.parent);
+            bone.parent = 0xFFFFFFFFu;
+        }
+
+        uint32_t size = f.ReadUint32();
+        if (size != 64) {
+            LOG_ERROR("mdl unsupport bones size: %d", size);
+            return false;
+        }
+        for (auto row : bone.transform.matrix().colwise()) {
+            for (auto& x : row) x = f.ReadFloat();
+        }
+
+        std::string bone_simulation_json = f.ReadStr();
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+        {
+            auto trans = bone.transform.translation();
+            LOG_INFO("    bone[%u] '%s' parent=%d trans=(%.1f, %.1f, %.1f)",
+                     i,
+                     name.c_str(),
+                     (int)bone.parent,
+                     trans[0],
+                     trans[1],
+                     trans[2]);
+        }
+#endif
+    }
+
+    if (mdl.mdls > 1) {
+        int16_t unk = f.ReadInt16();
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+        if (unk != 0) {
+            LOG_INFO("puppet: one unk is not 0, may be wrong");
+        }
+#else
+        (void)unk;
+#endif
+
+        // Per-bone rest pose: a second local transform for every bone, in the
+        // same layout as the bind matrix above.  The bind pose says where a
+        // bone sits in the space the vertices are stored in; the rest pose
+        // says where the assembled character wants it, and animation frames
+        // are authored relative to it.  For a puppet warped in place the two
+        // coincide.  For a puppet whose pieces are packed into an atlas
+        // (Rei Ayanami, 3061226599) they differ by hundreds of pixels per
+        // piece, and skinning from the bind pose alone leaves every piece
+        // where the atlas stored it.
+        uint8_t has_trans = f.ReadUint8();
+        if (has_trans) {
+            for (auto& bone : bones) {
+                Eigen::Affine3f rest;
+                for (auto row : rest.matrix().colwise()) {
+                    for (auto& x : row) x = f.ReadFloat();
+                }
+                bone.rest_transform = rest;
+            }
+        }
+        // The remaining mdls>1 tables are derived data the renderer does not
+        // need, so they are skipped.  Explicit SeekCur calls make the stride
+        // visible and avoid iteration-counter mutants with no observable
+        // effect (misalignment surfaces only through the downstream
+        // MDAT/MDLA assertions in tests).
+        uint32_t size_unk = f.ReadUint32();
+        f.SeekCur((isize)size_unk * 12); // size_unk × 3 u32
+
+        f.ReadUint32(); // unk
+
+        // Per bone: an oriented bounding box of the vertices the bone owns,
+        // in the bone's bind-local space — 3 half-extents (x, y, and y again
+        // in the z slot) followed by the box frame as a 4x4 (rotation and
+        // centre).  Bones that own no vertices carry 0.5 everywhere.
+        // Recomputable from the mesh; nothing here reads it.
+        uint8_t has_offset_trans = f.ReadUint8();
+        if (has_offset_trans) {
+            f.SeekCur((isize)bones_num * 76); // 19 floats
+        }
+
+        // Per bone: one u32 forming a permutation of the bone indices.  It
+        // does not order the triangles, the hierarchy, or the animation
+        // tracks (those are in file order), so it is most likely the
+        // editor's own bone order kept for round-tripping.
+        uint8_t has_index = f.ReadUint8();
+        if (has_index) {
+            f.SeekCur((isize)bones_num * 4);
+        }
+
+        // MDLS v4 adds a second per-bone u32 table (purpose unknown — values
+        // are signed multiples of 100 in the wild; SAO's 1-bone puppet has 0).
+        // Missing this read leaves the cursor 1 + bones_num*4 bytes before
+        // the MDAT/MDLA tag.  In most v4 puppets the trailing ReadStr() scan
+        // walks past the gap one NUL-terminated chunk at a time and still
+        // lands on the tag; in 3363252053's body puppet the last u32 ends
+        // in 0xFF (no NUL before 'MDAT'), so ReadStr swallows the tag inside
+        // a longer string and the loop misses both MDAT and MDLA — the
+        // entire skeleton then renders as static with no attachments, so
+        // the head decouples from the body bone.
+        if (mdl.mdls >= 4) {
+            uint8_t has_bone_table = f.ReadUint8();
+            if (has_bone_table) {
+                f.SeekCur((isize)bones_num * 4);
+            }
+        }
+    }
+
+    // sometimes there can be one or more zero bytes and/or MDAT sections containing
+    // attachments before the MDLA section, so we need to skip them
+    std::string mdType = "";
+    std::string mdVersion;
+
+    bool reached_eof_without_mdla = false;
+    do {
+        if (f.Tell() >= f.Size()) {
+            // No animation section — valid for static deform puppets (hair
+            // strands, body parts that only receive bone skinning).
+            reached_eof_without_mdla = true;
+            break;
+        }
+        auto        pos_before = f.Tell();
+        std::string mdPrefix   = f.ReadStr();
+
+        // sometimes there can be other garbage in this gap, so we need to
+        // skip over that as well
+        if (mdPrefix.length() == 8) {
+            mdType    = mdPrefix.substr(0, 4);
+            mdVersion = mdPrefix.substr(4, 4);
+
+            if (mdType == "MDAT") {
+                f.ReadUint32(); // skip 4 bytes
+                uint32_t num_attachments =
+                    f.ReadUint16(); // number of attachments in the MDAT section
+
+                for (int i = 0; i < num_attachments; i++) {
+                    // u16 before the name is the bone-index the attachment
+                    // is rigged to.  Used at render time so children of this
+                    // puppet attached via this slot inherit the bone's world
+                    // transform in addition to the attachment matrix.
+                    WPPuppet::Attachment att;
+                    att.bone_index = f.ReadUint16();
+                    att.name       = f.ReadStr();
+                    // 64 bytes = 4x4 float matrix (column-major) describing
+                    // the attachment point's transform in puppet local space.
+                    // Children that rig to this attachment (via scene.json's
+                    // "attachment" field) land at this transform.
+                    for (auto row : att.transform.matrix().colwise()) {
+                        for (auto& x : row) x = f.ReadFloat();
+                    }
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+                    {
+                        auto m = att.transform.matrix();
+                        LOG_INFO("    MDAT attach '%s' bone_idx=%u trans=(%.2f, %.2f, %.2f) "
+                                 "row0=[%.3f %.3f %.3f %.3f] row1=[%.3f %.3f %.3f %.3f]",
+                                 att.name.c_str(),
+                                 att.bone_index,
+                                 att.transform.translation().x(),
+                                 att.transform.translation().y(),
+                                 att.transform.translation().z(),
+                                 m(0, 0),
+                                 m(0, 1),
+                                 m(0, 2),
+                                 m(0, 3),
+                                 m(1, 0),
+                                 m(1, 1),
+                                 m(1, 2),
+                                 m(1, 3));
+                    }
+#endif
+                    mdl.puppet->attachments.push_back(std::move(att));
+                }
+            }
+        }
+
+        // Bail if the stream didn't advance — a zero-length read at EOF would loop forever.
+        if (f.Tell() == pos_before) {
+            LOG_ERROR("mdl: stalled scanning for MDLA section in '%s'", path.data());
+            return false;
+        }
+    } while (mdType != "MDLA");
+
+    if (reached_eof_without_mdla) {
+        LOG_INFO("mdl: no animation section in '%s' (static skinned puppet)", path.data());
+    } else if (mdType == "MDLA" && mdVersion.length() > 0) {
+        // std::stoi throws on non-numeric input; the MDLA tag's 4-digit
+        // suffix can be arbitrary bytes from a hostile stream, so use the
+        // non-throwing from_chars (matches ReadVersion's pattern in WPCommon.hpp).
+        int  mdla_v = 0;
+        auto [ptr, ec] =
+            std::from_chars(mdVersion.data(), mdVersion.data() + mdVersion.size(), mdla_v);
+        if (ec != std::errc()) {
+            LOG_ERROR("mdl: invalid MDLA version '%s'", mdVersion.c_str());
+            return false;
+        }
+        mdl.mdla = mdla_v;
+        if (mdl.mdla != 0) {
+            uint end_size = f.ReadUint32();
+            (void)end_size;
+
+            uint anim_num = f.ReadUint32();
+            if (! CountFitsStream(f, anim_num)) {
+                LOG_ERROR("mdl: anim_num %u exceeds stream", anim_num);
+                return false;
+            }
+            anims.resize(anim_num);
+            for (size_t ai = 0; ai < anims.size(); ai++) {
+                auto& anim = anims[ai];
+                // Skip zero padding bytes between animations.  Older formats
+                // used 4-byte-aligned padding, but newer MDLA versions (v6+)
+                // can have an odd number of padding bytes.  Scan byte-by-byte
+                // to find the first non-zero byte, then seek back and read
+                // the full 32-bit animation ID.
+                {
+                    uint8_t b = 0;
+                    while (b == 0) {
+                        if (f.Tell() >= f.Size()) {
+                            LOG_ERROR("mdl: EOF scanning animation padding in '%s'", path.data());
+                            return false;
+                        }
+                        b = f.ReadUint8();
+                    }
+                    f.SeekCur(-1);
+                    anim.id = f.ReadInt32();
+                }
+
+                if (anim.id <= 0) {
+                    LOG_ERROR("wrong anime id %d", anim.id);
+                    return false;
+                }
+                f.ReadInt32();
+                anim.name = f.ReadStr();
+                if (anim.name.empty()) {
+                    anim.name = f.ReadStr();
+                }
+                anim.mode   = ToPlayMode(f.ReadStr());
+                anim.fps    = f.ReadFloat();
+                anim.length = f.ReadInt32();
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+                LOG_INFO("  anim[%d]: id=%d name='%s' length=%d",
+                         (int)ai,
+                         anim.id,
+                         anim.name.c_str(),
+                         anim.length);
+#endif
+                // fps divides into every derived playback time and length is
+                // the modulus for frame selection, so neither survives a
+                // non-positive or NaN value.  Reaching one means the MDLA
+                // trailer misparsed — same recovery as the b_num overrun
+                // below: keep the static puppet, drop the animations.
+                if (! (anim.fps > 0.0) || anim.length <= 0) {
+                    LOG_INFO("mdl: anim %d has unusable timing (fps=%f length=%d) — keeping "
+                             "%zu parsed animation(s), finalizing bind pose",
+                             anim.id,
+                             anim.fps,
+                             anim.length,
+                             ai);
+                    anims.resize(ai);
+                    break;
+                }
+                f.ReadInt32();
+
+                uint32_t b_num = f.ReadUint32();
+                if (! CountFitsStream(f, b_num)) {
+                    // Downgraded from LOG_ERROR: a b_num overrun in MDLA
+                    // animation parsing usually means the upstream bone /
+                    // attachment / MDAT layout has a version-specific
+                    // variant we don't model exactly.  The puppet's static
+                    // mesh + bones still loaded successfully; we just lose
+                    // the animation track.  Drivers: Totoro (2891663007),
+                    // Chill Time (2925278995), Persona 5 (2955378002).
+                    //
+                    // Drop this unparsable animation (and any trailing ones we
+                    // never reached), then break so control falls through to
+                    // mdl.puppet->prepared() below.  Returning here instead
+                    // would skip prepared(), leaving m_final_affines empty so
+                    // genFrame() returns an empty span, g_Bones is never
+                    // uploaded, and the skinned mesh collapses to the origin —
+                    // which rendered the entire Totoro body invisible.
+                    LOG_INFO("mdl: b_num %u exceeds stream — keeping %zu parsed "
+                             "animation(s), finalizing bind pose",
+                             b_num,
+                             ai);
+                    anims.resize(ai);
+                    break;
+                }
+                anim.bframes_array.resize(b_num);
+                for (auto& bframes : anim.bframes_array) {
+                    f.ReadInt32();
+                    uint32_t byte_size = f.ReadUint32();
+                    uint32_t num       = byte_size / singile_bone_frame;
+                    if (byte_size % singile_bone_frame != 0) {
+                        LOG_ERROR("wrong bone frame size %d", byte_size);
+                        return false;
+                    }
+                    if (! CountFitsStream(f, num)) {
+                        LOG_ERROR("mdl: bone frame num %u exceeds stream", num);
+                        return false;
+                    }
+                    bframes.frames.resize(num);
+                    for (auto& frame : bframes.frames) {
+                        for (auto& v : frame.position) v = f.ReadFloat();
+                        for (auto& v : frame.angle) v = f.ReadFloat();
+                        for (auto& v : frame.scale) v = f.ReadFloat();
+                    }
+                }
+
+                // Report a track that stores a different number of frames than
+                // the animation declares — the renderer clamps into what is
+                // stored, so this shows up as a stiff limb rather than an
+                // error.  Do NOT drop the animation over it: some MDLA variants
+                // store length as a last-frame index, and rejecting them is
+                // what made the Totoro puppet (2891663007) invisible.
+                for (usize bi = 0; bi < anim.bframes_array.size(); bi++) {
+                    const auto& fr = anim.bframes_array[bi].frames;
+                    if (fr.size() != (usize)anim.length) {
+                        LOG_INFO("mdl: anim %d declares %d frame(s) but bone track %zu stores "
+                                 "%zu — playback clamps into the stored frames",
+                                 anim.id,
+                                 anim.length,
+                                 bi,
+                                 fr.size());
+                        break;
+                    }
+                }
+
+                // in the alternative MDL format there are 2 empty bytes followed
+                // by a variable number of 32-bit 0s between animations. We'll read
+                // the two bytes now so that the cursor is aligned to read through the
+                // 32-bit 0s in the next iteration
+                if (alt_mdl_format) {
+                    f.ReadUint8();
+                    f.ReadUint8();
+                } else if (mdl.mdla == 3) {
+                    // In MDLA version 3 there is an extra 8-bit zero between animations.
+                    // This will cause the parser to be misaligned moving forward if we don't handle
+                    // it here.
+                    f.ReadUint8();
+                } else {
+                    // The trailer after each animation's bone frames is a list of
+                    // keyframe event records.  Each record is:
+                    //   float  — animation timestamp of the event (redundant w/ frame)
+                    //   string — small JSON blob: {"frame":N,"name":"eventName",...}
+                    // SceneScripts react to these via animationEvent(event,value).
+                    uint32_t event_count = f.ReadUint32();
+                    // Each record is at least a float plus a string terminator.
+                    // A count that cannot fit in what is left of the stream
+                    // means the trailer misparsed; iterating it anyway spins
+                    // the scene-load thread through billions of no-op reads
+                    // past EOF with nothing in the log, and nothing polls the
+                    // abort flag in here to stop it.
+                    if (! CountFitsStream(f, event_count, 5)) {
+                        // Unlike the b_num bail-out above, this animation's
+                        // bone frames are already fully parsed — keep it and
+                        // drop only the unreadable event list (plus any
+                        // trailing animations we never reached).
+                        LOG_INFO("mdl: anim %d event_count %u exceeds stream — dropping its "
+                                 "keyframe events",
+                                 anim.id,
+                                 event_count);
+                        anims.resize(ai + 1);
+                        break;
+                    }
+                    for (uint i = 0; i < event_count; i++) {
+                        f.ReadFloat();
+                        std::string evt_json = f.ReadStr();
+                        if (evt_json.empty()) continue;
+                        nlohmann::json j;
+                        if (! PARSE_JSON(evt_json, j)) {
+                            LOG_ERROR("anim %d: failed to parse event json: %s",
+                                      anim.id,
+                                      evt_json.c_str());
+                            continue;
+                        }
+                        WPPuppet::Animation::Event e {};
+                        GET_JSON_NAME_VALUE_NOWARN(j, "frame", e.frame);
+                        GET_JSON_NAME_VALUE_NOWARN(j, "name", e.name);
+                        if (e.name.empty()) continue;
+                        LOG_INFO("    anim[%d] event frame=%d name='%s'",
+                                 anim.id,
+                                 e.frame,
+                                 e.name.c_str());
+                        anim.events.push_back(std::move(e));
+                    }
+                }
+            }
+        }
+    }
+
+    mdl.puppet->prepared();
+
+    LOG_INFO("read puppet: mdlv: %d, nmdls: %d, mdla: %d, bones: %d, anims: %d",
+             mdl.mdlv,
+             mdl.mdls,
+             mdl.mdla,
+             mdl.puppet->bones.size(),
+             mdl.puppet->anims.size());
+    return true;
+}
+
+void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
+    SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3 },
+                              { WE_IN_BLENDINDICES.data(), VertexType::UINT4 },
+                              { WE_IN_BLENDWEIGHTS.data(), VertexType::FLOAT4 },
+                              { WE_IN_TEXCOORD.data(), VertexType::FLOAT2 } },
+                            mdl.vertexs.size());
+
+    // Clamp blend indices to [0, bone_count-1] to prevent OOB GPU array access in
+    // g_Bones[a_BlendIndices.x] which causes VK_ERROR_DEVICE_LOST on strict GPU drivers.
+    // Unused slots in the MDL may carry sentinel values (e.g. 0xFF) with weight=0.
+    uint32_t bone_count = mdl.puppet ? (uint32_t)mdl.puppet->bones.size() : 1u;
+
+    std::array<float, 16> one_vert;
+    // Explicit per-attribute offsets (in float units).  The old pattern used
+    // `4 * (offset++)` which yielded equivalent mutants at offset=1 where
+    // `4*1 == 4/1` made the cxx_mul_to_div mutation unkillable.
+    auto to_one = [bone_count](const WPMdl::Vertex& in, decltype(one_vert)& out) {
+        std::array<uint32_t, 4> safe_indices;
+        for (int j = 0; j < 4; j++)
+            safe_indices[j] = in.blend_indices[j] < bone_count ? in.blend_indices[j] : 0u;
+        memcpy(out.data() + 0, in.position.data(), sizeof(in.position));
+        memcpy(out.data() + 4, safe_indices.data(), sizeof(safe_indices));
+        memcpy(out.data() + 8, in.weight.data(), sizeof(in.weight));
+        memcpy(out.data() + 12, in.texcoord.data(), sizeof(in.texcoord));
+    };
+    for (uint i = 0; i < mdl.vertexs.size(); i++) {
+        auto& v = mdl.vertexs[i];
+        to_one(v, one_vert);
+        vertex.SetVertexs(i, one_vert);
+    }
+    std::vector<uint32_t> indices;
+    indices.resize(U32SlotsForU16Triangles(mdl.indices.size()));
+    memcpy(indices.data(), mdl.indices.data(), U16BytesForTriangles(mdl.indices.size()));
+
+    mesh.AddVertexArray(std::move(vertex));
+    mesh.AddIndexArray(SceneIndexArray(indices));
+}
+
+void WPMdlParser::GenModelMesh(SceneMesh& mesh, const WPMdl::Submesh& sub) {
+    if (sub.has_normals && sub.has_tangents && sub.has_texcoord1) {
+        // Flag 39: pos + normal + tangent + texcoord0 + texcoord1 (lightmap)
+        // Pack both texcoord sets into a_TexCoordVec4 (vec4) for lightmap shaders
+        SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3, false },
+                                  { WE_IN_NORMAL.data(), VertexType::FLOAT3, false },
+                                  { WE_IN_TANGENT4.data(), VertexType::FLOAT4, false },
+                                  { WE_IN_TEXCOORDVEC4.data(), VertexType::FLOAT4, false } },
+                                sub.vertexs.size());
+        // Literal offsets (0/3/6/10/12) keep the mutation surface small —
+        // the previous `offset += N` pattern generated cxx_add_to_sub
+        // mutants on every increment.
+        std::array<float, 14> one_vert;
+        for (uint i = 0; i < sub.vertexs.size(); i++) {
+            auto& v = sub.vertexs[i];
+            memcpy(one_vert.data() + 0, v.position.data(), sizeof(v.position));
+            memcpy(one_vert.data() + 3, v.normal.data(), sizeof(v.normal));
+            memcpy(one_vert.data() + 6, v.tangent.data(), sizeof(v.tangent));
+            memcpy(one_vert.data() + 10, v.texcoord.data(), sizeof(v.texcoord));
+            memcpy(one_vert.data() + 12, v.texcoord1.data(), sizeof(v.texcoord1));
+            vertex.SetVertexs(i, one_vert);
+        }
+        mesh.AddVertexArray(std::move(vertex));
+    } else if (sub.has_normals && sub.has_tangents) {
+        // padding=false: vertex data is tightly packed (no padding to vec4),
+        // must match the layout used by SetVertexs() below
+        SceneVertexArray      vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3, false },
+                                       { WE_IN_NORMAL.data(), VertexType::FLOAT3, false },
+                                       { WE_IN_TANGENT4.data(), VertexType::FLOAT4, false },
+                                       { WE_IN_TEXCOORD.data(), VertexType::FLOAT2, false } },
+                                sub.vertexs.size());
+        std::array<float, 12> one_vert;
+        for (uint i = 0; i < sub.vertexs.size(); i++) {
+            auto& v = sub.vertexs[i];
+            memcpy(one_vert.data() + 0, v.position.data(), sizeof(v.position));
+            memcpy(one_vert.data() + 3, v.normal.data(), sizeof(v.normal));
+            memcpy(one_vert.data() + 6, v.tangent.data(), sizeof(v.tangent));
+            memcpy(one_vert.data() + 10, v.texcoord.data(), sizeof(v.texcoord));
+            vertex.SetVertexs(i, one_vert);
+        }
+        mesh.AddVertexArray(std::move(vertex));
+    } else if (sub.has_normals) {
+        SceneVertexArray     vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3, false },
+                                      { WE_IN_NORMAL.data(), VertexType::FLOAT3, false },
+                                      { WE_IN_TEXCOORD.data(), VertexType::FLOAT2, false } },
+                                sub.vertexs.size());
+        std::array<float, 8> one_vert;
+        for (uint i = 0; i < sub.vertexs.size(); i++) {
+            auto& v = sub.vertexs[i];
+            memcpy(one_vert.data() + 0, v.position.data(), sizeof(v.position));
+            memcpy(one_vert.data() + 3, v.normal.data(), sizeof(v.normal));
+            memcpy(one_vert.data() + 6, v.texcoord.data(), sizeof(v.texcoord));
+            vertex.SetVertexs(i, one_vert);
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+            // Dump first 3 vertices for debugging
+            if (i < 3) {
+                LOG_INFO("  vert[%u] pos=(%.4f,%.4f,%.4f) norm=(%.4f,%.4f,%.4f) tc=(%.4f,%.4f)",
+                         i,
+                         v.position[0],
+                         v.position[1],
+                         v.position[2],
+                         v.normal[0],
+                         v.normal[1],
+                         v.normal[2],
+                         v.texcoord[0],
+                         v.texcoord[1]);
+            }
+#endif
+        }
+#ifndef WP_SUPPRESS_DEBUG_LOGGING
+        // Also dump first 3 index triples
+        for (uint i = 0; i < std::min((uint)sub.indices.size(), 3u); i++) {
+            LOG_INFO("  tri[%u] indices=(%u,%u,%u)",
+                     i,
+                     sub.indices[i][0],
+                     sub.indices[i][1],
+                     sub.indices[i][2]);
+        }
+#endif
+        mesh.AddVertexArray(std::move(vertex));
+    } else {
+        // padding=false: tightly packed, matches SetVertexs() layout
+        SceneVertexArray     vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3, false },
+                                      { WE_IN_TEXCOORD.data(), VertexType::FLOAT2, false } },
+                                sub.vertexs.size());
+        std::array<float, 5> one_vert;
+        for (uint i = 0; i < sub.vertexs.size(); i++) {
+            auto& v = sub.vertexs[i];
+            memcpy(one_vert.data() + 0, v.position.data(), sizeof(v.position));
+            memcpy(one_vert.data() + 3, v.texcoord.data(), sizeof(v.texcoord));
+            vertex.SetVertexs(i, one_vert);
+        }
+        mesh.AddVertexArray(std::move(vertex));
+    }
+
+    mesh.AddIndexArray(MakeIndexArray(sub.indices, sub.wide_indices));
+}
+
+void WPMdlParser::AddPuppetShaderInfo(WPShaderInfo& info, const WPMdl& mdl) {
+    info.combos["SKINNING"]  = "1";
+    info.combos["BONECOUNT"] = std::to_string(mdl.puppet->bones.size());
+}
+
+void WPMdlParser::AddPuppetMatInfo(wpscene::WPMaterial& mat, const WPMdl& mdl) {
+    mat.combos["SKINNING"]  = 1;
+    mat.combos["BONECOUNT"] = (i32)mdl.puppet->bones.size();
+    mat.use_puppet          = true;
+}

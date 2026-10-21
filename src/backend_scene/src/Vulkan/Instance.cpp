@@ -1,0 +1,227 @@
+#include "Instance.hpp"
+#include "Device.hpp"
+
+#include <cstdlib>
+#include "Utils/Logging.h"
+#include "Vulkan/DebugCallback.hpp"
+
+using namespace wallpaper::vulkan;
+
+// VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+
+constexpr std::array<InstanceLayer, 0> base_inst_layers {};
+
+// kDebugUtilsExt (VK_EXT_debug_utils, required=false) lives in
+// Vulkan/DebugCallback.hpp so the test target can lock the
+// "required-bit stays false" contract directly.
+
+namespace
+{
+
+VkBool32 DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+                                     [[maybe_unused]] VkDebugUtilsMessageTypeFlagsEXT messageType,
+                                     const VkDebugUtilsMessengerCallbackDataEXT*      pCallbackData,
+                                     [[maybe_unused]] void*                           pUserData) {
+    // INFO+VERBOSE are not subscribed via messageSeverity (see
+    // debugCallbackMessageSeverity() in DebugCallback.hpp), so this body
+    // only ever sees WARN+ERROR.  Threshold check below is belt-and-braces
+    // in case a future patch widens the mask.
+    VkBool32 result = VK_FALSE;
+    if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        const bool is_error = messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        if (is_error) result |= VK_TRUE;
+        if (is_error)
+            LOG_ERROR("vulkan validation ERROR: %s", pCallbackData->pMessage);
+        else
+            LOG_NOTICE("vulkan validation WARN: %s", pCallbackData->pMessage);
+    }
+    return result;
+}
+
+vvk::DebugUtilsMessenger SetupDebugCallback(vvk::Instance& instance) {
+    return instance.CreateDebugUtilsMessenger(VkDebugUtilsMessengerCreateInfoEXT {
+        .sType           = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .pNext           = nullptr,
+        .flags           = 0,
+        .messageSeverity = debugCallbackMessageSeverity(),
+        .messageType     = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = DebugUtilsMessengerCallback,
+        .pUserData       = nullptr,
+    });
+}
+
+VkResult CreatInstance(vvk::Instance* inst, std::span<const std::string_view> exts,
+                       std::span<const std::string_view> layers, vvk::InstanceDispatch& dld) {
+    VkApplicationInfo app_info {
+        .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pNext              = nullptr,
+        .pApplicationName   = WP_APPLICATION_NAME,
+        .applicationVersion = WP_VULKAN_VERSION,
+        .pEngineName        = "vulkan",
+        .apiVersion         = WP_VULKAN_VERSION,
+    };
+
+    std::vector<const char*> extension_names_c;
+    std::transform(exts.begin(), exts.end(), std::back_inserter(extension_names_c), [](auto& ext) {
+        return ext.data();
+    });
+
+    std::vector<const char*> layer_names_c;
+    std::transform(
+        layers.begin(), layers.end(), std::back_inserter(layer_names_c), [](auto& layer) {
+            return layer.data();
+        });
+
+    return vvk::Instance::Create(*inst, app_info, layer_names_c, extension_names_c, dld);
+}
+void EnumateExts(wallpaper::Set<std::string>& set, const vvk::InstanceDispatch& dld) {
+    if (auto rv = vvk::EnumerateInstanceExtensionProperties(dld); rv.has_value()) {
+        for (const auto& ext : *rv) {
+            set.insert(ext.extensionName);
+        }
+    }
+}
+void EnumateLayers(wallpaper::Set<std::string>& set, const vvk::InstanceDispatch& dld) {
+    if (auto rv = vvk::EnumerateInstanceLayerProperties(dld); rv.has_value()) {
+        for (const auto& ext : *rv) {
+            set.insert(ext.layerName);
+        }
+    }
+}
+} // namespace
+
+bool Instance::ChoosePhysicalDevice(const CheckGpuOp&             checkgpu,
+                                    std::span<const std::uint8_t> uuid) {
+    auto deviceList = m_vinst.EnumeratePhysicalDevices();
+
+    VkInstanceCreateInfo crea;
+    auto                 logGpu = [](const VkPhysicalDeviceProperties& props) {
+        LOG_NOTICE("vulkan device: %s", props.deviceName);
+    };
+
+    vvk::PhysicalDevice        final_gpu;
+    VkPhysicalDeviceProperties final_props;
+
+    // choose deiscrete device
+    for (const auto& d : deviceList) {
+        VkPhysicalDeviceIDProperties device_id_props {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, .pNext = NULL
+        };
+        VkPhysicalDeviceProperties2 props2 { .sType =
+                                                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                             .pNext = &device_id_props };
+        d.GetProperties2KHR(props2);
+        auto& props = props2.properties;
+        if (uuid.size() > 0) {
+            decltype(uuid) device_uuid { device_id_props.deviceUUID };
+            if (std::equal(uuid.begin(), uuid.end(), device_uuid.begin(), device_uuid.end())) {
+                /*
+                for(const auto& p:device_uuid) {
+                    printf("%02x ", p);
+                }
+                */
+                final_props = props;
+                final_gpu   = d;
+                break;
+            }
+        } else {
+            if (checkgpu(d)) {
+                final_props = props;
+                final_gpu   = d;
+                break;
+            }
+        }
+    }
+    if (final_gpu) {
+        logGpu(final_props);
+        m_gpu = final_gpu;
+        return true;
+    } else {
+        LOG_ERROR("failed to find GPU with vulkan support");
+        return false;
+    }
+}
+
+const vvk::Instance&       Instance::inst() const { return m_vinst; };
+const vvk::PhysicalDevice& Instance::gpu() const { return m_gpu; }
+const vvk::SurfaceKHR&     Instance::surface() const { return m_surface; }
+
+bool Instance::offscreen() const { return ! m_surface; }
+
+void Instance::setSurface(VkSurfaceKHR sf) {
+    m_surface = vvk::SurfaceKHR(sf, *m_vinst, m_vinst.Dispatch());
+}
+
+bool Instance::supportExt(std::string_view name) const { return exists(m_extensions, name); }
+bool Instance::supportLayer(std::string_view name) const { return exists(m_layers, name); }
+
+void Instance::Destroy() {}
+
+bool Instance::Create(Instance& inst, std::span<const Extension> instExts,
+                      std::span<const InstanceLayer> instLayers) {
+    if (vvk::LoadLibrary(inst.m_vklib, inst.m_dld) != VK_SUCCESS || ! vvk::Load(inst.m_dld)) {
+        LOG_ERROR("could not load the Vulkan loader (libvulkan.so.1); is a Vulkan driver installed?");
+        return false;
+    }
+
+    EnumateExts(inst.m_extensions, inst.m_dld);
+    Set<std::string> exts, layers;
+    std::array       test_exts_array { std::span<const Extension>(kDebugUtilsExt), instExts };
+    for (auto& test_exts : test_exts_array) {
+        for (auto& ext : test_exts) {
+            bool ok = inst.supportExt(ext.name);
+            if (ok) exts.insert(std::string(ext.name));
+            if (ext.required && ! ok) {
+                LOG_ERROR("required vulkan instance extension \"%s\" is not supported",
+                          ext.name.data());
+                return false;
+            }
+        }
+    }
+
+    EnumateLayers(inst.m_layers, inst.m_dld);
+    std::array test_layers_array { std::span<const InstanceLayer>(base_inst_layers), instLayers };
+    for (auto& test_layers : test_layers_array) {
+        for (auto& layer : test_layers) {
+            bool ok = inst.supportLayer(layer.name);
+            if (ok) layers.insert(std::string(layer.name));
+            if (layer.required && ! ok) {
+                LOG_ERROR("required vulkan instance layer \"%s\" is not supported",
+                          layer.name.data());
+                return false;
+            }
+        }
+    }
+
+    std::vector<std::string_view> exts_vec { exts.begin(), exts.end() },
+        layers_vec { layers.begin(), layers.end() };
+
+    VVK_CHECK_BOOL_RE(CreatInstance(&inst.m_vinst, exts_vec, layers_vec, inst.m_dld));
+    vvk::Load(*inst.m_vinst, inst.m_dld);
+
+    // Set up the debug-utils messenger only when validation is actually
+    // wanted (CLI/--valid-layer, QML m_enable_valid, or WEKDE_VULKAN_VALIDATION
+    // env var) AND the optional extension was successfully resolved.
+    // Without these, m_debug_utils stays default-constructed (a destructor-
+    // safe empty vvk handle), the validation layer pays no formatting
+    // cost, and drivers without VK_EXT_debug_utils still initialise.
+    const bool has_valid_layer = exists(layers, std::string(VALIDATION_LAYER_NAME));
+    const bool has_debug_utils = exists(exts, std::string(VK_EXT_DEBUG_UTILS_EXTENSION_NAME));
+    if (has_debug_utils && shouldEnableDebugCallback(std::getenv, has_valid_layer)) {
+        inst.m_debug_utils = SetupDebugCallback(inst.m_vinst);
+    }
+
+    // VK_CHECK_RESULT_ACT(return false, CreatInstance(&inst.m_inst, exts_vec, layers_vec));
+    // VK_CHECK_RESULT_ACT(return false, setupDebugCallback(&inst.m_inst, inst.m_debug_utils));
+    /*
+    if(!ChoosePhysicalDevice(inst.m_inst, inst.m_gpu, checkgpu, uuid)) {
+        if(uuid.size() > 0) {
+            // to do
+        }
+        return false;
+    }
+    */
+    return true;
+}

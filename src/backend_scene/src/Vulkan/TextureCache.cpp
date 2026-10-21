@@ -1,0 +1,1405 @@
+
+#include "Shader.hpp"
+#include "Swapchain.hpp"
+#include "TextureCache.hpp"
+#include "Device.hpp"
+#include "Util.hpp"
+
+#include <algorithm>
+
+#include "Image.hpp"
+#include "Core/MapSet.hpp"
+#include "Core/ArrayHelper.hpp"
+#include "Utils/AutoDeletor.hpp"
+#include "Utils/Hash.h"
+#include "include/Vulkan/Parameters.hpp"
+#include "vvk/vulkan_wrapper.hpp"
+#include "TexFormatVk.hpp" // ToVkType(TextureFormat) — testable mapping (BC1 1-bit alpha)
+#include "TextureCacheDetail.hpp" // MEM4: mipOffsets / packedTotalBytes / bytesPerBlockForFormat
+#include "ImagePayload.h"  // mayReleaseDecodedPayload / releaseDecodedPayload
+
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
+
+using namespace wallpaper;
+using namespace wallpaper::vulkan;
+
+namespace wallpaper
+{
+namespace vulkan
+{
+// ToVkType(TextureFormat) moved to include/Vulkan/TexFormatVk.hpp so it is
+// unit-testable without the Vulkan device (see Test/test_TexFormatVk.cpp).
+
+VkSamplerAddressMode ToVkType(wallpaper::TextureWrap sam) {
+    using namespace wallpaper;
+    switch (sam) {
+    case TextureWrap::CLAMP_TO_EDGE: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    case TextureWrap::REPEAT:
+    default: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    }
+}
+VkFilter ToVkType(wallpaper::TextureFilter sam) {
+    using namespace wallpaper;
+    switch (sam) {
+    case TextureFilter::LINEAR: return VK_FILTER_LINEAR;
+    case TextureFilter::NEAREST:
+    default: return VK_FILTER_NEAREST;
+    }
+}
+
+VkSamplerCreateInfo GenDepthSamplerInfo() {
+    VkSamplerCreateInfo info { .sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                               .pNext            = nullptr,
+                               .flags            = 0,
+                               .magFilter        = VK_FILTER_NEAREST,
+                               .minFilter        = VK_FILTER_NEAREST,
+                               .mipmapMode       = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                               .addressModeU     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                               .addressModeV     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                               .addressModeW     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                               .mipLodBias       = 0.0f,
+                               .anisotropyEnable = VK_FALSE,
+                               .maxAnisotropy    = 1.0f,
+                               .compareEnable    = VK_FALSE,
+                               .compareOp        = VK_COMPARE_OP_NEVER,
+                               .minLod           = 0.0f,
+                               .maxLod           = 0.0f,
+                               .borderColor      = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                               .unnormalizedCoordinates = VK_FALSE };
+    return info;
+}
+
+VkSamplerCreateInfo GenSamplerInfo(const TextureSample& sample, float max_lod,
+                                   float device_max_anisotropy) {
+    const bool use_aniso =
+        (sample.magFilter == TextureFilter::LINEAR) && device_max_anisotropy > 1.0f;
+
+    // U and V each take their own wrap flag.  W has no flag of its own in a
+    // wallpaper texture header and nothing samples these images with a 3D
+    // coordinate, so it follows T.
+    VkSamplerCreateInfo sampler_info {
+        .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .pNext                   = nullptr,
+        .magFilter               = ToVkType(sample.magFilter),
+        .minFilter               = ToVkType(sample.minFilter),
+        .mipmapMode              = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU            = ToVkType(sample.wrapS),
+        .addressModeV            = ToVkType(sample.wrapT),
+        .addressModeW            = ToVkType(sample.wrapT),
+        .anisotropyEnable        = use_aniso,
+        .maxAnisotropy           = use_aniso ? device_max_anisotropy : 1.0f,
+        .compareEnable           = false,
+        .compareOp               = VK_COMPARE_OP_NEVER,
+        .minLod                  = 0.0f,
+        .maxLod                  = max_lod,
+        .borderColor             = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = false,
+    };
+    return sampler_info;
+}
+
+VkClearColorValue GenInitialClearColor(const TextureKey& key) {
+    // A 1x1 cache image is never a render target — no pass draws into a single
+    // pixel — it is the placeholder bound to shader slots the material left
+    // empty.  Such a slot can be anything, but only a normal map has a real
+    // neutral: (0.5, 0.5, 1) decodes to +Z, the unperturbed surface normal, so
+    // lighting stays flat instead of being driven by the (-1,-1,-1) that black
+    // decodes to.  Alpha 1 so an unbound alpha mask does not erase the layer.
+    if (key.width == 1 && key.height == 1) {
+        return VkClearColorValue { { 0.5f, 0.5f, 1.0f, 1.0f } };
+    }
+    // Everything else is a render target.  Transparent black is the identity
+    // for the premultiplied compositing the passes do, so a target read before
+    // anything wrote it contributes nothing.
+    return VkClearColorValue { { 0.0f, 0.0f, 0.0f, 0.0f } };
+}
+
+// A fresh image's first user may be a shader read, a render pass, or a copy
+// (CopyPass opens with TOP_OF_PIPE barriers of its own), so the closing barrier
+// covers both fragment-shader and transfer stages and the reads and writes
+// either can make.  A render pass as first user is ordered by its own
+// external dependency, whose FRAGMENT_SHADER source stage chains with this
+// barrier's destination stage (CustomShaderPass.cpp, render pass creation).
+static constexpr VkPipelineStageFlags kFirstUseStages =
+    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+static constexpr VkAccessFlags kFirstUseAccess =
+    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
+void RecClearNewImage(const vvk::CommandBuffer& cmd, VkImage image, const VkClearColorValue& color,
+                      VkImageLayout final_layout) {
+    const VkImageSubresourceRange range {
+        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel   = 0,
+        .levelCount     = VK_REMAINING_MIP_LEVELS,
+        .baseArrayLayer = 0,
+        .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+    };
+    const VkImageMemoryBarrier to_dst {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext            = nullptr,
+        .srcAccessMask    = 0,
+        .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .image            = image,
+        .subresourceRange = range,
+    };
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_DEPENDENCY_BY_REGION_BIT,
+                        to_dst);
+
+    cmd.ClearColorImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, range);
+
+    const VkImageMemoryBarrier to_final {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext            = nullptr,
+        .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask    = kFirstUseAccess,
+        .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout        = final_layout,
+        .image            = image,
+        .subresourceRange = range,
+    };
+    cmd.PipelineBarrier(
+        VK_PIPELINE_STAGE_TRANSFER_BIT, kFirstUseStages, VK_DEPENDENCY_BY_REGION_BIT, to_final);
+}
+
+void RecTransitionNewImage(const vvk::CommandBuffer& cmd, VkImage image,
+                           VkImageLayout final_layout) {
+    const VkImageMemoryBarrier barrier {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext            = nullptr,
+        .srcAccessMask    = 0,
+        .dstAccessMask    = kFirstUseAccess,
+        .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout        = final_layout,
+        .image            = image,
+        .subresourceRange = {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+        },
+    };
+    cmd.PipelineBarrier(
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, kFirstUseStages, VK_DEPENDENCY_BY_REGION_BIT, barrier);
+}
+} // namespace vulkan
+} // namespace wallpaper
+
+namespace
+{
+// Records `rec` into `cmd` and submits it on its own.  Callers wait for the
+// queue afterwards, so the buffer is safe to reuse for the next one-shot.
+template<typename Rec>
+VkResult SubmitOneShot(const vvk::Queue& queue, vvk::CommandBuffer& cmd, Rec&& rec) {
+    VkResult result;
+    do {
+        result = cmd.Begin(VkCommandBufferBeginInfo {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        });
+        if (result != VK_SUCCESS) break;
+
+        rec(cmd);
+
+        result = cmd.End();
+        if (result != VK_SUCCESS) break;
+
+        VkSubmitInfo sub_info {
+            .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext              = nullptr,
+            .commandBufferCount = 1,
+            .pCommandBuffers    = cmd.address(),
+        };
+        result = queue.Submit(sub_info);
+    } while (false);
+    return result;
+}
+
+VkResult TransImgLayout(const vvk::Queue& queue, vvk::CommandBuffer& cmd,
+                        const ImageParameters& image, VkImageLayout layout) {
+    return SubmitOneShot(queue, cmd, [&](vvk::CommandBuffer& rec_cmd) {
+        VkImageSubresourceRange subresourceRange {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+        };
+        VkImageMemoryBarrier out_bar {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext            = nullptr,
+            .srcAccessMask    = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
+            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout        = layout,
+            .image            = image.handle,
+            .subresourceRange = subresourceRange,
+        };
+        rec_cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                out_bar);
+    });
+}
+
+std::optional<vvk::DeviceMemory> AllocateMemory(const vvk::Device& device, vvk::PhysicalDevice gpu,
+                                                VkMemoryRequirements  reqs,
+                                                VkMemoryPropertyFlags property,
+                                                void*                 pNext = NULL) {
+    VkPhysicalDeviceMemoryProperties pros = gpu.GetMemoryProperties().memoryProperties;
+    for (uint32_t i = 0; i < pros.memoryTypeCount; ++i) {
+        if ((reqs.memoryTypeBits & (1 << i)) && (pros.memoryTypes[i].propertyFlags & property)) {
+            VkMemoryAllocateInfo memory_allocate_info { .sType =
+                                                            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                                        .pNext           = pNext,
+                                                        .allocationSize  = reqs.size,
+                                                        .memoryTypeIndex = i };
+            vvk::DeviceMemory    mem;
+            VkResult             res = device.AllocateMemory(memory_allocate_info, mem);
+            if (res == VK_SUCCESS) {
+                return mem;
+            } else {
+                VVK_CHECK(res);
+                return std::nullopt;
+            }
+        }
+    }
+    LOG_ERROR("vulkan allocate memory failed, no memory match requires");
+    return std::nullopt;
+}
+
+std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, VkFormat format,
+                                               VkImageTiling tiling, VkSampler sampler,
+                                               VkImageUsageFlags usage, const vvk::Device& device,
+                                               const vvk::PhysicalDevice& gpu) {
+    // Sampler resolved by the caller via TextureCache::GetOrCreateSampler — see MEM5.
+    ExImageParameters image;
+    image.sampler = sampler;
+    do {
+        VkExternalMemoryImageCreateInfo ex_info {
+            .sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext       = NULL,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+        };
+        VkExportMemoryAllocateInfo ex_mem_info { .sType =
+                                                     VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                                                 .pNext = NULL,
+                                                 .handleTypes =
+                                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
+        VkImageCreateInfo          info {
+                     .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                     .pNext       = &ex_info,
+                     .imageType   = VK_IMAGE_TYPE_2D,
+                     .format      = format,
+                     .extent      = VkExtent3D { .width = width, .height = height, .depth = 1 },
+                     .mipLevels   = 1,
+                     .arrayLayers = 1,
+                     .samples     = VK_SAMPLE_COUNT_1_BIT,
+                     .tiling      = tiling,
+                     .usage       = usage,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                     .queueFamilyIndexCount = 0,
+                     .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        image.extent = info.extent;
+
+        VVK_CHECK_ACT(break, device.CreateImage(info, image.handle));
+
+        image.mem_reqs = device.GetImageMemoryRequirements(*image.handle);
+
+        if (auto opt = AllocateMemory(
+                device, gpu, image.mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ex_mem_info);
+            opt.has_value()) {
+            image.mem = std::move(opt.value());
+        } else
+            break;
+
+        VVK_CHECK_ACT(break, image.handle.BindMemory(*image.mem, 0));
+        {
+            VkImageViewCreateInfo createinfo {
+                .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext    = nullptr,
+                .image    = *image.handle,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format   = format,
+                .subresourceRange =
+                    VkImageSubresourceRange {
+                        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel   = 0,
+                        .levelCount     = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount     = 1,
+                    },
+            };
+            VVK_CHECK_ACT(break, device.CreateImageView(createinfo, image.view));
+        }
+        // No CreateSampler here — see CreateImage above (MEM5 dedup).
+        VVK_CHECK_ACT(break, image.mem.GetMemoryFdKHR(&image.fd));
+
+        return image;
+
+    } while (false);
+    return std::nullopt;
+}
+
+inline std::optional<VmaImageParameters>
+CreateImage(const Device& device, VkExtent3D extent, u32 miplevel, VkFormat format,
+            VkSampler sampler, VkImageUsageFlags usage,
+            VmaMemoryUsage mem_usage = VMA_MEMORY_USAGE_GPU_ONLY, bool dedicated = false) {
+    // Sampler is resolved by the caller (TextureCache::GetOrCreateSampler) so
+    // identical sampler configs share one underlying VkSampler; the image just
+    // holds the raw handle non-owning.
+    VmaImageParameters image;
+    image.sampler = sampler;
+    do {
+        VkImageCreateInfo info {
+            .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext                 = nullptr,
+            .imageType             = VK_IMAGE_TYPE_2D,
+            .format                = format,
+            .extent                = extent,
+            .mipLevels             = miplevel,
+            .arrayLayers           = 1,
+            .samples               = VK_SAMPLE_COUNT_1_BIT,
+            .tiling                = VK_IMAGE_TILING_OPTIMAL,
+            .usage                 = usage,
+            .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        image.extent = info.extent;
+        VmaAllocationCreateInfo vma_info {};
+        vma_info.usage = mem_usage;
+        // Own VkDeviceMemory, so destroying the image returns it to the driver
+        // instead of leaving it inside a half-empty VMA block.
+        if (dedicated) vma_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        VVK_CHECK_ACT(break,
+                      vvk::CreateImage(device.vma_allocator(), info, vma_info, image.handle));
+
+        image.mipmap_level = miplevel;
+        {
+            // Multi-mip view for sampler binding — covers all levels so the
+            // hardware sampler can pick lower mips via LOD selection.
+            VkImageViewCreateInfo createinfo {
+                .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext    = nullptr,
+                .image    = *image.handle,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format   = format,
+                .subresourceRange =
+                    VkImageSubresourceRange {
+                        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel   = 0,
+                        .levelCount     = miplevel,
+                        .baseArrayLayer = 0,
+                        .layerCount     = 1,
+                    },
+            };
+            VVK_CHECK_ACT(break, device.handle().CreateImageView(createinfo, image.view));
+        }
+        if (miplevel > 1) {
+            // Separate single-mip view for render attachments — Vulkan requires
+            // a color attachment view to cover exactly one mip level.  When
+            // miplevel == 1, the ImageParameters wrapper aliases mip0_view to
+            // view so callers don't need a branch.
+            VkImageViewCreateInfo createinfo {
+                .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext    = nullptr,
+                .image    = *image.handle,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format   = format,
+                .subresourceRange =
+                    VkImageSubresourceRange {
+                        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel   = 0,
+                        .levelCount     = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount     = 1,
+                    },
+            };
+            VVK_CHECK_ACT(break,
+                          device.handle().CreateImageView(createinfo, image.mip0_view));
+        }
+        // No CreateSampler here — `sampler` was resolved by the caller via
+        // TextureCache::GetOrCreateSampler so identical configs reuse one
+        // underlying VkSampler (owned by m_sampler_cache).  See MEM5.
+        return image;
+    } while (false);
+    return std::nullopt;
+}
+
+// MEM4: copy mip levels from a single packed staging buffer to the
+// destination image.  Mirrors CopyImageData's shape (begin/barrier-in/N
+// CopyBufferToImage/barrier-out/end/submit) but takes one staging buffer
+// + per-mip bufferOffset instead of N independent buffers.  The
+// VkBufferImageCopy::bufferOffset values must be multiples of the
+// format's texel block size — see bytesPerBlockForFormat() in
+// Vulkan/TextureCacheDetail.hpp.
+inline VkResult CopyImageDataWithOffsets(const BufferParameters&        staging,
+                                         std::span<const std::size_t>   mip_offsets,
+                                         std::span<const VkExtent3D>    in_exts,
+                                         const vvk::Queue&              queue,
+                                         vvk::CommandBuffer&            cmd,
+                                         const ImageParameters&         image) {
+    VkResult result;
+    do {
+        result = cmd.Begin(VkCommandBufferBeginInfo {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        });
+        if (result != VK_SUCCESS) break;
+
+        VkImageSubresourceRange subresourceRange {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = (uint32_t)mip_offsets.size(),
+            .baseArrayLayer = 0,
+            .layerCount     = 1,
+        };
+        {
+            VkImageMemoryBarrier in_bar {
+                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext            = nullptr,
+                .srcAccessMask    = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .image            = image.handle,
+                .subresourceRange = subresourceRange,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                in_bar);
+        }
+        VkBufferImageCopy copy {
+            .imageSubresource =
+                VkImageSubresourceLayers {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
+        };
+        for (usize i = 0; i < mip_offsets.size(); i++) {
+            copy.bufferOffset              = (VkDeviceSize)mip_offsets[i];
+            copy.imageSubresource.mipLevel = (u32)i;
+            copy.imageExtent               = in_exts[i];
+            cmd.CopyBufferToImage(
+                staging.handle, image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+        }
+        {
+            VkImageMemoryBarrier out_bar {
+                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext            = nullptr,
+                .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .image            = image.handle,
+                .subresourceRange = subresourceRange,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                out_bar);
+        }
+        result = cmd.End();
+        if (result != VK_SUCCESS) break;
+
+        VkSubmitInfo sub_info {
+            .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext              = nullptr,
+            .commandBufferCount = 1,
+            .pCommandBuffers    = cmd.address(),
+        };
+        result = queue.Submit(sub_info);
+    } while (false);
+    return result;
+}
+
+[[maybe_unused]] inline VkResult CopyImageData(std::span<const BufferParameters> in_bufs,
+                                               std::span<const VkExtent3D>       in_exts,
+                                               const vvk::Queue& queue, vvk::CommandBuffer& cmd,
+                                               const ImageParameters& image) {
+    VkResult result;
+    do {
+        result = cmd.Begin(VkCommandBufferBeginInfo {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        });
+        if (result != VK_SUCCESS) break;
+
+        VkImageSubresourceRange subresourceRange {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = (uint32_t)in_bufs.size(),
+            .baseArrayLayer = 0,
+            .layerCount     = 1,
+        };
+        {
+            VkImageMemoryBarrier in_bar {
+                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext            = nullptr,
+                .srcAccessMask    = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .image            = image.handle,
+                .subresourceRange = subresourceRange,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                in_bar);
+        }
+        VkBufferImageCopy copy {
+            .imageSubresource =
+                VkImageSubresourceLayers {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
+        };
+        for (usize i = 0; i < in_bufs.size(); i++) {
+            copy.imageSubresource.mipLevel = (u32)i;
+            copy.imageExtent               = in_exts[i];
+            cmd.CopyBufferToImage(
+                in_bufs[i].handle, image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+        }
+        {
+            VkImageMemoryBarrier out_bar {
+                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext            = nullptr,
+                .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .image            = image.handle,
+                .subresourceRange = subresourceRange,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                out_bar);
+        }
+        result = cmd.End();
+        if (result != VK_SUCCESS) break;
+
+        VkSubmitInfo sub_info {
+            .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext              = nullptr,
+            .commandBufferCount = 1,
+            .pCommandBuffers    = cmd.address(),
+        };
+        result = queue.Submit(sub_info);
+    } while (false);
+    return result;
+}
+} // namespace
+
+std::size_t TextureKey::HashValue(const TextureKey& k) {
+    std::size_t seed { 0 };
+    utils::hash_combine(seed, k.width);
+    utils::hash_combine(seed, k.height);
+    utils::hash_combine(seed, (int)k.usage);
+    utils::hash_combine(seed, (int)k.format);
+    utils::hash_combine(seed, (int)k.mipmap_level);
+
+    utils::hash_combine(seed, (int)k.sample.wrapS);
+    utils::hash_combine(seed, (int)k.sample.wrapT);
+    utils::hash_combine(seed, (int)k.sample.magFilter);
+    return seed;
+}
+
+std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint32_t height,
+                                                           VkFormat format, VkImageTiling tiling) {
+    VkSamplerCreateInfo sampler_info {
+        .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .pNext                   = nullptr,
+        .magFilter               = VK_FILTER_NEAREST,
+        .minFilter               = VK_FILTER_NEAREST,
+        .mipmapMode              = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU            = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        .addressModeV            = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        .addressModeW            = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        .anisotropyEnable        = false,
+        .maxAnisotropy           = 1.0f,
+        .compareEnable           = false,
+        .compareOp               = VK_COMPARE_OP_NEVER,
+        .minLod                  = 0.0f,
+        .maxLod                  = 1.0f,
+        .borderColor             = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = false,
+    };
+
+    VkSampler shared_sampler = GetOrCreateSampler(sampler_info);
+    auto      opt            = CreateExImage(width,
+                             height,
+                             format,
+                             tiling,
+                             shared_sampler,
+                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             m_device.device(),
+                             m_device.gpu());
+    if (opt.has_value()) {
+        const auto& eximg = opt.value();
+
+        if (! m_tex_cmd) allocateCmd();
+        TransImgLayout(m_device.graphics_queue().handle, m_tex_cmd, eximg, VK_IMAGE_LAYOUT_GENERAL);
+        VVK_CHECK(m_device.handle().WaitIdle());
+    }
+    return opt;
+}
+
+ImageSlotsRef TextureCache::CreateTex(Image& image) {
+    if (exists(m_tex_map, image.key)) {
+        return m_tex_map.at(image.key);
+    }
+
+    ImageSlots img_slots;
+
+    if (! m_tex_cmd) allocateCmd();
+
+    img_slots.slots.resize(image.slots.size());
+
+    auto& sam      = image.header.sample;
+    float maxAniso = m_device.maxAnisotropy();
+
+    usize slots_built = 0;
+    for (usize i = 0; i < image.slots.size(); i++) {
+        auto& image_paras   = img_slots.slots[i];
+        auto& image_slot    = image.slots[i];
+        auto  mipmap_levels = image_slot.mipmaps.size();
+
+        // check data
+        if (! image_slot) {
+            LOG_ERROR("CreateTex '%s': slot %zu has no usable pixel data", image.key.c_str(), i);
+            return {};
+        }
+
+        VkSamplerCreateInfo sampler_info = GenSamplerInfo(sam, (float)mipmap_levels, maxAniso);
+        VkFormat            format       = ToVkType(image.header.format);
+        VkExtent3D          ext { (u32)image_slot.width, (u32)image_slot.height, 1 };
+
+        VkSampler shared_sampler = GetOrCreateSampler(sampler_info);
+        if (auto opt = CreateImage(m_device,
+                                   ext,
+                                   (u32)mipmap_levels,
+                                   format,
+                                   shared_sampler,
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+            opt.has_value()) {
+            image_paras = std::move(opt.value());
+        } else {
+            LOG_ERROR("CreateTex '%s': image create failed for slot %zu (%ux%u, %zu mips)",
+                      image.key.c_str(),
+                      i,
+                      ext.width,
+                      ext.height,
+                      mipmap_levels);
+            break;
+        }
+
+        // MEM4: pack all mip levels into one CPU-only VMA staging buffer
+        // sized to the sum of mip byte counts; record one
+        // vkCmdCopyBufferToImage per mip pointing at this single buffer
+        // with the appropriate VkBufferImageCopy::bufferOffset.  Drops
+        // per-texture allocation count from N mips → 1, eliminating the
+        // VmaAllocation metadata overhead and page-rounding waste of the
+        // legacy per-mip path.  Bit-exact: same bytes from same source to
+        // same image — vkCmdCopyBufferToImage validates each
+        // VkBufferImageCopy independently.
+        //
+        // Alignment: bufferOffset must be a multiple of the format's
+        // texel block size (1 for uncompressed; 8 for BC1/BC4; 16 for
+        // BC2/BC3/BC5/BC6H/BC7).  detail::bytesPerBlockForFormat returns
+        // the right value for every format the engine loads, and
+        // detail::mipOffsets rounds each per-mip starting offset up.
+        std::vector<std::size_t> mip_sizes;
+        mip_sizes.reserve(image_slot.mipmaps.size());
+        for (const auto& mip : image_slot.mipmaps) {
+            mip_sizes.push_back(mip.size);
+        }
+
+        const std::size_t blockSize = detail::bytesPerBlockForFormat(format);
+        const auto        offsets   = detail::mipOffsets(mip_sizes, blockSize);
+        const std::size_t total     = detail::packedTotalBytes(mip_sizes, offsets);
+
+        VmaBufferParameters staging;
+        VkResult            map_res = VK_SUCCESS;
+        const auto          mapped  = detail::acquireMappedStaging(
+            /*reusable=*/false,
+            [&] {
+                return CreateStagingBuffer(m_device.vma_allocator(), total, staging);
+            },
+            [&](void** out) {
+                map_res = staging.handle.MapMemory(out);
+                return map_res == VK_SUCCESS;
+            });
+        // Give up on this texture rather than copy through a pointer no driver
+        // wrote; matches how a failed CreateImage above bails out of the loop.
+        if (mapped.status == detail::StagingMapStatus::CreateFailed) {
+            LOG_ERROR("CreateTex '%s': staging alloc failed for slot %zu (%zu bytes)",
+                      image.key.c_str(),
+                      i,
+                      total);
+            break;
+        }
+        if (mapped.status != detail::StagingMapStatus::Ok) {
+            LOG_ERROR("CreateTex '%s': staging map failed for slot %zu: %s",
+                      image.key.c_str(),
+                      i,
+                      vvk::ToString(map_res));
+            break;
+        }
+        {
+            auto* dst = static_cast<std::uint8_t*>(mapped.data);
+            for (usize j = 0; j < image_slot.mipmaps.size(); j++) {
+                const auto& image_data = image_slot.mipmaps[j];
+                memcpy(dst + offsets[j], image_data.data.get(), (u32)image_data.size);
+            }
+            staging.handle.UnMapMemory();
+        }
+
+        std::vector<VkExtent3D> extents;
+        extents.reserve(image_slot.mipmaps.size());
+        for (const auto& mip : image_slot.mipmaps) {
+            extents.push_back(VkExtent3D { (u32)mip.width, (u32)mip.height, 1 });
+        }
+
+        CopyImageDataWithOffsets(staging,
+                                 offsets,
+                                 extents,
+                                 m_device.graphics_queue().handle,
+                                 m_tex_cmd,
+                                 image_paras);
+
+        m_device.handle().WaitIdle();
+        ++slots_built;
+    }
+
+    // The GPU image is only authoritative once every slot landed.  Publishing a
+    // half-built texture would remember one transient allocation failure for
+    // the process lifetime — the next CreateTex for this key hits the cache and
+    // hands back null image handles — and freeing the decoded CPU bytes would
+    // destroy the only source a retry could upload from.  Callers treat an
+    // empty result as "no texture" and fall back to the 1x1 dummy.
+    const auto publish = detail::planUploadPublish(slots_built,
+                                                   image.slots.size(),
+                                                   mayReleaseDecodedPayload(image) &&
+                                                       ! std::getenv("WEKDE_KEEP_TEXBYTES"));
+    if (! publish.cache) {
+        LOG_ERROR("CreateTex '%s': upload stopped after %zu of %zu slots; not cached so a "
+                  "later prepare can retry",
+                  image.key.c_str(),
+                  slots_built,
+                  image.slots.size());
+        return {};
+    }
+    m_tex_map[image.key] = std::move(img_slots);
+    // The decoded CPU mip bytes were the staging source and are dead after the
+    // WaitIdle above.  Free them but keep the Image shell so the parser cache
+    // (m_registered) still serves ParseHeader and a duplicate CreateTex
+    // early-returns on the m_tex_map key.  Video-texture placeholders are left
+    // intact (policy == false); their per-frame frames come from the live
+    // decoder, not from this image.  WEKDE_KEEP_TEXBYTES is a zero-rebuild
+    // A/B / rollback escape hatch.
+    if (publish.release) {
+        if (std::getenv("WEKDE_DEBUG_TEXBYTES")) {
+            isize freed = 0;
+            for (auto& s : image.slots)
+                for (auto& m : s.mipmaps) freed += m.size;
+            LOG_INFO("TEXBYTES free '%s': %lld decoded CPU bytes released",
+                     image.key.c_str(),
+                     (long long)freed);
+        }
+        releaseDecodedPayload(image);
+    }
+    return m_tex_map[image.key];
+}
+
+void TextureCache::allocateCmd() {
+    const auto& pool = m_device.cmd_pool();
+    VVK_CHECK(pool.Allocate(1, VK_COMMAND_BUFFER_LEVEL_PRIMARY, m_tex_cmds));
+    m_tex_cmd = vvk::CommandBuffer(m_tex_cmds[0], m_device.handle().Dispatch());
+}
+
+std::optional<VmaImageParameters> TextureCache::createImageOnly(const TextureKey& tex_key,
+                                                                bool              releasable) {
+    // maxLod gates the highest mip the hardware sampler may pick.  Set to
+    // the key's actual mip count so trilinear can pick lower mips when the
+    // image has them.  When mipmap_level == 1 (the normal case for current
+    // pingpongs and _rt_default), maxLod is 1.0.  When multi-mip RTs are
+    // ever re-enabled, this lifts the artificial clamp without exposing the
+    // rotated-quad pixelation that mip-gen for halo softening produced.
+    const float         max_lod = std::max(1.0f, (float)tex_key.mipmap_level);
+    VkSamplerCreateInfo sam_info =
+        GenSamplerInfo(tex_key.sample, max_lod, m_device.maxAnisotropy());
+    VkSampler  shared_sampler = GetOrCreateSampler(sam_info);
+    VkFormat   format         = ToVkType(tex_key.format);
+    VkExtent3D ext { (u32)tex_key.width, (u32)tex_key.height, 1 };
+
+    // Only an image that residency will release gains from dedicated memory;
+    // persistent targets and eagerly created ones stay in the shared blocks.
+    const bool dedicated =
+        releasable &&
+        ShouldUseDedicatedMemory(
+            RtImageBytes(tex_key.width, tex_key.height, tex_key.format, tex_key.mipmap_level),
+            m_dedicated_live.live(),
+            m_device.limits().maxMemoryAllocationCount);
+    auto opt = CreateImage(m_device,
+                           ext,
+                           tex_key.mipmap_level,
+                           format,
+                           shared_sampler,
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                           VMA_MEMORY_USAGE_GPU_ONLY,
+                           dedicated);
+    if (opt.has_value() && dedicated) opt->dedicated_token = m_dedicated_live.take();
+    return opt;
+}
+
+bool TextureCache::CreateImageForSlot(RtSlot& slot) {
+    auto opt = createImageOnly(slot.key, ! slot.persist && ! m_eager_managed);
+    if (! opt.has_value()) return false;
+    detail::attachImage(slot, std::move(opt.value()));
+    return true;
+}
+
+void TextureCache::ReleaseSlot(RtSlot& slot, std::vector<vvk::Framebuffer> framebuffers,
+                               std::uint64_t frame) {
+    RetiredImage r;
+    r.image        = std::move(slot.image);
+    r.framebuffers = std::move(framebuffers);
+    slot.image.reset();
+    slot.idle_frames = 0;
+    m_retired.push(std::move(r), frame);
+}
+
+void TextureCache::RetireFramebuffer(vvk::Framebuffer framebuffer, std::uint64_t frame) {
+    RetiredImage r;
+    r.framebuffers.push_back(std::move(framebuffer));
+    m_retired.push(std::move(r), frame);
+}
+
+void TextureCache::CollectRetired(std::uint64_t frame, std::uint64_t frames_in_flight) {
+    auto dead = m_retired.collect(frame, frames_in_flight);
+    (void)dead; // destroyed here: framebuffers first, then the image
+}
+
+void TextureCache::DrainRetired() {
+    auto dead = m_retired.drain();
+    (void)dead;
+}
+
+void TextureCache::RecInitialState(const vvk::CommandBuffer& cmd, const RtSlot& slot,
+                                   bool clear) const {
+    if (! slot.image) return;
+    if (clear)
+        RecClearNewImage(cmd,
+                         *slot.image->handle,
+                         GenInitialClearColor(slot.key),
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    else
+        RecTransitionNewImage(cmd, *slot.image->handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
+    VmaImageParameters image_paras;
+    do {
+        if (auto opt = createImageOnly(tex_key); opt.has_value()) {
+            image_paras = std::move(opt.value());
+        } else
+            break;
+
+        if (! m_tex_cmd) allocateCmd();
+        // Nothing has written this image yet, and the allocator hands back
+        // recycled memory — so fill it before the first sampler can read it.
+        // Costs the same single submit the layout transition already needed.
+        SubmitOneShot(m_device.graphics_queue().handle, m_tex_cmd, [&](vvk::CommandBuffer& cmd) {
+            RecClearNewImage(cmd,
+                             *image_paras.handle,
+                             GenInitialClearColor(tex_key),
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        });
+
+        VVK_CHECK_ACT(break, m_device.handle().WaitIdle());
+        return image_paras;
+    } while (false);
+    return std::nullopt;
+}
+
+void TextureCache::evictColdQueryTexs() {
+    // Build parallel lru_tick + persist views over m_query_texs so the
+    // selection helper stays pure (testable without a live VkDevice).
+    std::vector<uint64_t> ticks;
+    std::vector<uint8_t>  persist_flags;
+    std::vector<uint64_t> last_gens;
+    ticks.reserve(m_query_texs.size());
+    persist_flags.reserve(m_query_texs.size());
+    last_gens.reserve(m_query_texs.size());
+    for (const auto& q : m_query_texs) {
+        ticks.push_back(q->lru_tick);
+        persist_flags.push_back(q->persist ? 1u : 0u);
+        last_gens.push_back(q->last_gen);
+    }
+    // Current-generation entries are live render targets in this scene (still
+    // bound to a pass framebuffer); evicting one destroys an image still
+    // referenced by CustomShaderPass::execute -> use-after-free.  Protect them
+    // regardless of the soft cap; only prior-scene entries are reclaimable.
+    const std::vector<std::uint8_t> persists =
+        detail::effectiveEvictionPersist(persist_flags, last_gens, m_query_generation);
+    const std::vector<std::size_t> victims =
+        detail::selectEvictionVictims(ticks, persists, m_query_soft_cap);
+    if (victims.empty()) return;
+    // Defensive: drain in-flight frames so no submitted command buffer is
+    // still referencing the evicted images.  Mirrors the WaitIdle invariant
+    // around Clear() (which destroys the entire pool).  Called once per
+    // eviction batch — eviction is rare (only above cap), so the cost
+    // amortises.
+    m_device.handle().WaitIdle();
+    detail::eraseEvictedSlots(m_query_texs, m_query_map, victims);
+    LOG_INFO("TextureCache: evicted %zu cold query-tex entries (cap=%u, size=%zu)",
+             victims.size(),
+             m_query_soft_cap,
+             m_query_texs.size());
+}
+
+TextureCache::TextureCache(const Device& device): m_device(device) {
+    m_eager_managed = ! detail::residencyEnabledFromEnv(std::getenv("WEKDE_RT_RESIDENCY"));
+    if (m_eager_managed)
+        LOG_INFO("TextureCache: WEKDE_RT_RESIDENCY=0, render targets stay resident from load");
+    const char* env = std::getenv("WEK_TEXCACHE_QUERY_CAP");
+    if (env != nullptr && env[0] != '\0') {
+        // Sentinel-based accept/reject probe: pass two distinct defaults and
+        // check whether the parser kept either of them.  If both return the
+        // same value, the env was accepted (and that value is the parse
+        // result); otherwise the parser bailed to its default arg.  Avoids a
+        // false "rejected" log when the user explicitly passes the current
+        // default (e.g. WEK_TEXCACHE_QUERY_CAP=64).
+        const uint32_t p1 = detail::parseQueryCapEnv(env, /*default=*/0, /*min=*/8, /*max=*/4096);
+        const uint32_t p2 = detail::parseQueryCapEnv(env, /*default=*/1, /*min=*/8, /*max=*/4096);
+        if (p1 == p2) {
+            m_query_soft_cap = p1;
+            LOG_INFO("TextureCache: query-tex soft cap = %u (WEK_TEXCACHE_QUERY_CAP override)",
+                     m_query_soft_cap);
+        } else {
+            LOG_INFO("TextureCache: WEK_TEXCACHE_QUERY_CAP='%s' rejected "
+                     "(outside [8, 4096] or malformed); using default cap = %u",
+                     env,
+                     m_query_soft_cap);
+        }
+    }
+}
+
+TextureCache::~TextureCache() {};
+
+void TextureCache::Clear() {
+    DrainRetired();
+    m_tex_map.clear();
+    m_reupload_staging.clear();
+    m_reupload_fail_streak.clear();
+    m_query_texs.clear();
+    m_query_map.clear();
+    m_next_slot_id = 0;
+    // Clear the sampler cache LAST.  Samplers must be destroyed AFTER the
+    // images that reference them (or after vkDeviceWaitIdle); the m_tex_map
+    // clear above destroys the images synchronously, so this is the safe
+    // point to drop the dedup'd VkSampler handles.  If a future refactor
+    // reorders, --valid-layer flags "destroy in use" on the still-bound
+    // descriptors.
+    m_sampler_cache.clear();
+}
+
+RtSlot* TextureCache::QuerySlot(std::string_view key, TextureKey content_hash, bool persist) {
+    if (exists(m_query_map, key)) {
+        auto& query = *(m_query_map.find(key)->second);
+
+        query.share_ready = false;
+        query.persist     = persist;
+        query.lru_tick    = ++m_lru_clock;
+        query.last_gen    = m_query_generation;
+        if (! createUpFrontIfNeeded(query, persist)) return nullptr;
+        return &query;
+    };
+
+    TexHash tex_hash = TextureKey::HashValue(content_hash);
+    for (auto& query : m_query_texs) {
+        if (! (query->share_ready)) continue;
+        if (query->content_hash != tex_hash) continue;
+
+        query->share_ready = false;
+        query->persist     = persist;
+        query->query_keys.insert(std::string(key));
+        query->lru_tick = ++m_lru_clock;
+        query->last_gen = m_query_generation;
+
+        m_query_map[std::string(key)] = &(*query);
+        if (! createUpFrontIfNeeded(*query, persist)) return nullptr;
+        return query.get();
+    }
+
+    m_query_texs.emplace_back(std::make_unique<RtSlot>());
+    auto& query                   = *m_query_texs.back();
+    m_query_map[std::string(key)] = &query;
+
+    query.id           = detail::AllocateSlotId(m_next_slot_id);
+    query.key          = content_hash;
+    query.content_hash = tex_hash;
+    query.query_keys.insert(std::string(key));
+    query.persist  = persist;
+    query.lru_tick = ++m_lru_clock;
+    query.last_gen = m_query_generation;
+    if (! createUpFrontIfNeeded(query, persist)) return nullptr;
+    if (detail::queryPoolOverCap(m_query_texs.size(), m_query_soft_cap)) {
+        evictColdQueryTexs();
+    }
+    return &query;
+}
+
+bool TextureCache::createUpFrontIfNeeded(RtSlot& slot, bool persist) {
+    // A managed slot gets its image when a frame first needs it, unless the
+    // eager switch is on; a persistent slot is read from the first frame.
+    if (! (persist || m_eager_managed) || slot.image) return true;
+    auto opt = CreateTex(slot.key);
+    if (! opt.has_value()) return false;
+    detail::attachImage(slot, std::move(opt.value()));
+    return true;
+}
+
+void TextureCache::MarkShareReady(std::string_view key) {
+    if (exists(m_query_map, key)) {
+        auto& query = m_query_map.find(key)->second;
+        if (query->persist) return;
+        query->share_ready = true;
+        m_query_map.erase(key.data());
+    }
+}
+
+bool TextureCache::noteReuploadFailure(const std::string& key) {
+    return detail::shouldLogUploadFailure(m_reupload_fail_streak[key]++);
+}
+
+bool TextureCache::ReuploadTex(const std::string& key, Image& image) {
+    if (! exists(m_tex_map, key)) {
+        if (noteReuploadFailure(key))
+            LOG_ERROR("ReuploadTex: key '%s' not found in cache", key.c_str());
+        return false;
+    }
+    auto& img_slots = m_tex_map.at(key);
+    if (img_slots.slots.empty() || image.slots.empty()) {
+        if (noteReuploadFailure(key))
+            LOG_ERROR("ReuploadTex '%s': nothing to upload (%zu cached slots, %zu source slots)",
+                      key.c_str(),
+                      img_slots.slots.size(),
+                      image.slots.size());
+        return false;
+    }
+
+    if (! m_tex_cmd) allocateCmd();
+
+    // Reuse persistent per-texture staging across frames (video re-upload),
+    // recreating a slot's buffer only when its payload grows.  Avoids a
+    // ~frame-sized alloc/free every frame; the WaitIdle below keeps reuse safe.
+    auto& key_pool = m_reupload_staging[key];
+    if (key_pool.size() < img_slots.slots.size()) key_pool.resize(img_slots.slots.size());
+
+    for (usize i = 0; i < std::min(img_slots.slots.size(), image.slots.size()); i++) {
+        auto& image_paras = img_slots.slots[i];
+        auto& image_slot  = image.slots[i];
+        if (image_slot.mipmaps.empty()) continue;
+
+        const usize             mip_count  = image_slot.mipmaps.size();
+        auto&                   stage_bufs = key_pool[i];
+        std::vector<VkExtent3D> extents;
+        if (stage_bufs.size() < mip_count) stage_bufs.resize(mip_count);
+
+        for (usize j = 0; j < mip_count; j++) {
+            auto& image_data = image_slot.mipmaps[j];
+            if (! detail::mipHasPayload((long long)image_data.size, image_data.data.get())) {
+                if (noteReuploadFailure(key))
+                    LOG_ERROR("ReuploadTex '%s': slot %zu mip %zu has no pixel data (%zu bytes)",
+                              key.c_str(),
+                              i,
+                              j,
+                              (usize)image_data.size);
+                return false;
+            }
+            auto&      buf     = stage_bufs[j];
+            VkResult   map_res = VK_SUCCESS;
+            const auto mapped  = detail::acquireMappedStaging(
+                stagingBufferReusable(
+                    static_cast<bool>(buf.handle), buf.req_size, image_data.size),
+                [&] {
+                    // Only adopt the new buffer once it exists, so a transient
+                    // OOM leaves last frame's buffer in place to retry with.
+                    VmaBufferParameters newbuf;
+                    if (! CreateStagingBuffer(
+                            m_device.vma_allocator(), (u32)image_data.size, newbuf))
+                        return false;
+                    buf = std::move(newbuf);
+                    return true;
+                },
+                [&](void** out) {
+                    map_res = buf.handle.MapMemory(out);
+                    return map_res == VK_SUCCESS;
+                });
+            // Skipping just this mip would desync stage_bufs from extents and
+            // upload the wrong level, so drop the whole re-upload; the caller
+            // keeps showing the last frame that did land.
+            if (mapped.status == detail::StagingMapStatus::CreateFailed) {
+                if (noteReuploadFailure(key))
+                    LOG_ERROR("ReuploadTex '%s': staging alloc failed for slot %zu mip %zu "
+                              "(%zu bytes)",
+                              key.c_str(),
+                              i,
+                              j,
+                              (usize)image_data.size);
+                return false;
+            }
+            if (mapped.status != detail::StagingMapStatus::Ok) {
+                if (noteReuploadFailure(key))
+                    LOG_ERROR("ReuploadTex '%s': staging map failed for slot %zu mip %zu: %s",
+                              key.c_str(),
+                              i,
+                              j,
+                              vvk::ToString(map_res));
+                return false;
+            }
+            memcpy(mapped.data, image_data.data.get(), (u32)image_data.size);
+            buf.handle.UnMapMemory();
+            extents.push_back(VkExtent3D { (u32)image_data.width, (u32)image_data.height, 1 });
+        }
+
+        // Re-upload: transition from SHADER_READ_ONLY → TRANSFER_DST, copy, → SHADER_READ_ONLY
+        VkResult result;
+        do {
+            result = m_tex_cmd.Begin(VkCommandBufferBeginInfo {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .pNext = nullptr,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            });
+            if (result != VK_SUCCESS) break;
+
+            VkImageSubresourceRange subresourceRange {
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel   = 0,
+                .levelCount     = (uint32_t)mip_count,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            };
+            {
+                VkImageMemoryBarrier in_bar {
+                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext            = nullptr,
+                    .srcAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+                    .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .image            = *image_paras.handle,
+                    .subresourceRange = subresourceRange,
+                };
+                m_tex_cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                          VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                          VK_DEPENDENCY_BY_REGION_BIT,
+                                          in_bar);
+            }
+            VkBufferImageCopy copy {
+                .imageSubresource =
+                    VkImageSubresourceLayers {
+                        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseArrayLayer = 0,
+                        .layerCount     = 1,
+                    },
+            };
+            for (usize j = 0; j < mip_count; j++) {
+                copy.imageSubresource.mipLevel = (u32)j;
+                copy.imageExtent               = extents[j];
+                m_tex_cmd.CopyBufferToImage(*stage_bufs[j].handle,
+                                            *image_paras.handle,
+                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            copy);
+            }
+            {
+                VkImageMemoryBarrier out_bar {
+                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext            = nullptr,
+                    .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+                    .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    .image            = *image_paras.handle,
+                    .subresourceRange = subresourceRange,
+                };
+                m_tex_cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                          VK_DEPENDENCY_BY_REGION_BIT,
+                                          out_bar);
+            }
+            result = m_tex_cmd.End();
+            if (result != VK_SUCCESS) break;
+
+            VkSubmitInfo sub_info {
+                .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .pNext              = nullptr,
+                .commandBufferCount = 1,
+                .pCommandBuffers    = m_tex_cmd.address(),
+            };
+            result = m_device.graphics_queue().handle.Submit(sub_info);
+        } while (false);
+
+        m_device.handle().WaitIdle();
+        if (result != VK_SUCCESS) {
+            if (noteReuploadFailure(key))
+                LOG_ERROR("ReuploadTex '%s': copy submit failed for slot %zu: %s",
+                          key.c_str(),
+                          i,
+                          vvk::ToString(result));
+            return false;
+        }
+    }
+    m_reupload_fail_streak.erase(key);
+    return true;
+}
+
+void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParameters& image) const {
+    VkImageMemoryBarrier barrier {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext               = nullptr,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = image.handle,
+        .subresourceRange =
+            VkImageSubresourceRange {
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel   = 0,
+                .levelCount     = 1,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+    };
+
+    i32 mipWidth  = (i32)image.extent.width;
+    i32 mipHeight = (i32)image.extent.height;
+
+    for (uint i = 1; i < image.mipmap_level; i++) {
+        barrier.subresourceRange.baseMipLevel = i - 1;
+        barrier.oldLayout                     = i == 1 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                       : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+        barrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_DEPENDENCY_BY_REGION_BIT,
+                            barrier);
+
+        barrier.subresourceRange.baseMipLevel = i;
+        barrier.oldLayout                     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.newLayout                     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_DEPENDENCY_BY_REGION_BIT,
+                            barrier);
+
+        VkImageBlit blit {
+            .srcSubresource =
+                VkImageSubresourceLayers {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel       = i - 1,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
+            .srcOffsets = { VkOffset3D { 0, 0, 0 }, VkOffset3D { mipWidth, mipHeight, 1 } },
+            .dstOffsets = { VkOffset3D { 0, 0, 0 },
+                            VkOffset3D { mipWidth > 1 ? mipWidth / 2 : 1,
+                                         mipHeight > 1 ? mipHeight / 2 : 1,
+                                         1 } },
+        };
+        blit.dstSubresource =
+            VkImageSubresourceLayers {
+                .aspectMask     = blit.srcSubresource.aspectMask,
+                .mipLevel       = blit.srcSubresource.mipLevel + 1,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+
+        cmd.BlitImage(image.handle,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      image.handle,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      blit,
+                      VK_FILTER_LINEAR);
+
+        barrier.subresourceRange.baseMipLevel = i - 1;
+        barrier.oldLayout                     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout                     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask                 = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask                 = VK_ACCESS_SHADER_READ_BIT;
+
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            VK_DEPENDENCY_BY_REGION_BIT,
+                            barrier);
+
+        if (mipWidth > 1) mipWidth /= 2;
+        if (mipHeight > 1) mipHeight /= 2;
+    }
+
+    barrier.subresourceRange.baseMipLevel = image.mipmap_level - 1;
+    barrier.oldLayout                     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout                     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask                 = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask                 = VK_ACCESS_SHADER_READ_BIT;
+
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        VK_DEPENDENCY_BY_REGION_BIT,
+                        barrier);
+}
+
+VkSampler TextureCache::GetOrCreateDepthSampler() {
+    if (*m_depth_sampler != VK_NULL_HANDLE) {
+        return *m_depth_sampler;
+    }
+    auto info = GenDepthSamplerInfo();
+    if (m_device.handle().CreateSampler(info, m_depth_sampler) != VK_SUCCESS) {
+        LOG_ERROR("depth sampler creation failed");
+        return VK_NULL_HANDLE;
+    }
+    return *m_depth_sampler;
+}
+
+VkSampler TextureCache::GetOrCreateSampler(const VkSamplerCreateInfo& info) {
+    // Bucket-vector lookup + samplerInfoEqual scan disambiguates collisions.
+    // findOrCreateSampler returns a reference to the bucket entry by value
+    // semantics (vvk::Sampler is move-only); we deref to a raw VkSampler.
+    bool create_failed = false;
+    auto creator       = [&](const VkSamplerCreateInfo& ci) -> vvk::Sampler {
+        vvk::Sampler s;
+        if (m_device.handle().CreateSampler(ci, s) != VK_SUCCESS) {
+            LOG_ERROR("CreateSampler failed in TextureCache::GetOrCreateSampler");
+            create_failed = true;
+        }
+        return s;
+    };
+    vvk::Sampler& entry = findOrCreateSampler(m_sampler_cache, info, creator);
+    if (create_failed && *entry == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    return *entry;
+}

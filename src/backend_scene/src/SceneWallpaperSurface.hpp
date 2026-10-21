@@ -1,0 +1,103 @@
+#pragma once
+#include "SceneWallpaper.hpp"
+
+#include <functional>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+#include <string_view>
+#include <vulkan/vulkan.h>
+#include <cstdint>
+#include <span>
+#include <cstdlib>
+
+namespace wallpaper
+{
+using ReDrawCB = std::function<void()>;
+
+struct VulkanSurfaceInfo {
+    std::function<VkResult(VkInstance, VkSurfaceKHR*)> createSurfaceOp;
+    std::vector<std::string>                           instanceExts;
+};
+
+struct RenderInitInfo {
+    bool enable_valid_layer { false };
+    bool offscreen { false };
+    bool hdr_output { false };
+    bool hdr_content { false };
+
+    // Deterministic-rendering mode (engine-side only; OFF by default so normal
+    // playback is byte-identical to before).  When on, the render-thread draw
+    // loop feeds a FIXED per-frame dt instead of the wall-clock steady_clock
+    // delta, and the thread-local particle PRNG is seeded with `rng_seed` at
+    // scene load (on the render thread that steps the emitters).  Together
+    // these make a headless capture reproducible run-to-run on one machine,
+    // which is the prerequisite for golden-image tests (spec D11 phase-1).
+    // Cross-machine FP reproducibility is explicitly out of scope (phase-2).
+    bool     deterministic { false };
+    double   fixed_dt { 1.0 / 60.0 };
+    uint32_t rng_seed { 0x9E3779B9u };
+
+    std::span<const std::uint8_t> uuid;
+    TexTiling                     offscreen_tiling { TexTiling::OPTIMAL };
+    VulkanSurfaceInfo             surface_info;
+
+    uint16_t width { 1920 };
+    uint16_t height { 1080 };
+    ReDrawCB redraw_callback;
+};
+
+// Pure dt-selection used by the render-thread draw loop.  Kept as a free
+// function (header-only, no Vulkan / SceneWallpaper dependency) so it can be
+// unit-tested in isolation: the only nondeterminism in the scene clock comes
+// from `wall_dt`, and this collapses it to a constant when the mode is on.
+//   - deterministic OFF: returns the wall-clock delta unchanged (today's path).
+//   - deterministic ON:  returns the fixed step, ignoring wall-clock entirely.
+// The caller multiplies the result by m_speed; speed is intentionally left out
+// here so the helper stays a pure function of (mode, fixed_dt, wall_dt).
+inline double SelectFrameDt(bool deterministic, double fixed_dt, double wall_dt) noexcept {
+    return deterministic ? fixed_dt : wall_dt;
+}
+
+// Pure capture-gate predicate for frame-exact screenshots.  The render-thread
+// draw loop calls this once per frame BEFORE drawing; when it returns true the
+// loop arms m_render->setScreenshotPath() so the frame about to be rendered is
+// the one read back.  Kept a pure free function (like SelectFrameDt) so the
+// off-by-one and "disabled when target < 0" semantics are unit-tested without
+// a Vulkan device.
+//   target  : requested monotonic frame index, or -1 when no capture is pending.
+//   current : the render thread's monotonic completed-frame counter (getFrameIdx).
+inline bool ShouldCaptureAtFrame(int64_t target, uint64_t current) noexcept {
+    return target >= 0 && current == static_cast<uint64_t>(target);
+}
+
+// Several captures can be armed at once (a burst around a property change).
+// Returns the path due on `current`; entries already behind `current` are
+// dropped so a capture armed late can never hang the viewer waiting for a
+// frame that has passed.
+inline std::optional<std::string>
+PopDueCapture(std::vector<std::pair<uint64_t, std::string>>& queue, uint64_t current) {
+    std::optional<std::string> due;
+    std::erase_if(queue, [&](std::pair<uint64_t, std::string>& e) {
+        if (ShouldCaptureAtFrame(static_cast<int64_t>(e.first), current)) due = std::move(e.second);
+        return e.first <= current;
+    });
+    return due;
+}
+
+// Resolve whether deterministic mode is active given the struct flag and an
+// optional `WEK_DETERMINISTIC` env-var override.  The env var is a convenience
+// for ad-hoc headless debugging (set WEK_DETERMINISTIC=1) that does not require
+// rebuilding the viewer wiring; the struct field remains the explicit,
+// testable source of truth.  Any non-empty value other than "0"/"false"
+// enables it.  Returns the OR of (struct flag, env override).
+inline bool ResolveDeterministic(bool struct_flag) noexcept {
+    if (struct_flag) return true;
+    const char* e = std::getenv("WEK_DETERMINISTIC");
+    if (e == nullptr || e[0] == '\0') return false;
+    std::string_view v { e };
+    return ! (v == "0" || v == "false" || v == "FALSE" || v == "off" || v == "OFF");
+}
+
+} // namespace wallpaper

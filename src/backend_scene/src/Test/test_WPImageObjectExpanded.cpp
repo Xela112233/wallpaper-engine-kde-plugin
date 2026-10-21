@@ -1,0 +1,954 @@
+#include <doctest.h>
+
+#include "Fs/VFS.h"
+#include "Fs/MemBinaryStream.h"
+#include "wpscene/WPImageObject.h"
+
+#include <cstdint>
+#include <memory>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using namespace wallpaper;
+using namespace wallpaper::fs;
+using namespace wallpaper::wpscene;
+
+namespace
+{
+
+class MemFs : public Fs {
+public:
+    void add(std::string path, std::string content) {
+        std::vector<uint8_t> bytes(content.begin(), content.end());
+        m_files[std::move(path)] = std::move(bytes);
+    }
+    bool Contains(std::string_view path) const override {
+        return m_files.count(std::string(path)) > 0;
+    }
+    std::shared_ptr<IBinaryStream> Open(std::string_view path) override {
+        auto it = m_files.find(std::string(path));
+        if (it == m_files.end()) return nullptr;
+        auto copy = it->second;
+        return std::make_shared<MemBinaryStream>(std::move(copy));
+    }
+    std::shared_ptr<IBinaryStreamW> OpenW(std::string_view) override { return nullptr; }
+
+private:
+    std::unordered_map<std::string, std::vector<uint8_t>> m_files;
+};
+
+std::unique_ptr<VFS> Vfs(const std::unordered_map<std::string, std::string>& files) {
+    auto vfs = std::make_unique<VFS>();
+    auto fs  = std::make_unique<MemFs>();
+    for (const auto& [path, content] : files) fs->add("/" + path, content);
+    REQUIRE(vfs->Mount("/assets", std::move(fs)));
+    return vfs;
+}
+
+constexpr const char* kFlatMat = R"({"passes": [{"shader": "flat", "blending": "translucent"}]})";
+
+} // namespace
+
+// =============================================================================
+// WPEffectCommand
+// =============================================================================
+
+TEST_SUITE("WPEffectCommand::FromJson") {
+    TEST_CASE("populates command + target + source") {
+        auto j = nlohmann::json::parse(R"({
+            "command": "copy", "target": "_rt_default", "source": "_rt_FullCompoBuffer"
+        })");
+        WPEffectCommand c;
+        REQUIRE(c.FromJson(j));
+        CHECK(c.command == "copy");
+        CHECK(c.target == "_rt_default");
+        CHECK(c.source == "_rt_FullCompoBuffer");
+    }
+}
+
+// =============================================================================
+// WPEffectFbo
+// =============================================================================
+
+TEST_SUITE("WPEffectFbo::FromJson") {
+    TEST_CASE("name + format + scale") {
+        auto j = nlohmann::json::parse(R"({
+            "name": "_rt_blur1", "format": "rgba8", "scale": 2
+        })");
+        WPEffectFbo fbo;
+        REQUIRE(fbo.FromJson(j));
+        CHECK(fbo.name == "_rt_blur1");
+        CHECK(fbo.format == "rgba8");
+        CHECK(fbo.scale == 2u);
+    }
+
+    TEST_CASE("scale=0 is auto-corrected to 1") {
+        auto j = nlohmann::json::parse(R"({"name": "x", "format": "rgba8", "scale": 0})");
+        WPEffectFbo fbo;
+        REQUIRE(fbo.FromJson(j));
+        CHECK(fbo.scale == 1u);
+    }
+}
+
+// =============================================================================
+// WPImageEffect — full effect parse with passes, fbos, commands, compose
+// =============================================================================
+
+TEST_SUITE("WPImageEffect::FromJson") {
+    TEST_CASE("simple effect with one pass and fbo parses") {
+        auto vfs = Vfs({
+            { "effects/myFx/effect.json", R"({
+                "name": "fx", "version": 1,
+                "fbos": [{"name":"_rt_a", "format":"rgba8", "scale":1}],
+                "passes": [{"material": "materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j   = nlohmann::json::parse(R"({"file":"effects/myFx/effect.json"})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        REQUIRE(e.fbos.size() == 1u);
+        CHECK(e.fbos[0].name == "_rt_a");
+        REQUIRE(e.passes.size() == 1u);
+        REQUIRE(e.materials.size() == 1u);
+        CHECK(e.materials[0].shader == "flat");
+    }
+
+    TEST_CASE("effect with command-only pass populates commands") {
+        auto vfs = Vfs({
+            { "effects/cmd/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [
+                    {"material": "materials/util/effA.json"},
+                    {"command": "copy", "target": "_rt_X", "source": "_rt_Y"}
+                ]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({"file":"effects/cmd/effect.json"})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        REQUIRE(e.passes.size() == 1u); // command is NOT a render pass
+        REQUIRE(e.commands.size() == 1u);
+        CHECK(e.commands[0].command == "copy");
+        // afterpos = passes.size() AT THE MOMENT the command was consumed (= 1).
+        CHECK(e.commands[0].afterpos == 1);
+    }
+
+    TEST_CASE("compose:true on a 2-pass effect injects _rt_FullCompoBuffer1 fbo + binds") {
+        auto vfs = Vfs({
+            { "effects/compose/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [
+                    {"material":"materials/util/effA.json", "compose": true},
+                    {"material":"materials/util/effA.json"}
+                ]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({"file":"effects/compose/effect.json"})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        // FBO injected
+        REQUIRE(e.fbos.size() >= 1u);
+        bool found_compo = false;
+        for (const auto& f : e.fbos) {
+            if (f.name == "_rt_FullCompoBuffer1") found_compo = true;
+        }
+        CHECK(found_compo);
+        // Pass 0 retargeted to compo buffer; pass 1 binds it as input.
+        CHECK(e.passes[0].target == "_rt_FullCompoBuffer1");
+        REQUIRE(! e.passes[0].bind.empty());
+        CHECK(e.passes[0].bind.back().name == "previous");
+        REQUIRE(! e.passes[1].bind.empty());
+        CHECK(e.passes[1].bind.back().name == "_rt_FullCompoBuffer1");
+    }
+
+    TEST_CASE("compose error: pass count != 2 returns false") {
+        auto vfs = Vfs({
+            { "effects/bad/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [
+                    {"material":"materials/util/effA.json", "compose": true}
+                ]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({"file":"effects/bad/effect.json"})");
+
+        WPImageEffect e;
+        CHECK_FALSE(e.FromJson(j, *vfs));
+    }
+
+    TEST_CASE("scene-side `passes` array overrides effect-file pass with Update merge") {
+        auto vfs = Vfs({
+            { "effects/over/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material":"materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        // Scene-side override adds a combo + texture slot.  WPMaterialPass::Update
+        // overlays the scene-side fields onto the parsed pass.
+        auto j = nlohmann::json::parse(R"({
+            "file":"effects/over/effect.json",
+            "passes": [{"combos": {"BLOOM": 1}}]
+        })");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        REQUIRE(e.passes.size() == 1u);
+        CHECK(e.passes[0].combos.at("BLOOM") == 1);
+    }
+
+    // Multi-pass override exercises the `passes[i++].Update(pass)` post-increment
+    // — needed to distinguish i++ from i-- (mutation would access passes[-1]).
+    TEST_CASE("scene-side `passes` array of 2 entries indexes both passes in order") {
+        auto vfs = Vfs({
+            { "effects/twoPass/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [
+                    {"material":"materials/util/effA.json"},
+                    {"material":"materials/util/effA.json"}
+                ]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "file":"effects/twoPass/effect.json",
+            "passes": [
+                {"combos": {"PASS0": 1}},
+                {"combos": {"PASS1": 2}}
+            ]
+        })");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        REQUIRE(e.passes.size() == 2u);
+        // i=0 step set PASS0 on passes[0].
+        CHECK(e.passes[0].combos.at("PASS0") == 1);
+        // i=1 step set PASS1 on passes[1].  An `i--` mutation would write to
+        // passes[-1] (UB), or never reach passes[1] — either way this CHECK
+        // distinguishes original from mutation.
+        CHECK(e.passes[1].combos.at("PASS1") == 2);
+    }
+
+    TEST_CASE("scene-side `passes` array longer than effect's is rejected") {
+        auto vfs = Vfs({
+            { "effects/over/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material":"materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "file":"effects/over/effect.json",
+            "passes": [{}, {}]
+        })");
+
+        WPImageEffect e;
+        CHECK_FALSE(e.FromJson(j, *vfs));
+    }
+
+    TEST_CASE("missing `name` in effect file is tolerated (warns + continues)") {
+        // GET_JSON_NAME_VALUE warns when the key is absent but doesn't gate the
+        // function's return value; the parser remains successful so partial data
+        // can still feed the renderer.
+        auto vfs = Vfs({
+            { "effects/noname/effect.json", R"({
+                "version": 1,
+                "passes": [{"material":"materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({"file":"effects/noname/effect.json"})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        CHECK(e.name.empty());
+    }
+
+    TEST_CASE("audio oscilloscope (2799421411) loads — no longer blacklisted") {
+        // 2799421411 was the only id in BLACKLISTED_WORKSHOP_EFFECTS, listed for
+        // a Vulkan deadlock that the renderer's sync/render-graph fixes resolved.
+        // Blacklisting forces visible=false, which the effect loader skips and
+        // *compacts* — and shader-value scripts key on the JSON effect index, so
+        // a blacklisted effect silently breaks the alpha/uniform scripts of every
+        // effect after it on the same layer (it gated the entire post-FX composite
+        // — blur/bloom/CA — in 2992803622's "Music Player").  The set is now
+        // empty; this guards against silently re-adding the oscilloscope.
+        auto vfs = Vfs({
+            { "effects/2799421411/myFx/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material":"materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "file":"effects/2799421411/myFx/effect.json",
+            "visible": true
+        })");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        CHECK(e.visible); // not blacklisted -> declared visibility is honored
+    }
+
+    TEST_CASE("user-bound visible field is preserved as raw JSON alongside the resolved bool") {
+        auto vfs = Vfs({
+            { "effects/bound/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material": "materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j   = nlohmann::json::parse(
+            R"({"file":"effects/bound/effect.json",
+                "visible": {"user": "godrays_enable", "value": true}})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        CHECK(e.visible); // parse-time-resolved default: no UserPropertiesScope active here ->
+                          // falls back to the embedded "value"
+        CHECK(e.userVisibleRawJson ==
+              nlohmann::json::parse(R"({"user":"godrays_enable","value":true})").dump());
+    }
+
+    TEST_CASE("a plain boolean visible field leaves userVisibleRawJson empty") {
+        auto vfs = Vfs({
+            { "effects/plain/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material": "materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({"file":"effects/plain/effect.json", "visible": false})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        CHECK_FALSE(e.visible);
+        CHECK(e.userVisibleRawJson.empty());
+        CHECK(e.visibleScript.empty());
+    }
+
+    TEST_CASE("a script-bound visible field captures the script string alongside the resolved "
+              "bool") {
+        auto vfs = Vfs({
+            { "effects/scripted/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material": "materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j   = nlohmann::json::parse(
+            R"({"file":"effects/scripted/effect.json",
+                "visible": {"script": "export function mediaThumbnailChanged(e){}",
+                            "value": true}})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        CHECK(e.visible); // resolved from the embedded "value", same as any other shape
+        CHECK(e.visibleScript == "export function mediaThumbnailChanged(e){}");
+        CHECK(e.userVisibleRawJson.empty()); // the two visible-binding shapes don't cross-populate
+    }
+
+    TEST_CASE("a user-bound visible field does not populate visibleScript") {
+        auto vfs = Vfs({
+            { "effects/bound2/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material": "materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j   = nlohmann::json::parse(
+            R"({"file":"effects/bound2/effect.json",
+                "visible": {"user": "godrays_enable", "value": true}})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        CHECK(e.visibleScript.empty());
+        CHECK_FALSE(e.userVisibleRawJson.empty()); // the user-binding path still works
+    }
+
+    TEST_CASE("scriptproperties on a visible script round-trips as JSON") {
+        auto vfs = Vfs({
+            { "effects/scriptedprops/effect.json", R"({
+                "name": "fx", "version": 1,
+                "passes": [{"material": "materials/util/effA.json"}]
+            })" },
+            { "materials/util/effA.json", kFlatMat },
+        });
+        auto j   = nlohmann::json::parse(
+            R"({"file":"effects/scriptedprops/effect.json",
+                "visible": {"script": "export function mediaThumbnailChanged(e){}",
+                            "value": true,
+                            "scriptproperties": {"speed": {"value": 2}}}})");
+
+        WPImageEffect e;
+        REQUIRE(e.FromJson(j, *vfs));
+        CHECK(e.visibleScriptProperties ==
+              nlohmann::json::parse(R"({"speed":{"value":2}})").dump());
+    }
+}
+
+// =============================================================================
+// WPImageObject — shape-quad branch
+// =============================================================================
+
+TEST_SUITE("WPImageObject::FromJson — shape-quad") {
+    TEST_CASE("basic shape:quad object with no image parses") {
+        auto vfs = Vfs({});
+        auto j   = nlohmann::json::parse(R"({
+            "id": 99, "name": "quad",
+            "shape": "quad",
+            "origin": "10 20 0", "scale":"1 1 1", "angles":"0 0 0",
+            "size":  "200 100"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.id == 99);
+        CHECK(obj.name == "quad");
+        CHECK(obj.size[0] == doctest::Approx(200.0f));
+        CHECK(obj.size[1] == doctest::Approx(100.0f));
+        CHECK(obj.material.shader == "genericimage2");
+    }
+
+    TEST_CASE("unsupported shape type rejected") {
+        auto vfs = Vfs({});
+        auto j   = nlohmann::json::parse(R"({
+            "shape": "circle",
+            "origin": "0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10"
+        })");
+        WPImageObject obj;
+        CHECK_FALSE(obj.FromJson(j, *vfs));
+    }
+
+    TEST_CASE("config.passthrough is captured on shape-quad") {
+        auto vfs = Vfs({});
+        auto j   = nlohmann::json::parse(R"({
+            "shape": "quad",
+            "origin": "0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"100 100",
+            "config": {"passthrough": true}
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.config.passthrough);
+    }
+}
+
+// =============================================================================
+// WPImageObject — image-backed branch (full optional surface)
+// =============================================================================
+
+TEST_SUITE("WPImageObject::FromJson — image-backed") {
+    TEST_CASE("autosize:true (model) populates flag and leaves size at default") {
+        auto vfs = Vfs({
+            { "models/auto.json", R"({
+                "material":"materials/util/m.json", "autosize": true
+            })" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"a", "image":"models/auto.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.autosize);
+    }
+
+    TEST_CASE("model 'width'/'height' wins over scene 'size' and clears autosize") {
+        auto vfs = Vfs({
+            { "models/sized.json", R"({
+                "material":"materials/util/m.json",
+                "width": 512, "height": 256, "autosize": true
+            })" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/sized.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0",
+            "size":"100 100"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.size[0] == doctest::Approx(512.0f));
+        CHECK(obj.size[1] == doctest::Approx(256.0f));
+        CHECK_FALSE(obj.autosize); // explicit dimensions win
+    }
+
+    TEST_CASE("scene 'size' wins when model has no width and no autosize") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0",
+            "size":"333 444"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.size[0] == doctest::Approx(333.0f));
+        CHECK(obj.size[1] == doctest::Approx(444.0f));
+        CHECK_FALSE(obj.autosize);
+    }
+
+    TEST_CASE("absent size + non-autosize falls back to origin*2") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"5 7 0", "scale":"1 1 1", "angles":"0 0 0"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.size[0] == doctest::Approx(10.0f));
+        CHECK(obj.size[1] == doctest::Approx(14.0f));
+    }
+
+    TEST_CASE("fullscreen:true skips origin/size parsing") {
+        auto vfs = Vfs({
+            { "models/x.json",
+              R"({"material":"materials/util/m.json", "fullscreen": true})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.fullscreen);
+    }
+
+    TEST_CASE("nopadding flag from model JSON") {
+        auto vfs = Vfs({
+            { "models/x.json",
+              R"({"material":"materials/util/m.json", "nopadding": true})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.nopadding);
+    }
+
+    TEST_CASE("parent_id, alignment, attachment, perspective, parallaxDepth") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0",
+            "size":"10 10",
+            "parent": 5,
+            "alignment": "topleft",
+            "attachment": "head",
+            "perspective": true,
+            "parallaxDepth": "0.5 1.0"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.parent_id == 5);
+        CHECK(obj.alignment == "topleft");
+        CHECK(obj.attachment == "head");
+        CHECK(obj.perspective);
+        CHECK(obj.parallaxDepth[0] == doctest::Approx(0.5f));
+        CHECK(obj.parallaxDepth[1] == doctest::Approx(1.0f));
+    }
+
+    TEST_CASE("color script object captures script + scriptproperties + initial value") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "color": {
+                "script": "return [1,0,0];",
+                "scriptproperties": { "k": 1 },
+                "value": "0.5 0.6 0.7"
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.colorScript == "return [1,0,0];");
+        CHECK(obj.colorScriptProperties.find("\"k\":1") != std::string::npos);
+        CHECK(obj.color[0] == doctest::Approx(0.5f));
+        CHECK(obj.color[2] == doctest::Approx(0.7f));
+    }
+
+    TEST_CASE("alpha animation block populates propertyAnimations") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "alpha": {
+                "value": 0.5,
+                "animation": {
+                    "c0": [
+                        {"frame": 0,  "value": 0.0},
+                        {"frame": 60, "value": 1.0}
+                    ],
+                    "options": { "name": "fade", "fps": 30, "length": 90, "mode": "loop" }
+                }
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        REQUIRE(obj.propertyAnimations.size() == 1u);
+        const auto& a = obj.propertyAnimations[0];
+        CHECK(a.property == "alpha");
+        CHECK(a.name == "fade");
+        CHECK(a.fps == doctest::Approx(30.0f));
+        CHECK(a.length == doctest::Approx(90.0f));
+        CHECK(a.initialValue == doctest::Approx(0.5f));
+        REQUIRE(a.keyframes.size() == 2u);
+        CHECK(a.keyframes[1].value == doctest::Approx(1.0f));
+    }
+
+    // A layer alpha animation that closes its own loop: WE writes
+    // options.wraploop alongside fps/length/mode, and the curve uses it to
+    // ride the last keyframe back to the first instead of holding the last
+    // value and snapping at the period boundary.  The flag has to survive
+    // the scalar parser to reach the evaluator.
+    TEST_CASE("alpha animation carries options.wraploop through to the curve") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 11055, "name":"heat", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "alpha": {
+                "value": 0.37,
+                "animation": {
+                    "c0": [
+                        {"frame": 0,  "value": 0.37},
+                        {"frame": 30, "value": 1.0}
+                    ],
+                    "options": { "name": "breathe", "fps": 30, "length": 60,
+                                 "mode": "loop", "wraploop": true }
+                }
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        REQUIRE(obj.propertyAnimations.size() == 1u);
+        const auto& a = obj.propertyAnimations[0];
+        CHECK(a.wraploop);
+        // Halfway down the tail segment (frame 45 = 1.5 s) the alpha sits
+        // midway between the last keyframe and the first, not pinned at 1.0.
+        CHECK(EvaluatePropertyAnimation(a, 1.5) == doctest::Approx(0.685f));
+    }
+
+    // Rella whale (3363252053 id=173) origin animation: per-axis keyframe
+    // tracks (c0/c1/c2) on a wrapped {value, animation, relative} object.
+    // Until this parser landed, GET_JSON_NAME_VALUE pulled the `value`
+    // string into origin[] and dropped the keyframes — the fish school sat
+    // static instead of swimming.
+    TEST_CASE("origin animation block emits three component anims with base") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 173, "name":"x", "image":"models/x.json",
+            "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "origin": {
+                "value": "2032.50073 2182.06079 0.00000",
+                "animation": {
+                    "c0": [
+                        {"frame": 0,  "value": -5.2279},
+                        {"frame": 60, "value": -2.9997499}
+                    ],
+                    "c1": [
+                        {"frame": 0,  "value": 5.5241699},
+                        {"frame": 60, "value": -65.994881}
+                    ],
+                    "c2": [
+                        {"frame": 0,  "value": 0},
+                        {"frame": 60, "value": 0}
+                    ],
+                    "options": { "fps": 30, "length": 120, "mode": "loop", "wraploop": true },
+                    "relative": true
+                }
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        // The static base still lands in origin[] from the `value` string.
+        CHECK(obj.origin[0] == doctest::Approx(2032.50073f));
+        CHECK(obj.origin[1] == doctest::Approx(2182.06079f));
+        CHECK(obj.origin[2] == doctest::Approx(0.0f));
+        REQUIRE(obj.propertyAnimations.size() == 3u);
+        const auto& x = obj.propertyAnimations[0];
+        const auto& y = obj.propertyAnimations[1];
+        const auto& z = obj.propertyAnimations[2];
+        CHECK(x.property == "origin.x");
+        CHECK(y.property == "origin.y");
+        CHECK(z.property == "origin.z");
+        // Per-axis initialValue carries the base so relative deltas can
+        // compose onto it at tick time.
+        CHECK(x.initialValue == doctest::Approx(2032.50073f));
+        CHECK(y.initialValue == doctest::Approx(2182.06079f));
+        CHECK(z.initialValue == doctest::Approx(0.0f));
+        CHECK(x.relative);
+        CHECK(y.relative);
+        CHECK(z.relative);
+        CHECK(x.fps == doctest::Approx(30.0f));
+        CHECK(x.length == doctest::Approx(120.0f));
+        CHECK(x.mode == PropertyAnimMode::Loop);
+        // Rella's keyframes wrap smoothly back to the first via wraploop:true.
+        CHECK(x.wraploop);
+        CHECK(y.wraploop);
+        CHECK(z.wraploop);
+        REQUIRE(x.keyframes.size() == 2u);
+        REQUIRE(y.keyframes.size() == 2u);
+        CHECK(x.keyframes[1].value == doctest::Approx(-2.9997499f));
+        CHECK(y.keyframes[1].value == doctest::Approx(-65.994881f));
+    }
+
+    TEST_CASE("absolute (non-relative) origin animation parses with relative=false") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "origin": {
+                "value": "100 200 0",
+                "animation": {
+                    "c0": [{"frame":0,"value":100},{"frame":30,"value":500}],
+                    "options": {"fps": 30, "length": 60, "mode": "loop"}
+                }
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        REQUIRE(obj.propertyAnimations.size() == 1u);
+        CHECK_FALSE(obj.propertyAnimations[0].relative);
+        CHECK(obj.propertyAnimations[0].property == "origin.x");
+        CHECK(obj.propertyAnimations[0].initialValue == doctest::Approx(100.0f));
+    }
+
+    TEST_CASE("scale and angles also accept multi-channel animations") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "size":"10 10",
+            "scale": {
+                "value": "1 1 1",
+                "animation": {
+                    "c0": [{"frame":0,"value":1},{"frame":30,"value":2}],
+                    "c1": [{"frame":0,"value":1},{"frame":30,"value":3}],
+                    "options": {"fps": 30, "length": 30, "mode": "loop"}
+                }
+            },
+            "angles": {
+                "value": "0 0 0",
+                "animation": {
+                    "c2": [{"frame":0,"value":0},{"frame":30,"value":1.5707}],
+                    "options": {"fps": 30, "length": 30, "mode": "loop"},
+                    "relative": false
+                }
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        // scale.x, scale.y, angles.z
+        REQUIRE(obj.propertyAnimations.size() == 3u);
+        CHECK(obj.propertyAnimations[0].property == "scale.x");
+        CHECK(obj.propertyAnimations[1].property == "scale.y");
+        CHECK(obj.propertyAnimations[2].property == "angles.z");
+        // Channels without c-track aren't emitted.
+        for (const auto& a : obj.propertyAnimations) {
+            CHECK(a.property != "scale.z");
+        }
+    }
+
+    TEST_CASE("animation block without name uses property name as fallback") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "alpha": {
+                "value": 1.0,
+                "animation": {
+                    "c0": [{"frame":0,"value":0}]
+                }
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        REQUIRE(obj.propertyAnimations.size() == 1u);
+        CHECK(obj.propertyAnimations[0].name == "alpha");
+    }
+
+    TEST_CASE("missing material in model JSON is rejected") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"width":100,"height":100})" }, // no material
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0"
+        })");
+        WPImageObject obj;
+        CHECK_FALSE(obj.FromJson(j, *vfs));
+    }
+
+    TEST_CASE("missing image file in VFS is rejected") {
+        auto vfs = Vfs({});
+        auto j   = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/missing.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0"
+        })");
+        WPImageObject obj;
+        CHECK_FALSE(obj.FromJson(j, *vfs));
+    }
+
+    TEST_CASE("animationlayers populate puppet_layers") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json", "puppet": "x.puppet"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "animationlayers": [
+                {"animation": 1, "blend": 1.0, "rate": 1.0},
+                {"animation": 2, "blend": 0.5, "rate": 2.0, "visible": false}
+            ]
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        REQUIRE(obj.puppet_layers.size() == 2u);
+        CHECK(obj.puppet_layers[0].id == 1);
+        CHECK(obj.puppet_layers[1].rate == doctest::Approx(2.0f));
+        CHECK(obj.puppet_layers[1].visible == false);
+    }
+
+    TEST_CASE("config.passthrough on image-backed object") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "config": {"passthrough": true}
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.config.passthrough);
+    }
+
+    TEST_CASE("visibleIsComboSelector flips when visible is a combo-condition object") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "visible": {"user": {"condition": "1==1", "name": "char_a"}}
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.visibleIsComboSelector);
+    }
+
+    // App-launcher icons (24 of them in workshop 3616389236) all share one
+    // model file and differentiate purely through this per-object "instance"
+    // block -- it's the ONLY place each launcher's own icon is named. Before
+    // this override was parsed, every launcher rendered the model's shared
+    // default_dock_icon texture regardless of which app the user picked.
+    TEST_CASE("instance block overlays combos/textures/usertextures onto the resolved material") {
+        auto vfs = Vfs({
+            { "models/instanced.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 288, "name":"Launcher 2", "image":"models/instanced.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "instance": {
+                "id": 290,
+                "combos": {"version": 2},
+                "textures": ["default_dock_icon"],
+                "usertextures": [{"name": "launcher2", "type": "usershortcut"}]
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.material.combos.at("version") == 2);
+        REQUIRE(obj.material.textures.size() == 1u);
+        CHECK(obj.material.textures[0] == "default_dock_icon");
+        REQUIRE(obj.material.usertextures.size() == 1u);
+        CHECK(obj.material.usertextures[0].name == "launcher2");
+        CHECK(obj.material.usertextures[0].type == "usershortcut");
+    }
+
+    // The "scenetexture" family (Solid Color's user-picked "Custom"/"Add
+    // Texture" slots) spells its instance usertexture as a bare string, not
+    // the {name,type} object launchers use -- both shapes have to survive.
+    TEST_CASE("instance usertextures accepts the bare-string reference shape") {
+        auto vfs = Vfs({
+            { "models/instanced.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 247, "name":"Custom", "image":"models/instanced.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10",
+            "instance": {
+                "id": 248,
+                "combos": {"version": 2},
+                "textures": ["util/white"],
+                "usertextures": ["custom"]
+            }
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        REQUIRE(obj.material.usertextures.size() == 1u);
+        CHECK(obj.material.usertextures[0].name == "custom");
+        CHECK(obj.material.usertextures[0].type.empty());
+    }
+
+    TEST_CASE("no instance block leaves the resolved material untouched") {
+        auto vfs = Vfs({
+            { "models/x.json", R"({"material":"materials/util/m.json"})" },
+            { "materials/util/m.json", kFlatMat },
+        });
+        auto j = nlohmann::json::parse(R"({
+            "id": 1, "name":"x", "image":"models/x.json",
+            "origin":"0 0 0", "scale":"1 1 1", "angles":"0 0 0", "size":"10 10"
+        })");
+        WPImageObject obj;
+        REQUIRE(obj.FromJson(j, *vfs));
+        CHECK(obj.material.textures.empty());
+        CHECK(obj.material.usertextures.empty());
+        CHECK(obj.material.combos.empty());
+    }
+}

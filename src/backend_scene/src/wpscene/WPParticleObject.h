@@ -1,0 +1,264 @@
+#pragma once
+#include "WPJson.hpp"
+#include "WPMaterial.h"
+#include "WPImageObject.h"
+#include <nlohmann/json.hpp>
+#include <vector>
+#include <array>
+#include <unordered_set>
+#include "Utils/BitFlags.hpp"
+#include "Core/Literals.hpp"
+
+namespace wallpaper
+{
+namespace fs
+{
+class VFS;
+}
+namespace wpscene
+{
+
+class ParticleControlpoint {
+public:
+    enum class FlagEnum
+    {
+        link_mouse = 0, // 1
+        // this control point will follow the mouse cursor.
+        worldspace = 1, // 2
+        // the control point will always be at the same position in the world, independent from the
+        // position of the particle system.
+        follow_parent_particle = 2, // 4
+        // (empirical — see memory/cp-parent-chain.md for the audit) this CP tracks the
+        // spawner-parent's *live* particle position each frame.  Observed in NieR 2B
+        // thunderbolt_child_spawner and dripping_water_droplets; always co-occurs with
+        // parentcontrolpoint!=0, which provides the static fallback when no parent particle
+        // is bound.
+    };
+    using EFlags = BitFlags<FlagEnum>;
+
+    bool                 FromJson(const nlohmann::json&);
+    EFlags               flags { 0 };
+    i32                  id { -1 };
+    std::array<float, 3> offset { 0, 0, 0 };
+    // a static offset relative to the position of the particle system.
+    bool offset_is_null { false };
+    // True when JSON had `offset: null` (WE editor emits this for unassigned CP slots).
+    // Distinct from an explicit `offset: "0 0 0"`.  Consumed by LoadControlPoint →
+    // runtime `ParticleControlpoint::is_null_offset` for the bounded-pos fallback.
+    i32 parentcontrolpoint { 0 };
+    // Chain index into the parent subsystem's controlpoints array.  0 = no link (self); >0
+    // pulls the resolved offset from parent->controlpoints[N] each frame.  Validated by
+    // dripping_water_refract/splash (flags=0 chaining), droplets (flags=4 chaining), and
+    // NieR 2B thunderbolt_child_spawner (flags=4 + chain fallback).
+};
+
+class ParticleRender {
+public:
+    bool        FromJson(const nlohmann::json&);
+    std::string name;
+    float       length { 0.05f };
+    float       maxlength { 10.0f };
+    float       subdivision { 3.0f };
+};
+
+class Initializer {
+public:
+    bool                 FromJson(const nlohmann::json&);
+    std::array<float, 3> max { 0, 0, 0 };
+    std::array<float, 3> min { 0, 0, 0 };
+    std::string          name;
+};
+
+class Emitter {
+public:
+    enum class FlagEnum : uint32_t
+    {
+        one_per_frame = 1,
+    };
+    using EFlags = BitFlags<FlagEnum>;
+
+public:
+    bool                   FromJson(const nlohmann::json&);
+    std::array<float, 3>   directions { 1.0f, 1.0f, 0.0f };
+    std::array<float, 3>   distancemax { 256.0f, 256.0f, 256.0f };
+    std::array<float, 3>   distancemin { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3>   origin { 0, 0, 0 };
+    std::array<int32_t, 3> sign { 0, 0, 0 };
+    u32                    instantaneous { 0 };
+    float                  speedmin { 0 };
+    float                  speedmax { 0 };
+    u32                    audioprocessingmode { 0 };
+    // Optional WE-shape audio response keys.  When any are present in the JSON,
+    // `audio_we_shape_authored` flips on and the runtime switches from the
+    // legacy 0.4..2.0 bass curve to WE's
+    //   smoothstep(bounds, mean(spectrum[freqStart..freqEnd))) ^ exp * amount
+    // mapping.  Values left at the defaults below recreate the legacy curve.
+    int                    audioprocessingfrequencystart { 0 };
+    int                    audioprocessingfrequencyend { 4 };
+    std::array<float, 2>   audioprocessingbounds { 0.0f, 1.0f };
+    float                  audioprocessingexponent { 1.0f };
+    float                  audioprocessing { 1.0f };
+    bool                   audio_we_shape_authored { false };
+    i32                    controlpoint { 0 };
+    i32                    id;
+    EFlags                 flags;
+    std::string            name;
+    float                  rate { 5.0f };
+
+    // Periodic emission fields
+    float minperiodicdelay { 0.0f };
+    float maxperiodicdelay { 0.0f };
+    float minperiodicduration { 0.0f };
+    float maxperiodicduration { 0.0f };
+    u32   maxtoemitperperiod { 0 };
+    float duration { 0.0f }; // Emitter lifetime limit in seconds. 0 = unlimited.
+};
+
+class ParticleChild;
+class Particle {
+public:
+    enum class FlagEnum
+    {
+        wordspace             = 0, // 1
+        spritenoframeblending = 1, // 2
+        perspective           = 2, // 4
+    };
+    using EFlags = BitFlags<FlagEnum>;
+
+public:
+    bool FromJson(const nlohmann::json&, fs::VFS&);
+
+    std::vector<Emitter>              emitters;
+    std::vector<nlohmann::json>       initializers;
+    std::vector<nlohmann::json>       operators;
+    std::vector<ParticleRender>       renderers;
+    std::vector<ParticleControlpoint> controlpoints;
+
+    WPMaterial material;
+
+    std::vector<ParticleChild> children;
+
+    std::string animationmode;
+    float       sequencemultiplier { 1.0f };
+    uint32_t    maxcount { 1 };
+    float       starttime { 0.0f };
+    EFlags      flags { 0 };
+};
+class ParticleChild {
+public:
+    bool FromJson(const nlohmann::json&, fs::VFS&);
+
+    // static
+    // eventfollow
+    // eventspawn
+    // eventdeath
+    std::string type { "static" };
+    std::string name;
+    i32         maxcount { 20 };
+
+    // flags
+    i32   controlpointstartindex { 0 };
+    float probability { 1.0f };
+
+    std::array<float, 3> angles { 0, 0, 0 };
+    std::array<float, 3> origin { 0, 0, 0 };
+    std::array<float, 3> scale { 1.0f, 1.0f, 1.0f };
+
+    Particle obj;
+};
+
+// Collect every image id a particle system's own material reads via a raw
+// `_rt_imageLayerComposite_<id>` texture string.  Particle materials go
+// through the identical LoadMaterial/ParseSpecTexName path as image and
+// text effect materials (ParseParticleObj calls LoadMaterial directly on
+// particle_obj.material), so a particle can be a reader of a sibling's
+// composite RT the same way an effect chain can.
+inline void collectParticleComposeLinkIds(const Particle& particle, int32_t self_id,
+                                          std::unordered_set<int32_t>& out) {
+    collectComposeLinkIdsFromTextures(particle.material.textures, self_id, out);
+    for (const auto& child : particle.children)
+        collectParticleComposeLinkIds(child.obj, self_id, out);
+}
+
+class ParticleInstanceoverride {
+public:
+    bool FromJosn(const nlohmann::json&);
+    bool enabled { false };
+    bool overColor { false };
+    bool overColorn { false };
+
+    float                alpha { 1.0f };
+    float                brightness { 1.0f };
+    float                count { 1.0f };
+    // All scalar overrides default to 1.0 — the multiplicative identity.  The
+    // runtime treats every override as a multiplier on the preset's per-
+    // particle init field, so an absent JSON entry (default 1.0) is a no-op.
+    // `lifetime` previously defaulted to 0.0 to short-circuit an absolute-
+    // seconds dispatch path that has since been removed; identity-default
+    // matches the runtime's behaviour and avoids a special-case sentinel.
+    float                lifetime { 1.0f };
+    float                rate { 1.0f };
+    float                speed { 1.0f };
+    float                size { 1.0f };
+    std::array<float, 3> color { 1.0f, 1.0f, 1.0f };
+    std::array<float, 3> colorn { 1.0f, 1.0f, 1.0f };
+
+    struct ControlPointOverride {
+        bool                 active { false };
+        std::array<float, 3> offset { 0, 0, 0 };
+        // Per-CP orientation override (radians, XYZ).  WE's editor exposes "Lock control
+        // point angles" (see wpdoc/ui_en-us.json), so CPs are a frame (position + rotation)
+        // at the authoring level even though the runtime CP struct has historically tracked
+        // only position.  NieR 2B's lightning/discharge (obj 113, 716, 722) sets
+        // `controlpointangle1` on CP[1]; no operator we've implemented currently consumes
+        // the angle, but we plumb it through so a consumer can read it without a parse-layer
+        // change, and so the data isn't silently dropped.
+        std::array<float, 3> angles { 0, 0, 0 };
+        bool                 anglesActive { false };
+    };
+    std::array<ControlPointOverride, 8> controlpointOverrides;
+};
+
+// instanceoverride.rate = playback-speed multiplier on the subsystem clock:
+// rate=5.0 → particleTime advances 5× faster, so emit timing, lifetime
+// decrement, and movement operators all accelerate in lockstep.  Direction
+// is uniform across renderable and spawner-only subsystems — the runtime
+// has no special-case branch for child-only emitters.  Returns 1.0 (identity)
+// when the override is absent or rate is non-positive.
+inline double OverrideTimeScale(const ParticleInstanceoverride& over) {
+    return over.enabled && over.rate > 0.0f ? (double) over.rate : 1.0;
+}
+
+class WPParticleObject {
+public:
+    bool                     FromJson(const nlohmann::json&, fs::VFS&);
+    int32_t                  id;
+    int32_t                  parent_id { -1 };
+    std::string              name;
+    std::array<float, 3>     origin { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3>     scale { 1.0f, 1.0f, 1.0f };
+    std::array<float, 3>     angles { 0.0f, 0.0f, 0.0f };
+    std::array<float, 2>     parallaxDepth { 0.0f, 0.0f };
+    bool                     visible { true };
+    // When true, the object does NOT inherit transform/visibility/alpha/tint
+    // from parent groups or nodes.  WE editor flag; no groups exist in the
+    // scenes we've encountered so the effect is currently nil, but the field
+    // is parsed for completeness and future hierarchy support.
+    bool                     disablepropagation { false };
+    std::string              particle;
+    Particle                 particleObj;
+    ParticleInstanceoverride instanceoverride;
+};
+
+inline std::unordered_set<int32_t>
+CollectParticleComposeLinkIds(const std::vector<const WPParticleObject*>& particle_objs) {
+    std::unordered_set<int32_t> out;
+    for (const WPParticleObject* p : particle_objs) {
+        if (p == nullptr) continue;
+        collectParticleComposeLinkIds(p->particleObj, p->id, out);
+    }
+    return out;
+}
+
+} // namespace wpscene
+} // namespace wallpaper

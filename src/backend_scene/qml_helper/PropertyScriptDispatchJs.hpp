@@ -1,0 +1,255 @@
+#pragma once
+
+// JavaScript source for the batched property-script dispatch loop.  Kept here
+// as a header-only constant so the scenescript_tests can evaluate the exact
+// same code path as production (no drift).
+//
+// The loop processes three partitions of `_allPropertyScripts`:
+//   [0, visEnd)   — Kind::Visible (boolean return)
+//   [visEnd, vec3End) — Kind::Vec3 (Vec3-or-scalar return; scalar broadcasts)
+//   [vec3End, N)  — Kind::Alpha   (number return)
+//
+// The scalar-broadcast branch in the Vec3 loop implements WE's documented
+// semantic: `return value.x + k` from a `scale` script is treated as uniform
+// scale applied to all three components.  Dropping the scalar (as the
+// original implementation did) meant Lucy's hover-zoom Clock scale script,
+// and every other "return modified single-axis value" script, silently
+// did nothing.
+
+namespace wek::qml_helper
+{
+
+inline constexpr const char* kPropertyScriptDispatchJs =
+    "var _allPropertyScripts = [];\n"
+    "var _scriptErrors = [];\n"
+    "var _scriptOut = [];\n"
+    "var _scriptPartVisEnd = 0;\n"
+    "var _scriptPartVec3End = 0;\n"
+    // A value only reaches the renderer when it differs from the one sent
+    // last tick.  Everything downstream is float32, so comparing the rounded
+    // floats is the exact question: would the renderer even see a different
+    // number?  Anything finer is noise it cannot represent.
+    //
+    // The obvious alternative, an absolute tolerance, cannot work here: it has
+    // to be wide enough for world-space positions in the thousands, and that
+    // same width freezes every script whose entire working range is narrower
+    // than it.  Real-Time Earth (3557068717) drives its lens-flare sprites
+    // over a scale range of 1e-5 to 1e-4, which never moved at all under a
+    // 1e-4 window; alpha fades stalled a percent short of transparent under
+    // the 1e-3 one the alpha loop used.
+    //
+    // A suppressed tick deliberately leaves the stored value alone, so a drift
+    // finer than one float step still accumulates and lands once it grows to
+    // a step.
+    "function _scriptValueMoved(nv, ov) {\n"
+    "  return Math.fround(nv) !== Math.fround(ov);\n"
+    "}\n"
+    "function _runAllPropertyScripts() {\n"
+    "  var out = _scriptOut;\n"
+    "  out.length = 0;\n"
+    "  _scriptErrors.length = 0;\n"
+    "  var scripts = _allPropertyScripts;\n"
+    "  var N = scripts.length;\n"
+    "  var ve = _scriptPartVisEnd;\n"
+    "  var xe = _scriptPartVec3End;\n"
+    "  var i, s, r;\n"
+    // The `var fn = s.fn; fn(arg)` dance is deliberate: calling `s.fn(arg)`
+    // directly would bind `this = s` inside the fn, but the original C++
+    // `updateFn.call({arg})` path bound `this = undefined`.  Extracting
+    // the function into a local first matches that semantics, and avoids
+    // polluting our entry objects if scripts do `this.foo = bar` on the
+    // side.
+    "  var fn;\n"
+    "  for (i = 0; i < ve; i++) {\n"
+    "    s = scripts[i];\n"
+    "    if (!s.valid) continue;\n"
+    "    if (s.hasLayer) thisLayer = s.proxy;\n"
+    // thisObject rebinds per attachment site.  For Object-attached scripts
+    // it equals thisLayer; for AnimationLayer-attached scripts it resolves
+    // to the specific animation-layer proxy (Lucy puppet init scripts rely
+    // on thisObject.setFrame / frameCount reaching the rig layer, not the
+    // parent image).  `s.obj` is always set when `hasLayer` is true.
+    "    if (s.obj) thisObject = s.obj;\n"
+    "    fn = s.fn;\n"
+    "    try { r = fn(s.cb); }\n"
+    "    catch (e) {\n"
+    "      _scriptErrors.push(i, String((e && e.message) || e),\n"
+    "        (e && e.lineNumber) || 0, String((e && e.stack) || ''));\n"
+    "      continue;\n"
+    "    }\n"
+    "    if (r === undefined || r === null || typeof r !== 'boolean') continue;\n"
+    "    if (r === s.cb) continue;\n"
+    "    s.cb = r;\n"
+    "    out.push(i, r ? 1 : 0, 0, 0);\n"
+    "  }\n"
+    "  for (i = ve; i < xe; i++) {\n"
+    "    s = scripts[i];\n"
+    "    if (!s.valid) continue;\n"
+    "    if (s.hasLayer) thisLayer = s.proxy;\n"
+    // thisObject rebinds per attachment site.  For Object-attached scripts
+    // it equals thisLayer; for AnimationLayer-attached scripts it resolves
+    // to the specific animation-layer proxy (Lucy puppet init scripts rely
+    // on thisObject.setFrame / frameCount reaching the rig layer, not the
+    // parent image).  `s.obj` is always set when `hasLayer` is true.
+    "    if (s.obj) thisObject = s.obj;\n"
+    "    fn = s.fn;\n"
+    "    try { r = fn(Vec3(s.cx, s.cy, s.cz)); }\n"
+    "    catch (e) {\n"
+    "      _scriptErrors.push(i, String((e && e.message) || e),\n"
+    "        (e && e.lineNumber) || 0, String((e && e.stack) || ''));\n"
+    "      continue;\n"
+    "    }\n"
+    "    if (r === undefined || r === null) continue;\n"
+    // WE semantic: returning a scalar broadcasts to all three components
+    // (used by hover-zoom style scripts that do `return value.x + k`).
+    "    if (typeof r === 'number') {\n"
+    "      if (!_scriptValueMoved(r, s.cx) && !_scriptValueMoved(r, s.cy) &&\n"
+    "          !_scriptValueMoved(r, s.cz)) continue;\n"
+    "      s.cx = r; s.cy = r; s.cz = r;\n"
+    "      out.push(i, r, r, r);\n"
+    "      continue;\n"
+    "    }\n"
+    "    if (typeof r.x !== 'number') continue;\n"
+    // Vec2 returns leave .z undefined — coerce to 0 so the C++ side doesn't
+    // see NaN on toNumber() and propagate it into updateNodeTransform.
+    // Game of Life (3453251764) Tooltip origin script returns
+    // `input.cursorWorldPosition.add(new Vec2(offX, offY))` (Vec2) every
+    // tick; without this, origin.z was NaN and the layer collapsed to
+    // world origin.
+    "    var rx = r.x, ry = (typeof r.y === 'number') ? r.y : 0,\n"
+    "        rz = (typeof r.z === 'number') ? r.z : 0;\n"
+    "    if (!_scriptValueMoved(rx, s.cx) && !_scriptValueMoved(ry, s.cy) &&\n"
+    "        !_scriptValueMoved(rz, s.cz)) continue;\n"
+    "    s.cx = rx; s.cy = ry; s.cz = rz;\n"
+    "    out.push(i, rx, ry, rz);\n"
+    "  }\n"
+    "  for (i = xe; i < N; i++) {\n"
+    "    s = scripts[i];\n"
+    "    if (!s.valid) continue;\n"
+    "    if (s.hasLayer) thisLayer = s.proxy;\n"
+    // thisObject rebinds per attachment site.  For Object-attached scripts
+    // it equals thisLayer; for AnimationLayer-attached scripts it resolves
+    // to the specific animation-layer proxy (Lucy puppet init scripts rely
+    // on thisObject.setFrame / frameCount reaching the rig layer, not the
+    // parent image).  `s.obj` is always set when `hasLayer` is true.
+    "    if (s.obj) thisObject = s.obj;\n"
+    "    fn = s.fn;\n"
+    "    try { r = fn(s.cf); }\n"
+    "    catch (e) {\n"
+    "      _scriptErrors.push(i, String((e && e.message) || e),\n"
+    "        (e && e.lineNumber) || 0, String((e && e.stack) || ''));\n"
+    "      continue;\n"
+    "    }\n"
+    "    if (r === undefined || r === null || typeof r !== 'number') continue;\n"
+    "    if (!_scriptValueMoved(r, s.cf)) continue;\n"
+    "    s.cf = r;\n"
+    "    out.push(i, r, 0, 0);\n"
+    "  }\n"
+    "  return out;\n"
+    "}\n";
+
+// Per-IIFE shadow of `createScriptProperties` — the builder used inside a
+// single script's wrapper to seed property values from scene.json's stored
+// `scriptproperties` block (and its `user:` user-property bindings).
+//
+// Exposes each defined property via a getter/setter pair rather than a
+// plain value.  Writes fire the optional `onChange` callback.  Same-value
+// writes are suppressed so mutual-exclusion patterns (Lucy Clock date
+// formats: setting one checkbox's onChange writes `false` to its siblings)
+// don't infinite-recurse.
+//
+// The `%1` placeholder is the JSON-encoded stored-props map.  Use with
+// `QString(kCreateScriptPropertiesShadowJs).arg(jsonStr)`.
+inline constexpr const char* kCreateScriptPropertiesShadowJs =
+    "var _storedProps = JSON.parse('%1');\n"
+    "function createScriptProperties() {\n"
+    "  var _values = {};\n"
+    "  var _onChange = {};\n"
+    "  var b = {};\n"
+    "  function ap(def) {\n"
+    "    if (!def) return b;\n"
+    "    var n = def.name || def.n;\n"
+    "    if (!n) return b;\n"
+    "    var initial;\n"
+    "    if (n in _storedProps) {\n"
+    "      var sp = _storedProps[n];\n"
+    // WE scene.json lets a scriptProperty bind to a user property via
+    // `user: '<name>'`.  Resolve from engine.userProperties first, fall
+    // back to the stored `value`, then the script's own default.
+    // Wallpaper 2866203962's Player Options binds `enableplayer` to
+    // user prop `ui`; without the user-resolve step the UI always faded.
+    "      if (typeof sp === 'object' && sp !== null) {\n"
+    "        if ('user' in sp && typeof engine !== 'undefined' &&\n"
+    "            engine.userProperties && sp.user in engine.userProperties) {\n"
+    "          initial = engine.userProperties[sp.user];\n"
+    "        } else if ('value' in sp) {\n"
+    "          initial = sp.value;\n"
+    "        } else {\n"
+    "          initial = def.value;\n"
+    "        }\n"
+    "      } else {\n"
+    "        initial = sp;\n"
+    "      }\n"
+    "    } else { initial = def.value; }\n"
+    // Wrap Vec3/Vec2-typed initials so scripts can call `.subtract()` /
+    // `.multiply()` etc. on `scriptProperties.X` without first re-wrapping.
+    // Driver: Summer Vibes (3293999899) ships
+    //   value = newColor.subtract(oldColor).multiply(ratio).add(oldColor);
+    // where newColor came from `addColor({value: new Vec3(...)})` but the
+    // stored override (`sp.value`) is a plain object {x,y,z} → `.subtract`
+    // throws \"is not a function\".  We can't see the `addColor` name
+    // (all `add*` methods funnel through `ap`); use def.value's runtime
+    // class as the type signal instead.
+    "    if (typeof Vec3 !== 'undefined' && def.value instanceof Vec3) {\n"
+    "      if (typeof initial === 'string') {\n"
+    "        var _pp = initial.split(/\\s+/);\n"
+    "        initial = new Vec3(parseFloat(_pp[0])||0,\n"
+    "                           parseFloat(_pp[1])||0,\n"
+    "                           parseFloat(_pp[2])||0);\n"
+    "      } else if (initial && typeof initial === 'object' &&\n"
+    "                 !(initial instanceof Vec3)) {\n"
+    "        initial = new Vec3(initial.x||0, initial.y||0, initial.z||0);\n"
+    "      }\n"
+    "    } else if (typeof Vec2 !== 'undefined' && def.value instanceof Vec2) {\n"
+    "      if (typeof initial === 'string') {\n"
+    "        var _pp2 = initial.split(/\\s+/);\n"
+    "        initial = new Vec2(parseFloat(_pp2[0])||0,\n"
+    "                           parseFloat(_pp2[1])||0);\n"
+    "      } else if (initial && typeof initial === 'object' &&\n"
+    "                 !(initial instanceof Vec2)) {\n"
+    "        initial = new Vec2(initial.x||0, initial.y||0);\n"
+    "      }\n"
+    "    }\n"
+    "    _values[n] = initial;\n"
+    "    if (def.onChange && typeof def.onChange === 'function') {\n"
+    "      _onChange[n] = def.onChange;\n"
+    "    }\n"
+    "    if (!Object.getOwnPropertyDescriptor(b, n)) {\n"
+    "      Object.defineProperty(b, n, {\n"
+    "        get: function() { return _values[n]; },\n"
+    "        set: function(v) {\n"
+    "          if (_values[n] === v) return;\n"
+    "          _values[n] = v;\n"
+    "          var h = _onChange[n];\n"
+    "          if (h) {\n"
+    "            try { h.call(b, v); }\n"
+    "            catch (e) {\n"
+    "              if (typeof console !== 'undefined' && console.log)\n"
+    "                console.log('scriptProperty onChange error on ' + n\n"
+    "                            + ': ' + (e && e.message));\n"
+    "            }\n"
+    "          }\n"
+    "        },\n"
+    "        enumerable: true, configurable: true\n"
+    "      });\n"
+    "    }\n"
+    "    return b;\n"
+    "  }\n"
+    "  b.addCheckbox=ap; b.addSlider=ap; b.addCombo=ap;\n"
+    "  b.addText=ap; b.addTextInput=ap;\n"
+    "  b.addColor=ap; b.addFile=ap; b.addDirectory=ap;\n"
+    "  b.finish=function(){return b;};\n"
+    "  return b;\n"
+    "}\n";
+
+} // namespace wek::qml_helper

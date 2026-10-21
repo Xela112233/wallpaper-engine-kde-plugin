@@ -1,0 +1,340 @@
+#include "HWVideoTextureDecoder.hpp"
+#include "Utils/Logging.h"
+
+#include <mpv/client.h>
+#include <mpv/render.h>
+#include <mpv/render_gl.h>
+
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GL/gl.h>
+#include <gbm.h>
+
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <filesystem>
+
+namespace wallpaper
+{
+
+static void* eglGetProcAddressWrapper(void*, const char* name) {
+    return (void*)eglGetProcAddress(name);
+}
+
+// Translate an EGL error code into a short English token.  The numeric codes
+// are stable across the spec; returns "EGL_UNKNOWN" for anything outside the
+// set so the log site never loses context entirely.
+static const char* eglErrorString(EGLint err) {
+    switch (err) {
+    case EGL_SUCCESS: return "EGL_SUCCESS";
+    case EGL_NOT_INITIALIZED: return "EGL_NOT_INITIALIZED";
+    case EGL_BAD_ACCESS: return "EGL_BAD_ACCESS";
+    case EGL_BAD_ALLOC: return "EGL_BAD_ALLOC";
+    case EGL_BAD_ATTRIBUTE: return "EGL_BAD_ATTRIBUTE";
+    case EGL_BAD_CONTEXT: return "EGL_BAD_CONTEXT";
+    case EGL_BAD_CONFIG: return "EGL_BAD_CONFIG";
+    case EGL_BAD_CURRENT_SURFACE: return "EGL_BAD_CURRENT_SURFACE";
+    case EGL_BAD_DISPLAY: return "EGL_BAD_DISPLAY";
+    case EGL_BAD_SURFACE: return "EGL_BAD_SURFACE";
+    case EGL_BAD_MATCH: return "EGL_BAD_MATCH";
+    case EGL_BAD_PARAMETER: return "EGL_BAD_PARAMETER";
+    case EGL_BAD_NATIVE_PIXMAP: return "EGL_BAD_NATIVE_PIXMAP";
+    case EGL_BAD_NATIVE_WINDOW: return "EGL_BAD_NATIVE_WINDOW";
+    case EGL_CONTEXT_LOST: return "EGL_CONTEXT_LOST";
+    default: return "EGL_UNKNOWN";
+    }
+}
+
+HWVideoTextureDecoder::HWVideoTextureDecoder(int width, int height)
+    : VideoTextureDecoder(width, height) {}
+
+HWVideoTextureDecoder::~HWVideoTextureDecoder() {
+    // Destroy mpv render context before EGL context
+    if (m_renderCtx) {
+        mpv_render_context_free(m_renderCtx);
+        m_renderCtx = nullptr;
+    }
+    if (m_mpv) {
+        mpv_terminate_destroy(m_mpv);
+        m_mpv = nullptr;
+    }
+    cleanupGL();
+    cleanupEGL();
+}
+
+bool HWVideoTextureDecoder::initEGL(std::string* outError) {
+    // WEK_HW_DECODE_DRI_PATH lets tests redirect the /dev/dri probe at a
+    // tempdir with fake renderD* files (regular files, not devices) so the
+    // per-node failure paths are exercisable without a real GPU.  Behaves
+    // identically to /dev/dri when unset.
+    const char*                 driEnv = std::getenv("WEK_HW_DECODE_DRI_PATH");
+    const std::filesystem::path driRoot { driEnv && driEnv[0] ? driEnv : "/dev/dri" };
+
+    std::error_code ec;
+    if (! std::filesystem::is_directory(driRoot, ec)) {
+        static const char* MSG =
+            "HWVideoTextureDecoder: no working GPU render node found (DRI path missing)";
+        LOG_ERROR("%s: %s", MSG, driRoot.c_str());
+        if (outError) *outError = "HWVideoTextureDecoder: no working GPU render node found";
+        return false;
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(driRoot)) {
+        std::string name = entry.path().filename().string();
+        if (name.find("renderD") != 0) continue;
+
+        int fd = ::open(entry.path().c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            LOG_INFO("HWVideoTextureDecoder: skipped %s: open() failed (%s)",
+                     entry.path().c_str(),
+                     std::strerror(errno));
+            continue;
+        }
+
+        struct gbm_device* gbm = gbm_create_device(fd);
+        if (! gbm) {
+            LOG_INFO("HWVideoTextureDecoder: skipped %s: gbm_create_device returned null",
+                     entry.path().c_str());
+            ::close(fd);
+            continue;
+        }
+
+        EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, nullptr);
+        if (display == EGL_NO_DISPLAY) {
+            LOG_INFO("HWVideoTextureDecoder: skipped %s: eglGetPlatformDisplay returned "
+                     "NO_DISPLAY (%s)",
+                     entry.path().c_str(),
+                     eglErrorString(eglGetError()));
+            gbm_device_destroy(gbm);
+            ::close(fd);
+            continue;
+        }
+
+        EGLint major, minor;
+        if (! eglInitialize(display, &major, &minor)) {
+            LOG_INFO("HWVideoTextureDecoder: skipped %s: eglInitialize failed (%s)",
+                     entry.path().c_str(),
+                     eglErrorString(eglGetError()));
+            gbm_device_destroy(gbm);
+            ::close(fd);
+            continue;
+        }
+
+        // Try desktop GL config
+        eglBindAPI(EGL_OPENGL_API);
+        EGLint    configAttribs[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE };
+        EGLConfig config          = nullptr;
+        EGLint    numConfigs      = 0;
+        eglChooseConfig(display, configAttribs, &config, 1, &numConfigs);
+
+        if (numConfigs == 0) {
+            LOG_INFO("HWVideoTextureDecoder: skipped %s: eglChooseConfig returned 0 configs (%s)",
+                     entry.path().c_str(),
+                     eglErrorString(eglGetError()));
+            eglTerminate(display);
+            gbm_device_destroy(gbm);
+            ::close(fd);
+            continue;
+        }
+
+        EGLint ctxAttribs[] = {
+            EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 2, EGL_NONE,
+        };
+        EGLContext ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            LOG_INFO("HWVideoTextureDecoder: skipped %s: eglCreateContext failed (%s)",
+                     entry.path().c_str(),
+                     eglErrorString(eglGetError()));
+            eglTerminate(display);
+            gbm_device_destroy(gbm);
+            ::close(fd);
+            continue;
+        }
+
+        if (! eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
+            LOG_INFO("HWVideoTextureDecoder: skipped %s: eglMakeCurrent failed (%s)",
+                     entry.path().c_str(),
+                     eglErrorString(eglGetError()));
+            eglDestroyContext(display, ctx);
+            eglTerminate(display);
+            gbm_device_destroy(gbm);
+            ::close(fd);
+            continue;
+        }
+
+        // Success!
+        m_eglDisplay = display;
+        m_eglContext = ctx;
+        m_gbmDevice  = gbm;
+        m_drmFd      = fd;
+        LOG_INFO(
+            "HWVideoTextureDecoder: EGL %d.%d on %s (GBM)", major, minor, entry.path().c_str());
+        return true;
+    }
+
+    LOG_ERROR("HWVideoTextureDecoder: no working GPU render node found");
+    if (outError) *outError = "HWVideoTextureDecoder: no working GPU render node found";
+    return false;
+}
+
+void HWVideoTextureDecoder::cleanupGL() {
+    if (m_eglDisplay && m_eglContext) {
+        eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_eglContext);
+        if (m_fbo) {
+            auto glDeleteFramebuffers =
+                (void (*)(GLsizei, const GLuint*))eglGetProcAddress("glDeleteFramebuffers");
+            if (glDeleteFramebuffers) glDeleteFramebuffers(1, &m_fbo);
+            m_fbo = 0;
+        }
+        if (m_fboTex) {
+            glDeleteTextures(1, &m_fboTex);
+            m_fboTex = 0;
+        }
+    }
+}
+
+void HWVideoTextureDecoder::cleanupEGL() {
+    if (m_eglDisplay) {
+        eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (m_eglContext) {
+            eglDestroyContext(m_eglDisplay, m_eglContext);
+            m_eglContext = nullptr;
+        }
+        eglTerminate(m_eglDisplay);
+        m_eglDisplay = nullptr;
+    }
+    if (m_gbmDevice) {
+        gbm_device_destroy(m_gbmDevice);
+        m_gbmDevice = nullptr;
+    }
+    if (m_drmFd >= 0) {
+        ::close(m_drmFd);
+        m_drmFd = -1;
+    }
+}
+
+bool HWVideoTextureDecoder::open(const std::string& path, std::string* outError) {
+    if (! initEGL(outError)) return false;
+
+    // Create GL FBO for mpv to render into
+    auto glGenFramebuffers = (void (*)(GLsizei, GLuint*))eglGetProcAddress("glGenFramebuffers");
+    auto glBindFramebuffer = (void (*)(GLenum, GLuint))eglGetProcAddress("glBindFramebuffer");
+    auto glFramebufferTexture2D = (void (*)(
+        GLenum, GLenum, GLenum, GLuint, GLint))eglGetProcAddress("glFramebufferTexture2D");
+
+    if (! glGenFramebuffers || ! glBindFramebuffer || ! glFramebufferTexture2D) {
+        static const char* MSG = "HWVideoTextureDecoder: GL framebuffer entry points unavailable "
+                                 "(eglGetProcAddress returned null) — cannot create render FBO";
+        LOG_ERROR("%s", MSG);
+        if (outError) *outError = MSG;
+        cleanupEGL();
+        return false;
+    }
+
+    glGenTextures(1, &m_fboTex);
+    glBindTexture(GL_TEXTURE_2D, m_fboTex);
+    glTexImage2D(
+        GL_TEXTURE_2D, 0, GL_RGBA8, m_width, m_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+    glGenFramebuffers(1, &m_fbo);
+    glBindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, m_fbo);
+    glFramebufferTexture2D(0x8D40, 0x8CE0 /*GL_COLOR_ATTACHMENT0*/, GL_TEXTURE_2D, m_fboTex, 0);
+
+    // Initialize mpv
+    if (! initMpv(outError)) {
+        cleanupGL();
+        cleanupEGL();
+        return false;
+    }
+
+    // Create OpenGL render context with DRM render node for VA-API
+    mpv_opengl_init_params gl_init_params {
+        eglGetProcAddressWrapper,
+        nullptr,
+    };
+    mpv_opengl_drm_params_v2 drm_params {};
+    drm_params.fd           = -1;
+    drm_params.crtc_id      = -1;
+    drm_params.connector_id = -1;
+    drm_params.render_fd    = m_drmFd; // render node for VA-API interop
+
+    mpv_render_param params[] = {
+        { MPV_RENDER_PARAM_API_TYPE, const_cast<char*>(MPV_RENDER_API_TYPE_OPENGL) },
+        { MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init_params },
+        { MPV_RENDER_PARAM_DRM_DISPLAY_V2, &drm_params },
+        { MPV_RENDER_PARAM_INVALID, nullptr },
+    };
+    if (mpv_render_context_create(&m_renderCtx, m_mpv, params) < 0) {
+        static const char* MSG = "HWVideoTextureDecoder: mpv_render_context_create (GL) failed";
+        LOG_ERROR("%s", MSG);
+        if (outError) *outError = MSG;
+        mpv_terminate_destroy(m_mpv);
+        m_mpv = nullptr;
+        cleanupGL();
+        cleanupEGL();
+        return false;
+    }
+
+    mpv_render_context_set_update_callback(m_renderCtx, onMpvRenderUpdate, this);
+
+    // Force VA-API hwdec now that GL context is available
+    mpv_set_property_string(m_mpv, "hwdec", "vaapi");
+
+    loadFile(path);
+
+    LOG_INFO("HWVideoTextureDecoder(GL): opened '%s' (%dx%d)", path.c_str(), m_width, m_height);
+    return true;
+}
+
+void HWVideoTextureDecoder::renderFrame() {
+    if (! m_renderCtx || ! m_needsRender.exchange(false)) return;
+
+    std::lock_guard<std::mutex> lock(m_renderMutex);
+
+    // Make our EGL context current (may have been unset by another thread)
+    eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_eglContext);
+
+    // Render into our FBO
+    mpv_opengl_fbo mpv_fbo {
+        .fbo             = (int)m_fbo,
+        .w               = m_width,
+        .h               = m_height,
+        .internal_format = 0, // let mpv pick, matching prior implicit zero-init
+    };
+    int              flip_y          = 0;
+    mpv_render_param render_params[] = {
+        { MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo },
+        { MPV_RENDER_PARAM_FLIP_Y, &flip_y },
+        { MPV_RENDER_PARAM_INVALID, nullptr },
+    };
+
+    if (mpv_render_context_render(m_renderCtx, render_params) < 0) return;
+
+    // Read the frame back to CPU for the Vulkan upload.  A zero-copy dma-buf
+    // import would avoid this, but nothing on the Vulkan side can consume one
+    // yet, so exporting here would only leak the descriptor and the buffer it
+    // pins.
+    {
+        int      decIdx   = m_decodeIdx.load();
+        uint8_t* buf      = m_buffers[decIdx].get();
+        auto     glBindFB = (void (*)(GLenum, GLuint))eglGetProcAddress("glBindFramebuffer");
+        if (! glBindFB) return;
+        glBindFB(0x8D40 /*GL_FRAMEBUFFER*/, m_fbo);
+        glReadPixels(0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+        // libmpv renders video frames without alpha (no source channel) so the
+        // FBO's alpha slot stays at its clear value (0).  Downstream samplers
+        // with translucent/premultiplied blending then multiply RGB by 0 and
+        // produce a fully black output.  Fill alpha to 255 so the frame is
+        // treated as opaque — the colorkey effect on top of this then computes
+        // the actual transparency from the blue-screen RGB channels.
+        fillAlpha(buf);
+        publishFrame();
+    }
+}
+
+} // namespace wallpaper

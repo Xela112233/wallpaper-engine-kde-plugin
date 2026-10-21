@@ -1,0 +1,266 @@
+#include <doctest.h>
+
+#include "wpscene/WPMaterial.h"
+#include "UserPropUseRecorder.hpp"
+#include "WPUserProperties.hpp"
+
+#include <nlohmann/json.hpp>
+
+using namespace wallpaper;
+using namespace wallpaper::wpscene;
+
+namespace
+{
+
+WPMaterial parse(const char* json) {
+    WPMaterial m;
+    REQUIRE(m.FromJson(nlohmann::json::parse(json)));
+    return m;
+}
+
+WPUserProperties propsFrom(const char* properties) {
+    WPUserProperties props;
+    REQUIRE(props.LoadFromProjectJson(std::string(R"({"general": {"properties": )") + properties +
+                                      "}}"));
+    return props;
+}
+
+} // namespace
+
+// Shipped materials bind a user property to a shader constant two ways: the
+// `usershadervalues` block, and inline in `constantshadervalues` as
+// {"user": "<prop>", "value": <default>}.  Both have to end up in
+// userShaderBindings or the property can only be applied by reparsing the scene.
+TEST_SUITE("WPMaterial user property bindings") {
+    TEST_CASE("inline constantshadervalues user reference is recorded as a binding") {
+        auto m = parse(R"({
+            "passes": [{
+                "shader": "generic4",
+                "constantshadervalues": {
+                    "color": {"user": "earthcolor", "value": "0.5 0.5 0.5"},
+                    "alpha": {"user": "cloudopacity", "value": 0.95},
+                    "brightness": 0.82
+                }
+            }]
+        })");
+
+        CHECK(m.userShaderBindings.at("color") == "earthcolor");
+        CHECK(m.userShaderBindings.at("alpha") == "cloudopacity");
+        CHECK(m.userShaderBindings.count("brightness") == 0u);
+
+        // The embedded default still lands in the material.
+        CHECK(m.constantshadervalues.at("color")[0] == doctest::Approx(0.5f));
+        CHECK(m.constantshadervalues.at("alpha")[0] == doctest::Approx(0.95f));
+    }
+
+    TEST_CASE("conditional user reference binds the named property") {
+        auto m = parse(R"({
+            "passes": [{
+                "shader": "generic4",
+                "constantshadervalues": {
+                    "color": {"user": {"name": "nightcolor", "condition": "1"},
+                              "value": "1 1 1"}
+                }
+            }]
+        })");
+
+        CHECK(m.userShaderBindings.at("color") == "nightcolor");
+    }
+
+    // The scene's per-effect passes[] override is parsed as a WPMaterialPass and
+    // layered onto the material with MergePass; the link to the property has to
+    // survive that, and an override of a constant has to drop what the base
+    // bound it to.
+    TEST_CASE("a pass override's user reference merges into the material's bindings") {
+        auto           m = parse(R"({"passes": [{"shader": "generic4"}]})");
+        WPMaterialPass p;
+        REQUIRE(p.FromJson(nlohmann::json::parse(R"({
+            "constantshadervalues": { "pulse": {"user": "myprop", "value": 1} }
+        })")));
+        CHECK(p.userShaderBindings.at("pulse") == "myprop");
+
+        m.MergePass(p);
+        CHECK(m.userShaderBindings.at("pulse") == "myprop");
+    }
+
+    TEST_CASE("one property driving two constants keeps both bindings") {
+        auto m = parse(R"({
+            "passes": [{
+                "shader": "generic4",
+                "constantshadervalues": {
+                    "fill": {"user": "dock", "value": "1 1 1"},
+                    "line": {"user": "dock", "value": "0 0 0"}
+                }
+            }]
+        })");
+        CHECK(m.userShaderBindings.at("fill") == "dock");
+        CHECK(m.userShaderBindings.at("line") == "dock");
+    }
+
+    TEST_CASE("a plain override value drops the base binding for that constant") {
+        auto           m = parse(R"({
+            "passes": [{
+                "shader": "generic4",
+                "constantshadervalues": {
+                    "pulse": {"user": "base", "value": 1},
+                    "keep": {"user": "other", "value": 1}
+                }
+            }]
+        })");
+        WPMaterialPass p;
+        REQUIRE(p.FromJson(nlohmann::json::parse(R"({"constantshadervalues": {"pulse": 0.5}})")));
+        m.MergePass(p);
+
+        CHECK(m.userShaderBindings.count("pulse") == 0u);
+        CHECK(m.userShaderBindings.at("keep") == "other");
+        CHECK(m.constantshadervalues.at("pulse")[0] == doctest::Approx(0.5f));
+    }
+
+    TEST_CASE("an override bound to another property replaces the base's property") {
+        auto           m = parse(R"({
+            "passes": [{
+                "shader": "generic4",
+                "constantshadervalues": {"pulse": {"user": "base", "value": 1}}
+            }]
+        })");
+        WPMaterialPass p;
+        REQUIRE(p.FromJson(nlohmann::json::parse(
+            R"({"constantshadervalues": {"pulse": {"user": "mine", "value": 1}}})")));
+        m.MergePass(p);
+
+        CHECK(m.userShaderBindings.size() == 1u);
+        CHECK(m.userShaderBindings.at("pulse") == "mine");
+    }
+
+    TEST_CASE("a pass layered onto a pass carries its bindings too") {
+        WPMaterialPass base;
+        REQUIRE(base.FromJson(nlohmann::json::parse(
+            R"({"constantshadervalues": {"a": {"user": "pa", "value": 1}, "b": {"user": "pb", "value": 1}}})")));
+        WPMaterialPass over;
+        REQUIRE(over.FromJson(nlohmann::json::parse(R"({"constantshadervalues": {"a": 2}})")));
+        base.Update(over);
+
+        CHECK(base.userShaderBindings.count("a") == 0u);
+        CHECK(base.userShaderBindings.at("b") == "pb");
+    }
+
+    // The live path writes the property's raw value and cannot evaluate a
+    // condition, so a conditional reference in a pass override stays out of the
+    // runtime bindings (the scene reloads instead); the material file's own
+    // pass keeps recording it.
+    TEST_CASE("a conditional user reference is bound in a material but not in a pass override") {
+        constexpr const char* kConditional =
+            R"({"constantshadervalues": {"pulse": {"user": {"name": "myprop", "condition": "1"}, "value": 1}}})";
+
+        WPMaterialPass p;
+        REQUIRE(p.FromJson(nlohmann::json::parse(kConditional)));
+        CHECK(p.userShaderBindings.count("pulse") == 0u);
+
+        auto m = parse(R"({"passes": [{"shader": "generic4", "constantshadervalues":
+            {"pulse": {"user": {"name": "myprop", "condition": "1"}, "value": 1}}}]})");
+        CHECK(m.userShaderBindings.at("pulse") == "myprop");
+    }
+
+    // A constant that got a runtime binding is updated live, so its read is not
+    // a parse-time use; one that did not (the conditional shape in a pass
+    // override) is read once and a change has to reload the scene.
+    TEST_CASE("a pass-override constant is reported as a parse-time use only when unbound") {
+        UserPropUseRecorder       rec;
+        UserPropUseRecordingScope scope(&rec);
+
+        WPMaterialPass byName;
+        REQUIRE(byName.FromJson(nlohmann::json::parse(
+            R"({"constantshadervalues": {"pulse": {"user": "named", "value": 1}}})")));
+        CHECK(rec.uses.count("named") == 0u);
+
+        WPMaterialPass conditional;
+        REQUIRE(conditional.FromJson(nlohmann::json::parse(
+            R"({"constantshadervalues": {"pulse": {"user": {"name": "cond", "condition": "1"},
+                                                    "value": 1}}})")));
+        CHECK(rec.uses.count("cond") == 1u);
+    }
+
+    TEST_CASE("a usershadervalues entry is not read through the resolver, so the loader "
+              "reports it itself") {
+        UserPropUseRecorder       rec;
+        UserPropUseRecordingScope scope(&rec);
+        auto                      m = parse(R"({"passes": [{"shader": "generic4",
+            "usershadervalues": {"tint": "g_Tint"}}]})");
+        CHECK(rec.uses.empty());
+        CHECK(m.userShaderBindings.at("g_Tint") == "tint");
+    }
+
+    // A bool property is the same 1 / 0 the live update writes to the uniform.
+    TEST_CASE("a bool property bound in a pass override resolves to 1 or 0") {
+        auto off  = propsFrom(R"({"calendar": {"type": "bool", "value": false}})");
+        auto on   = propsFrom(R"({"calendar": {"type": "bool", "value": true}})");
+        auto json = nlohmann::json::parse(
+            R"({"constantshadervalues": {"alpha": {"user": "calendar", "value": 1}}})");
+
+        {
+            UserPropertiesScope scope(&off);
+            WPMaterialPass      p;
+            REQUIRE(p.FromJson(json));
+            CHECK(p.userShaderBindings.at("alpha") == "calendar");
+            CHECK(p.constantshadervalues.at("alpha") == std::vector<float> { 0.0f });
+        }
+        {
+            UserPropertiesScope scope(&on);
+            WPMaterialPass      p;
+            REQUIRE(p.FromJson(json));
+            CHECK(p.constantshadervalues.at("alpha") == std::vector<float> { 1.0f });
+        }
+    }
+
+    TEST_CASE("a bool property in usershadervalues resolves to 1 or 0") {
+        auto                props = propsFrom(R"({"flag": {"type": "bool", "value": false}})");
+        UserPropertiesScope scope(&props);
+        auto                m = parse(R"({"passes": [{"shader": "generic4",
+            "constantshadervalues": {"alpha": 0.5}, "usershadervalues": {"flag": "alpha"}}]})");
+        CHECK(m.userShaderBindings.at("alpha") == "flag");
+        CHECK(m.constantshadervalues.at("alpha") == std::vector<float> { 0.0f });
+    }
+
+    // A read that fails must leave the constant out, so the seeded shader
+    // default is not overwritten by an empty value.
+    TEST_CASE("a constant whose value cannot be read is not stored") {
+        auto                props = propsFrom(R"({"p": {"type": "textinput", "value": {"x": 1}}})");
+        UserPropertiesScope scope(&props);
+        WPMaterialPass      pass;
+        REQUIRE(pass.FromJson(nlohmann::json::parse(
+            R"({"constantshadervalues": {"k": {"user": "p", "value": 1}, "ok": 2}})")));
+        CHECK(pass.constantshadervalues.count("k") == 0u);
+        CHECK(pass.constantAnimations.count("k") == 0u);
+        CHECK(pass.constantshadervalues.at("ok") == std::vector<float> { 2.0f });
+    }
+
+    // With a bool default the parse result is a match flag or a default-flip
+    // while the live update writes the property's own value, so those shapes
+    // must stay unbound and read as a parse-time use (a change reloads).
+    TEST_CASE("a bool-default user reference is not bound") {
+        auto                props = propsFrom(R"({"mode": {"type": "combo", "value": "2"}})");
+        UserPropertiesScope scope(&props);
+
+        auto m = parse(R"({"passes": [{"shader": "generic4", "constantshadervalues": {
+            "plain": {"user": "mode", "value": true},
+            "cond": {"user": {"name": "mode", "condition": "1"}, "value": true},
+            "num": {"user": "mode", "value": 1},
+            "numcond": {"user": {"name": "mode", "condition": "1"}, "value": 1}}}]})");
+        CHECK(m.userShaderBindings.count("plain") == 0u);
+        CHECK(m.userShaderBindings.count("cond") == 0u);
+        CHECK(m.userShaderBindings.at("num") == "mode");
+        CHECK(m.userShaderBindings.at("numcond") == "mode");
+
+        WPMaterialPass p;
+        REQUIRE(p.FromJson(nlohmann::json::parse(
+            R"({"constantshadervalues": {"plain": {"user": "mode", "value": true}}})")));
+        CHECK(p.userShaderBindings.count("plain") == 0u);
+
+        UserPropUseRecorder       rec;
+        UserPropUseRecordingScope recScope(&rec);
+        WPMaterialPass            q;
+        REQUIRE(q.FromJson(nlohmann::json::parse(
+            R"({"constantshadervalues": {"plain": {"user": "mode", "value": true}}})")));
+        CHECK(rec.uses.count("mode") == 1u);
+    }
+}

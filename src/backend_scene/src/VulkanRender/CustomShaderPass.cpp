@@ -1,0 +1,2001 @@
+#include "CustomShaderPass.hpp"
+#include "Scene/Scene.h"
+#include "Scene/SceneShader.h"
+
+#include "SpecTexs.hpp"
+#include "Vulkan/Shader.hpp"
+#include "Vulkan/TextureCacheDetail.hpp"
+#include "Utils/Logging.h"
+#include "Utils/SceneProfiler.h"
+#include "Utils/AutoDeletor.hpp"
+#include "Resource.hpp"
+#include "PassCommon.hpp"
+#include "Interface/IImageParser.h"
+#include "VulkanRender/PassCacheAlias.hpp"
+#include "VulkanRender/PassthroughShader.hpp"
+#include "VulkanRender/UniformWriteSize.hpp"
+
+#include "Core/ArrayHelper.hpp"
+
+#include <cassert>
+#include <unordered_set>
+
+using namespace wallpaper::vulkan;
+
+// Frame-level pass execution counters (reset in VulkanRender.cpp each frame)
+namespace wallpaper::vulkan
+{
+// Defined in VulkanRender.cpp; forward-declared in this namespace so the
+// per-pass RT dump extern below binds g_pass_dump_entries to
+// wallpaper::vulkan::PassDumpEntry.  A bare `struct PassDumpEntry` in the
+// file-scope method body resolves to a global-scope type instead, which
+// tripped -Wundefined-internal.
+struct PassDumpEntry;
+int g_exec_pass_counter  = 0;
+int g_exec_frame_counter = 0;
+// NOTE: the per-image depth-init tracker used to live here as a namespace-
+// scope global (g_depth_inited_frame), alongside two now-deleted DEPRECATED
+// bools that predated it.  It moved to CustomShaderPass::m_depth_inited_frame_tracker
+// -- a pointer at VulkanRender::Impl::m_depth_inited_frame, wired onto every
+// pass by compileRenderGraph -- because a global with a non-trivial destructor dies
+// via ordinary static destruction whenever the process calls exit(), with no
+// regard for whether the render thread is still mid-frame and touching it.
+// That raced for real: ASAN caught a heap-use-after-free here, freed by
+// __run_exit_handlers while drawFrameOffscreen's render-thread read was
+// still live.  m_depth_inited_frame instead dies with the Impl, which
+// ~MainHandler already guarantees only happens after the render Looper is
+// joined (see MainHandler's destructor in SceneWallpaper.cpp).  See
+// recordDepthInit() below for the per-image-handle tracking rationale
+// (scenes with mixed RT sizes, e.g. Three-Body 3509243656's 4096x2048
+// skybox + 1280x720 main + 256x256 effect pingpongs, can have several live
+// depth images in one frame; a single global bool only ever tracked the
+// first one seen, leaving the rest UNDEFINED).
+// NOTE: the global MSAA-init tracker (g_msaa_color_inited) used to live here.
+// The latch now lives on the owning VmaImageParameters as
+// initial_layout_transitioned, so it dies with the VkImage handle and a
+// driver-recycled handle for a fresh image starts un-transitioned.  See the
+// barrier-emit site below.
+// Cacheable-pass skip counters (reset each frame).  g_cache_hits counts
+// passes whose execute() returned early because the RT was already up to
+// date; g_cache_misses counts everything else.  Reported in the periodic
+// DIAG log inside drawFrame.
+int g_cache_hits      = 0;
+int g_cache_misses    = 0;
+int g_invisible_skips = 0;
+} // namespace wallpaper::vulkan
+
+CustomShaderPass::CustomShaderPass(const Desc& desc) {
+    m_desc.node                          = desc.node;
+    m_desc.textures                      = desc.textures;
+    m_desc.output                        = desc.output;
+    m_desc.out_slot                      = desc.out_slot;
+    m_desc.in_slots                      = desc.in_slots;
+    m_desc.vk_textures                   = desc.vk_textures;
+    m_in_bound.assign(m_desc.in_slots.size(), {});
+    m_desc.sprites_map                   = desc.sprites_map;
+    m_desc.camera_override               = desc.camera_override;
+    m_desc.disableDepth                  = desc.disableDepth;
+    m_desc.flipCullMode                  = desc.flipCullMode;
+    m_desc.useReflectionDepth            = desc.useReflectionDepth;
+    m_desc.needsSceneDepth               = desc.needsSceneDepth;
+    m_desc.force_clear_output            = desc.force_clear_output;
+    m_desc.hideable                      = desc.hideable;
+    m_desc.passthrough_input_tex_index_a = desc.passthrough_input_tex_index_a;
+    m_desc.passthrough_input_tex_index_b = desc.passthrough_input_tex_index_b;
+    m_desc.chain_effects                 = desc.chain_effects;
+    m_desc.chain_index                   = desc.chain_index;
+    m_desc.chain_base_image_written      = desc.chain_base_image_written;
+};
+CustomShaderPass::~CustomShaderPass() {}
+
+void CustomShaderPass::rebindImages() {
+    if (m_desc.out_slot != nullptr && BoundImageStale(m_out_bound, *m_desc.out_slot)) {
+        m_desc.vk_output = m_desc.out_slot->paramsOrAbsent();
+        m_out_bound = { m_desc.out_slot->generation, m_desc.out_slot->resident() };
+    }
+    for (usize i = 0; i < m_desc.in_slots.size() && i < m_desc.vk_textures.size(); i++) {
+        RtSlot* slot = m_desc.in_slots[i];
+        if (slot == nullptr || ! BoundImageStale(m_in_bound[i], *slot)) continue;
+        auto& dst = m_desc.vk_textures[i].slots;
+        if (auto p = slot->params(); p.has_value())
+            dst = { *p };
+        else
+            dst.clear();
+        m_in_bound[i] = { slot->generation, slot->resident() };
+    }
+}
+
+constexpr VkFormat DEPTH_FORMAT = VK_FORMAT_D32_SFLOAT;
+
+static std::shared_ptr<VmaImageParameters>
+GetOrCreateDepthImage(std::shared_ptr<void>& storage, const Device& device, VkExtent3D extent,
+                      VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
+    auto existing = std::static_pointer_cast<VmaImageParameters>(storage);
+    if (existing && existing->extent.width == extent.width &&
+        existing->extent.height == extent.height) {
+        return existing;
+    }
+
+    auto              depth = std::make_shared<VmaImageParameters>();
+    VkImageCreateInfo info {
+        .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext       = nullptr,
+        .flags       = 0,
+        .imageType   = VK_IMAGE_TYPE_2D,
+        .format      = DEPTH_FORMAT,
+        .extent      = extent,
+        .mipLevels   = 1,
+        .arrayLayers = 1,
+        .samples     = samples,
+        .tiling      = VK_IMAGE_TILING_OPTIMAL,
+        // Usage flags composed by DepthImageUsageFlags (CustomShaderPass.hpp):
+        // SAMPLED_BIT is appended iff the device advertises sampled-image
+        // support for D32_SFLOAT on optimal tiling (probed in Device::Create).
+        // When the bit is absent the attachment still allocates the same way;
+        // it just never gets sampled, and nothing resolves a substitute — a
+        // pass requesting it degrades to CustomShaderPass::prepare()'s 1x1
+        // vk_fallback_tex dummy instead.
+        .usage                 = DepthImageUsageFlags(device.d32_sampleable()),
+        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices   = nullptr,
+        .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VmaAllocationCreateInfo vma_info {};
+    vma_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    if (vvk::CreateImage(device.vma_allocator(), info, vma_info, depth->handle) != VK_SUCCESS) {
+        LOG_ERROR("depth image creation failed");
+        return nullptr;
+    }
+    depth->extent = extent;
+    VkImageViewCreateInfo view_info {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext            = nullptr,
+        .flags            = 0,
+        .image            = *depth->handle,
+        .viewType         = VK_IMAGE_VIEW_TYPE_2D,
+        .format           = DEPTH_FORMAT,
+        .components       = {},
+        .subresourceRange = { .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
+                              .baseMipLevel   = 0,
+                              .levelCount     = 1,
+                              .baseArrayLayer = 0,
+                              .layerCount     = 1 },
+    };
+    if (device.handle().CreateImageView(view_info, depth->view) != VK_SUCCESS) {
+        LOG_ERROR("depth image view creation failed");
+        return nullptr;
+    }
+    storage = depth;
+    LOG_INFO("created depth buffer %dx%d samples=%d", extent.width, extent.height, (int)samples);
+    return depth;
+}
+
+static std::shared_ptr<VmaImageParameters>
+GetOrCreateMSAAColorImage(std::shared_ptr<void>& storage, const Device& device, VkExtent3D extent,
+                          VkSampleCountFlagBits samples,
+                          VkFormat              format = VK_FORMAT_R16G16B16A16_SFLOAT) {
+    auto existing = std::static_pointer_cast<VmaImageParameters>(storage);
+    if (existing && existing->extent.width == extent.width &&
+        existing->extent.height == extent.height) {
+        return existing;
+    }
+
+    auto              msaa = std::make_shared<VmaImageParameters>();
+    VkImageCreateInfo info {
+        .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext                 = nullptr,
+        .flags                 = 0,
+        .imageType             = VK_IMAGE_TYPE_2D,
+        .format                = format,
+        .extent                = extent,
+        .mipLevels             = 1,
+        .arrayLayers           = 1,
+        .samples               = samples,
+        .tiling                = VK_IMAGE_TILING_OPTIMAL,
+        .usage                 = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices   = nullptr,
+        .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VmaAllocationCreateInfo vma_info {};
+    vma_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    if (vvk::CreateImage(device.vma_allocator(), info, vma_info, msaa->handle) != VK_SUCCESS) {
+        LOG_ERROR("MSAA color image creation failed");
+        return nullptr;
+    }
+    msaa->extent = extent;
+    VkImageViewCreateInfo view_info {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext            = nullptr,
+        .flags            = 0,
+        .image            = *msaa->handle,
+        .viewType         = VK_IMAGE_VIEW_TYPE_2D,
+        .format           = format,
+        .components       = {},
+        .subresourceRange = { .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                              .baseMipLevel   = 0,
+                              .levelCount     = 1,
+                              .baseArrayLayer = 0,
+                              .layerCount     = 1 },
+    };
+    if (device.handle().CreateImageView(view_info, msaa->view) != VK_SUCCESS) {
+        LOG_ERROR("MSAA color image view creation failed");
+        return nullptr;
+    }
+    storage = msaa;
+    LOG_INFO("created MSAA %dx color buffer %dx%d", (int)samples, extent.width, extent.height);
+    return msaa;
+}
+
+std::optional<vvk::RenderPass>
+CreateRenderPass(const vvk::Device& device, VkFormat format, VkAttachmentLoadOp loadOp,
+                 VkImageLayout finalLayout, bool hasDepth = false,
+                 VkAttachmentLoadOp    depthLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                 VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT) {
+    bool useMSAA = msaaSamples > VK_SAMPLE_COUNT_1_BIT;
+
+    // Without MSAA: [0]=color, [1]=depth
+    // With MSAA:    [0]=msaa_color, [1]=resolve, [2]=msaa_depth
+    VkAttachmentDescription attachments[3];
+    uint32_t                attachmentCount = 0;
+
+    if (useMSAA) {
+        // Attachment 0: multisampled color
+        // Always use COLOR_ATTACHMENT_OPTIMAL as initialLayout.
+        // An explicit barrier in execute() transitions new MSAA images from
+        // UNDEFINED to COLOR_ATTACHMENT_OPTIMAL before first use.
+        attachments[0] = VkAttachmentDescription {
+            .flags          = 0,
+            .format         = format,
+            .samples        = msaaSamples,
+            .loadOp         = loadOp,
+            .storeOp        = VK_ATTACHMENT_STORE_OP_STORE, // persist for next pass
+            .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout  = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+
+        // Attachment 1: resolve target (single-sample, the original RT)
+        attachments[1] = VkAttachmentDescription {
+            .flags          = 0,
+            .format         = format,
+            .samples        = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout    = finalLayout,
+        };
+        attachmentCount = 2;
+
+        if (hasDepth) {
+            attachments[2] = VkAttachmentDescription {
+                .flags          = 0,
+                .format         = DEPTH_FORMAT,
+                .samples        = msaaSamples,
+                .loadOp         = depthLoadOp,
+                .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+                .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                .initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            };
+            attachmentCount = 3;
+        }
+    } else {
+        // No MSAA: original layout
+        attachments[0] = VkAttachmentDescription {
+            .flags          = 0,
+            .format         = format,
+            .samples        = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp         = loadOp,
+            .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout    = finalLayout,
+        };
+        if (loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            attachments[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        attachmentCount = 1;
+
+        if (hasDepth) {
+            attachments[1] = VkAttachmentDescription {
+                .flags          = 0,
+                .format         = DEPTH_FORMAT,
+                .samples        = VK_SAMPLE_COUNT_1_BIT,
+                .loadOp         = depthLoadOp,
+                .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+                .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                .initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            };
+            attachmentCount = 2;
+        }
+    }
+
+    VkAttachmentReference color_ref {
+        .attachment = 0,
+        .layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+    VkAttachmentReference resolve_ref {
+        .attachment = 1,
+        .layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+    VkAttachmentReference depth_ref {
+        .attachment = useMSAA ? 2u : 1u,
+        .layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+
+    VkSubpassDescription subpass {
+        .flags                   = 0,
+        .pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .inputAttachmentCount    = 0,
+        .pInputAttachments       = nullptr,
+        .colorAttachmentCount    = 1,
+        .pColorAttachments       = &color_ref,
+        .pResolveAttachments     = useMSAA ? &resolve_ref : nullptr,
+        .pDepthStencilAttachment = hasDepth ? &depth_ref : nullptr,
+        .preserveAttachmentCount = 0,
+        .pPreserveAttachments    = nullptr,
+    };
+
+    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkAccessFlags        dstAccess =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    if (hasDepth) {
+        dstStage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dstAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
+
+    VkSubpassDependency dependency {
+        .srcSubpass      = VK_SUBPASS_EXTERNAL,
+        .dstSubpass      = 0,
+        .srcStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        .dstStageMask    = dstStage,
+        .srcAccessMask   = {},
+        .dstAccessMask   = dstAccess,
+        .dependencyFlags = 0,
+    };
+
+    VkRenderPassCreateInfo creatinfo {
+        .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .pNext           = nullptr,
+        .flags           = 0,
+        .attachmentCount = attachmentCount,
+        .pAttachments    = attachments,
+        .subpassCount    = 1,
+        .pSubpasses      = &subpass,
+        .dependencyCount = 1,
+        .pDependencies   = &dependency,
+    };
+    vvk::RenderPass pass;
+    if (auto res = device.CreateRenderPass(creatinfo, pass); res == VK_SUCCESS) {
+        return pass;
+    } else {
+        VVK_CHECK(res);
+        return std::nullopt;
+    }
+}
+
+static void UpdateUniform(StagingBuffer* buf, const StagingBufferRef& bufref,
+                          const ShaderReflected::Block& block, std::string_view name,
+                          const wallpaper::ShaderValue& value) {
+    using namespace wallpaper;
+    std::span<uint8_t> value_u8 { (uint8_t*)value.data(),
+                                  value.size() * sizeof(ShaderValue::value_type) };
+    auto               uni = block.member_map.find(name);
+    if (uni == block.member_map.end()) {
+        return;
+    }
+
+    size_t offset    = uni->second.offset;
+    auto   type_size = ResolveUniformMemberWriteSize(uni->second.size);
+    if (! type_size) {
+        // Reflection never places a real UBO member at size 0; if this ever
+        // fires something upstream is broken, but logging every frame for
+        // as long as the wallpaper runs would flood the log over one bad
+        // uniform. Log once per (pass, uniform), same idiom as
+        // CustomShaderPass::prepare()'s _csp_logged guard below.
+        thread_local std::unordered_set<const void*> loggedZeroSizeUniforms;
+        if (loggedZeroSizeUniforms.insert(&uni->second).second) {
+            LOG_ERROR("uniform '%.*s' has no reflected size, skipping write",
+                      (int)name.size(),
+                      name.data());
+        }
+        return;
+    }
+
+    // Clamp write to member size to prevent overflow into adjacent UBO members
+    // (e.g., mat4 ShaderValue written to mat3 uniform)
+    value_u8 = value_u8.subspan(0, ClampUniformWriteSize(value_u8.size(), *type_size));
+    buf->writeToBuf(bufref, value_u8, offset);
+}
+
+// prepare()/execute() record real Vulkan command buffers against a live
+// Device -- there is no host-only path through either function, so this
+// file's own coverage stays low regardless of extraction.  The decisions
+// that don't need a Device are already pulled into CustomShaderPass.hpp and
+// tested there (index/cull/load-op/depth-usage/depth-alias/scene-depth
+// selection, time-uniform detection, fallback-texture need).  UpdateUniform's
+// UBO size resolution is a separate extraction, scoped and landed elsewhere.
+void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingResources& rr) {
+    WEK_PROFILE_SCOPE("CustomShaderPass::prepare");
+    {
+        thread_local std::unordered_set<const void*> _csp_logged;
+        if (_csp_logged.insert(this).second) {
+            SceneMesh*  pm = m_desc.node ? m_desc.node->Mesh() : nullptr;
+            std::string sn =
+                (pm && pm->Material()) ? pm->Material()->customShader.shader->name : "?";
+            LOG_INFO("CSP_PREPARE: shader='%s' vertCount=%zu",
+                     sn.c_str(),
+                     pm ? (size_t)pm->VertexCount() : 0u);
+        }
+    }
+    // If the pass declares needsSceneDepth, ensure WE_SCENE_DEPTH is present
+    // in the textures list (the descriptor binding logic below handles it
+    // from there).  Used by volumetric-front and future depth-aware passes
+    // that construct their descriptor set programmatically rather than via
+    // material JSON.
+    EnsureSceneDepthTextureIfNeeded(m_desc.textures, m_desc.needsSceneDepth);
+    // "Now Playing" system textures ($mediaThumbnail / $mediaPreviousThumbnail)
+    // reupload through the same out-of-band ReuploadTex path as text and
+    // video: a pass sampling one must not get cached, or a track change
+    // lands new bytes in a VkImage this pass never samples again. Decided
+    // once over the whole list (see ReferencesMediaSystemTexture) rather than
+    // inline in the per-texture loop below, so the decision is testable
+    // without a live Device.
+    if (ReferencesMediaSystemTexture(m_desc.textures)) {
+        m_samples_mutable_texture = true;
+    }
+    m_desc.vk_textures.resize(m_desc.textures.size());
+    m_desc.in_slots.assign(m_desc.textures.size(), nullptr);
+    m_in_bound.assign(m_desc.textures.size(), {});
+    // Pre-reserve per-pass scratch capacity to the prepare-time texture count
+    // + 1 for the UBO writeset.  std::vector::reserve allocates once and never
+    // reallocates while size() <= capacity(), so execute() never hits the
+    // allocator on subsequent frames AND pImageInfo pointers into
+    // m_image_infos_scratch remain stable across push_back (which the batched
+    // PushDescriptorSetKHR(array) below depends on).
+    m_image_barriers_scratch.reserve(m_desc.vk_textures.size());
+    m_image_infos_scratch.reserve(m_desc.vk_textures.size() + 1);
+    m_descriptor_writes_scratch.reserve(m_desc.vk_textures.size() + 1);
+    for (usize i = 0; i < m_desc.textures.size(); i++) {
+        auto& tex_name = m_desc.textures[i];
+        if (tex_name.empty()) continue;
+
+        // Text layer textures (key "_text_<id>") are re-uploaded each time the
+        // script produces new text (clock tick, track title, etc.).  Like
+        // video textures, the write reuses the same VkImage handle — invisible
+        // to the render graph — so any pass that samples one must re-execute
+        // each frame or the text freezes on the first raster.  Matches the
+        // ParseTextObj key convention in WPSceneParser.cpp.
+        if (tex_name.rfind("_text_", 0) == 0) {
+            m_samples_mutable_texture = true;
+        }
+
+        ImageSlotsRef img_slots;
+        if (IsSpecTex(tex_name)) {
+            // _rt_sceneDepth is sampled directly off the live depth
+            // attachment.  The image is owned by Scene::depthBuffer (a
+            // shared_ptr<void> carrying VmaImageParameters), not registered
+            // in scene.renderTargets, so the generic tex_cache().Query path
+            // below would fail — hence the dedicated branch here instead.
+            // A device that fails Device::d32_sampleable(), or a pass
+            // running under MSAA or with useReflectionDepth set (reflections
+            // own a separate depth buffer), is ineligible: prepare() skips
+            // wiring the binding and the slot falls back to the 1x1
+            // vk_fallback_tex dummy. No resolve pass substitutes a real
+            // depth value on those devices.
+            //
+            // _rt_volumetricsSingle is the WE shader's hidden-default key for
+            // the same scene-occluder closest-z buffer (used by the volumetric
+            // ray-march as an integration ceiling); we alias it onto the same
+            // depth attachment under each of the path-A / reflection / MSAA
+            // branches below.
+            const bool is_depth_alias =
+                (tex_name == WE_SCENE_DEPTH) || (tex_name == WE_VOLUMETRICS_SINGLE);
+            if (DepthAliasPathAEligible(is_depth_alias,
+                                        device.d32_sampleable(),
+                                        scene.msaaSamples,
+                                        m_desc.useReflectionDepth)) {
+                auto depth = std::static_pointer_cast<VmaImageParameters>(scene.depthBuffer);
+                if (depth && *depth->view != VK_NULL_HANDLE) {
+                    ImageParameters img;
+                    img.handle            = *depth->handle;
+                    img.view              = *depth->view;
+                    img.mip0_view         = *depth->view;
+                    img.sampler           = device.tex_cache().GetOrCreateDepthSampler();
+                    img.extent            = depth->extent;
+                    img.mipmap_level      = 1;
+                    img_slots.slots       = { img };
+                    m_desc.vk_textures[i] = img_slots;
+                    continue; // bypass the renderTargets lookup
+                }
+                // depthBuffer not yet initialised: skip wiring this frame.
+                LOG_INFO("CSP_PREPARE: %s requested but "
+                         "scene.depthBuffer not initialised (skipping)",
+                         tex_name.c_str());
+                continue;
+            } else if (is_depth_alias && m_desc.useReflectionDepth) {
+                LOG_INFO("CSP_PREPARE: %s requested in reflection "
+                         "pass — sampled-depth path disabled",
+                         tex_name.c_str());
+                continue;
+            } else if (is_depth_alias && scene.msaaSamples > 1) {
+                LOG_INFO("CSP_PREPARE: %s requested but MSAA=%u "
+                         "active — sampled-depth path disabled in v1",
+                         tex_name.c_str(),
+                         scene.msaaSamples);
+                continue;
+            }
+            if (scene.renderTargets.count(tex_name) == 0) continue;
+            auto&   rt   = scene.renderTargets.at(tex_name);
+            RtSlot* slot = device.tex_cache().QuerySlot(tex_name, ToTexKey(rt), ! rt.allowReuse);
+            if (slot == nullptr) continue;
+            m_desc.in_slots[i] = slot;
+            if (auto p = slot->params(); p.has_value()) img_slots.slots = { *p };
+            m_in_bound[i] = { slot->generation, slot->resident() };
+        } else {
+            auto image = scene.imageParser->Parse(tex_name);
+            if (image) {
+                img_slots = device.tex_cache().CreateTex(*image);
+                // Record video textures for frame decoding. Multiple passes
+                // may sample the same MP4 (e.g. 3276911872 has 8+ layers
+                // sharing the character video).  Append every owner so the
+                // decoder runs as long as ANY sampler is visible.
+                if (image->header.isVideoTexture && ! image->header.videoFilePath.empty()) {
+                    // Video textures are re-uploaded every frame into the
+                    // same VkImage via TextureCache::ReuploadTex — that
+                    // write is invisible to the render graph's safety
+                    // analysis, so any pass that samples this texture must
+                    // re-execute each frame (can't be cached).
+                    m_samples_mutable_texture  = true;
+                    VideoTextureInfo* existing = nullptr;
+                    for (auto& vt : scene.videoTextures)
+                        if (vt.textureKey == tex_name) {
+                            existing = &vt;
+                            break;
+                        }
+                    if (existing) {
+                        if (m_desc.node) {
+                            bool dup = false;
+                            for (auto* n : existing->ownerNodes)
+                                if (n == m_desc.node) {
+                                    dup = true;
+                                    break;
+                                }
+                            if (! dup) existing->ownerNodes.push_back(m_desc.node);
+                        }
+                    } else {
+                        VideoTextureInfo vti;
+                        vti.textureKey    = tex_name;
+                        vti.videoFilePath = image->header.videoFilePath;
+                        vti.width         = image->header.width;
+                        vti.height        = image->header.height;
+                        vti.ownerNode     = m_desc.node;
+                        if (m_desc.node) vti.ownerNodes.push_back(m_desc.node);
+                        scene.videoTextures.push_back(std::move(vti));
+                        LOG_INFO("video texture registered: '%s' %dx%d ownerNode=%d path=%s",
+                                 tex_name.c_str(),
+                                 image->header.width,
+                                 image->header.height,
+                                 m_desc.node ? m_desc.node->ID() : -999,
+                                 image->header.videoFilePath.c_str());
+                    }
+                }
+            } else {
+                // Downgraded from LOG_ERROR: a missing user-bundled texture
+                // is recoverable — the 1x1 dummy fallback below makes the
+                // shader binding valid; the wallpaper renders with a 1x1
+                // fill where the texture should be.  Author-side bundling
+                // errors (Summer Vibes 3293999899 ships a `gradient/
+                // blend_gradient_copy1` reference but doesn't include the
+                // .tex file) shouldn't fail-classify the whole wallpaper.
+                LOG_INFO("parse tex \"%s\" failed (using 1x1 fallback)", tex_name.c_str());
+            }
+        }
+        m_desc.vk_textures[i] = img_slots;
+    }
+    VkFormat output_vk_format;
+    {
+        auto& tex_name = m_desc.output;
+        // Runtime guard (replaces the two Release-stripped asserts): a
+        // malformed scene can name an output RT that was never registered.
+        // The bare .at() would throw std::out_of_range onto the render worker
+        // thread (std::terminate → plasmashell death) in every shipped build,
+        // since -DNDEBUG strips the asserts.  Log + return instead.
+        auto* rtp = scene.tryGetRenderTarget(tex_name);
+        if (rtp == nullptr) {
+            LOG_ERROR("output RT '%s' missing (not a registered render target)", tex_name.c_str());
+            return;
+        }
+        auto& rt                = *rtp;
+        output_vk_format        = ToVkType(rt.format);
+        m_desc.vk_output_format = output_vk_format;
+        m_desc.out_slot = device.tex_cache().QuerySlot(tex_name, ToTexKey(rt), ! rt.allowReuse);
+        if (m_desc.out_slot == nullptr) {
+            LOG_ERROR("output RT slot missing for '%s' (shader: %s)",
+                      tex_name.c_str(),
+                      m_desc.node->Mesh()->Material()->customShader.shader->name.c_str());
+            return;
+        }
+        m_desc.vk_output = m_desc.out_slot->paramsOrAbsent();
+        m_out_bound = { m_desc.out_slot->generation, m_desc.out_slot->resident() };
+    }
+
+    SceneMesh& mesh = *(m_desc.node->Mesh());
+
+    // Detect geometry shader point topology from mesh vertex array option
+    {
+        bool has_gs_opt =
+            mesh.VertexCount() > 0 && mesh.GetVertexArray(0).GetOption(WE_CB_GEOMETRY_SHADER);
+        if (has_gs_opt) {
+            m_desc.point_topology = true;
+        }
+    }
+
+    std::vector<Uni_ShaderSpv> spvs;
+    DescriptorSetInfo          descriptor_info;
+    ShaderReflected            ref;
+    {
+        SceneShader& shader = *(mesh.Material()->customShader.shader);
+
+        if (! GenReflect(shader.codes, spvs, ref)) {
+            LOG_ERROR("gen spv reflect failed, %s", shader.name.c_str());
+            return;
+        }
+
+        // Diagnostic: log stage count and UBO details for GS pipelines
+        if (m_desc.point_topology) {
+            std::string stages_str;
+            for (auto& s : spvs) {
+                if (! stages_str.empty()) stages_str += ",";
+                stages_str += (s->stage == ShaderType::VERTEX)     ? "VTX"
+                              : (s->stage == ShaderType::GEOMETRY) ? "GS"
+                              : (s->stage == ShaderType::FRAGMENT) ? "FRAG"
+                                                                   : "?";
+            }
+            LOG_INFO("GS pipeline '%s': %zu stages [%s], %zu UBO blocks",
+                     shader.name.c_str(),
+                     spvs.size(),
+                     stages_str.c_str(),
+                     ref.blocks.size());
+            if (! ref.blocks.empty()) {
+                LOG_INFO("  UBO block: size=%zu members=%zu",
+                         (size_t)ref.blocks.front().size,
+                         ref.blocks.front().member_map.size());
+                for (auto& [name, u] : ref.blocks.front().member_map) {
+                    LOG_INFO("    %s: off=%u sz=%u", name.c_str(), u.offset, u.size);
+                }
+            }
+        }
+
+        // Check if shader uses time-based uniforms (for caching optimization)
+        if (! ref.blocks.empty()) {
+            m_uses_time_uniforms = UsesTimeUniforms(ref.blocks.front());
+        }
+
+        auto& bindings = descriptor_info.bindings;
+        bindings.resize(ref.binding_map.size());
+
+        std::transform(
+            ref.binding_map.begin(), ref.binding_map.end(), bindings.begin(), [](auto& item) {
+                return item.second;
+            });
+
+        for (usize i = 0; i < m_desc.vk_textures.size(); i++) {
+            m_desc.vk_tex_binding.push_back(MaterialTexBinding(i,
+                                                               m_desc.passthrough_input_tex_index_a,
+                                                               m_desc.passthrough_input_tex_index_b,
+                                                               ref.binding_map));
+        }
+    }
+
+    // Create a 1x1 dummy texture for any shader-declared bindings with no texture loaded.
+    {
+        bool need_fallback = NeedsFallbackTexture(m_desc.vk_tex_binding, m_desc.vk_textures);
+        if (need_fallback) {
+            static const std::string dummy_key = "_rt_dummy_1x1";
+            TextureKey               tk {
+                .width        = 1,
+                .height       = 1,
+                .usage        = {},
+                .format       = TextureFormat::RGBA8,
+                .sample       = {},
+                .mipmap_level = 1,
+            };
+            if (auto params = ResidentSlotParams(device.tex_cache().QuerySlot(dummy_key, tk, true)))
+                m_desc.vk_fallback_tex = *params;
+        }
+    }
+
+    m_desc.draw_count = 0;
+    std::vector<VkVertexInputBindingDescription>   bind_descriptions;
+    std::vector<VkVertexInputAttributeDescription> attr_descriptions;
+    {
+        m_desc.dyn_vertex = mesh.Dynamic();
+        m_desc.vertex_bufs.resize(mesh.VertexCount());
+
+        for (uint i = 0; i < mesh.VertexCount(); i++) {
+            const auto& vertex    = mesh.GetVertexArray(i);
+            auto        attrs_map = vertex.GetAttrOffsetMap();
+
+            VkVertexInputBindingDescription bind_desc {
+                .binding   = i,
+                .stride    = (uint32_t)vertex.OneSizeOf(),
+                .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+            };
+            bind_descriptions.push_back(bind_desc);
+
+            AppendVertexArrayAttributes(attr_descriptions, i, attrs_map, ref.input_location_map);
+            if (m_desc.point_topology) {
+                for (auto& [name, input] : ref.input_location_map) {
+                    const auto it = attrs_map.find(name);
+                    LOG_INFO("  GS vtx attr '%s': loc=%u fmt=%u offset=%zu found=%d",
+                             name.c_str(),
+                             input.location,
+                             (u32)input.format,
+                             it != attrs_map.end() ? it->second.offset : (usize)0,
+                             (int)(it != attrs_map.end()));
+                }
+                LOG_INFO("  GS mesh attrs (stride=%zu):", vertex.OneSizeOf());
+                for (auto& [an, ai] : attrs_map)
+                    LOG_INFO("    mesh '%s': offset=%zu", an.c_str(), ai.offset);
+            }
+            {
+                auto& buf = m_desc.vertex_bufs[i];
+                if (! m_desc.dyn_vertex) {
+                    if (! rr.vertex_buf->allocateSubRef(vertex.CapacitySizeOf(), buf)) {
+                        LOG_ERROR("vertex buf alloc failed for shader '%s' vert %u, size %zu",
+                                  mesh.Material()->customShader.shader->name.c_str(),
+                                  i,
+                                  vertex.CapacitySizeOf());
+                        return;
+                    }
+                    if (! rr.vertex_buf->writeToBuf(buf, { (uint8_t*)vertex.Data(), buf.size })) {
+                        LOG_ERROR("vertex buf write failed for shader '%s'",
+                                  mesh.Material()->customShader.shader->name.c_str());
+                        return;
+                    }
+                } else {
+                    if (! rr.dyn_buf->allocateSubRef(vertex.CapacitySizeOf(), buf)) {
+                        LOG_ERROR("dyn buf alloc failed for shader '%s'",
+                                  mesh.Material()->customShader.shader->name.c_str());
+                        return;
+                    }
+                }
+            }
+            m_desc.draw_count += (u32)(vertex.DataSize() / vertex.OneSize());
+        }
+
+        if (mesh.IndexCount() > 0) {
+            auto& indice                   = mesh.GetIndexArray(0);
+            m_desc.draw_count              = (u32)indice.DrawIndexCount();
+            m_desc.index_type              = ToVkIndexType(indice.Width());
+            const VkDeviceSize index_align = IndexAlignmentFor(m_desc.index_type);
+            auto&              buf         = m_desc.index_buf;
+            if (! m_desc.dyn_vertex) {
+                if (! rr.vertex_buf->allocateSubRef(indice.CapacitySizeof(), buf, index_align)) {
+                    LOG_ERROR("index buf alloc failed for shader '%s'",
+                              mesh.Material()->customShader.shader->name.c_str());
+                    return;
+                }
+                if (! rr.vertex_buf->writeToBuf(buf, { (uint8_t*)indice.Data(), buf.size })) {
+                    LOG_ERROR("index buf write failed for shader '%s'",
+                              mesh.Material()->customShader.shader->name.c_str());
+                    return;
+                }
+            } else {
+                if (! rr.dyn_buf->allocateSubRef(indice.CapacitySizeof(), buf, index_align)) {
+                    LOG_ERROR("dyn index buf alloc failed for shader '%s'",
+                              mesh.Material()->customShader.shader->name.c_str());
+                    return;
+                }
+            }
+        }
+    }
+    {
+        VkPipelineColorBlendAttachmentState color_blend;
+        VkAttachmentLoadOp                  loadOp { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
+        {
+            VkColorComponentFlags colorMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            color_blend.colorWriteMask      = colorMask;
+
+            auto blendmode = mesh.Material()->blenmode;
+            SetBlend(blendmode, color_blend);
+            m_desc.blending = color_blend.blendEnable;
+
+            // First pass to write an RT in the prepared graph CLEARs it on
+            // entry; subsequent writers LOAD.  Each pass's loadOp is baked in
+            // here at prepare-time and reused every frame.  Two properties
+            // depend on the CLEAR semantics being available to first writers:
+            //   1. Alpha-correctness for compose layers (without CLEAR, the
+            //      corrupted alpha captured into the pingpong on prior frames
+            //      compounds, eventually saturating to 1).
+            //   2. Premultiplication of effect-chain base materials.  The
+            //      base material renders translucent into pingpong_a; with a
+            //      cleared (0,0,0,0) destination, alpha=0 source pixels
+            //      resolve to (0,0,0,0) — bilinear at the alpha boundary then
+            //      composites correctly without leaking source RGB.  Without
+            //      this, the eye.tex on Naruto Shippuden 2800255344 (orange
+            //      RGB at alpha=0 corners) produced an orange halo around
+            //      the sun.  See test_BlendModeFactors "Blend math".
+            const bool rt_already_cleared = scene.clearedRTs.count(m_desc.output) != 0;
+            loadOp = SelectOutputLoadOp(m_desc.force_clear_output, rt_already_cleared);
+            m_desc.clears_output = (loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR);
+            LOG_INFO("CSP_PREPARE loadOp for '%.*s': %s (force=%d already_cleared=%d)",
+                     (int)m_desc.output.size(),
+                     m_desc.output.data(),
+                     loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? "LOAD" : "CLEAR",
+                     (int)m_desc.force_clear_output,
+                     (int)rt_already_cleared);
+            // Only the implicit "first-writer" path participates in the
+            // one-shot tracking; force_clear is per-emission and must not
+            // mutate clearedRTs (otherwise the next non-forced writer would
+            // see "already cleared" and pick LOAD).
+            if (! m_desc.force_clear_output && ! rt_already_cleared) {
+                scene.clearedRTs.insert(m_desc.output);
+            }
+        }
+        // MSAA: only for _rt_default (the final composited output).
+        // Effect/pingpong RTs don't benefit from MSAA and small ones can
+        // trigger RADV GFX1201 FPE in radv_get_binning_state.
+        if (m_desc.output == SpecTex_Default) {
+            m_desc.msaaSamples = (VkSampleCountFlagBits)std::min((u32)scene.msaaSamples,
+                                                                 (u32)device.maxMSAASamples());
+        } else {
+            m_desc.msaaSamples = VK_SAMPLE_COUNT_1_BIT;
+        }
+
+        // Depth buffer for 3D models
+        bool useDepth =
+            ! m_desc.disableDepth && (mesh.Material()->depthTest || mesh.Material()->depthWrite);
+        std::shared_ptr<VmaImageParameters> depthImg;
+        if (useDepth) {
+            VkExtent3D depthExtent { (u32)m_desc.out_slot->key.width,
+                                     (u32)m_desc.out_slot->key.height,
+                                     1 };
+            if (m_desc.msaaSamples > VK_SAMPLE_COUNT_1_BIT) {
+                // MSAA: depth buffer must be multisampled
+                auto& depthStorage = m_desc.useReflectionDepth ? scene.msaaReflectionDepthBuffer
+                                                               : scene.msaaDepthBuffer;
+                depthImg =
+                    GetOrCreateDepthImage(depthStorage, device, depthExtent, m_desc.msaaSamples);
+            } else {
+                auto& depthStorage =
+                    m_desc.useReflectionDepth ? scene.reflectionDepthBuffer : scene.depthBuffer;
+                depthImg = GetOrCreateDepthImage(depthStorage, device, depthExtent);
+            }
+            if (! depthImg) {
+                LOG_ERROR("depth buffer creation failed for shader '%s'",
+                          mesh.Material()->customShader.shader->name.c_str());
+                useDepth = false;
+            }
+        }
+
+        // MSAA: create multisampled color image for this RT
+        std::shared_ptr<VmaImageParameters> msaaColorImg;
+        if (m_desc.msaaSamples > VK_SAMPLE_COUNT_1_BIT) {
+            VkExtent3D extent { (u32)m_desc.out_slot->key.width,
+                                (u32)m_desc.out_slot->key.height,
+                                1 };
+            auto&      msaaStorage = scene.msaaColorImages[m_desc.output];
+            msaaColorImg           = GetOrCreateMSAAColorImage(
+                msaaStorage, device, extent, m_desc.msaaSamples, output_vk_format);
+            if (! msaaColorImg) {
+                LOG_ERROR("MSAA color image creation failed, falling back to 1x");
+                m_desc.msaaSamples = VK_SAMPLE_COUNT_1_BIT;
+            }
+        }
+
+        VkAttachmentLoadOp depthLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        scene.depthBufferCleared       = true;
+        auto opt                       = CreateRenderPass(device.handle(),
+                                                          output_vk_format,
+                                                          loadOp,
+                                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                          useDepth,
+                                                          depthLoadOp,
+                                                          m_desc.msaaSamples);
+        if (! opt.has_value()) {
+            LOG_ERROR("CreateRenderPass failed for shader '%s'",
+                      mesh.Material()->customShader.shader->name.c_str());
+            return;
+        }
+        auto& pass        = opt.value();
+        m_desc.hasDepth   = useDepth;
+        m_desc.depthView  = useDepth ? *depthImg->view : VK_NULL_HANDLE;
+        m_desc.depthImage = useDepth ? *depthImg->handle : VK_NULL_HANDLE;
+        m_desc.depthOwner = depthImg; // prevent depth image from being freed
+        if (msaaColorImg) {
+            m_desc.msaaColorView  = *msaaColorImg->view;
+            m_desc.msaaColorImage = *msaaColorImg->handle;
+            m_desc.msaaColorOwner = msaaColorImg; // prevent MSAA image from being freed
+        }
+
+        descriptor_info.push_descriptor = true;
+        GraphicsPipeline pipeline;
+        pipeline.toDefault();
+        if (m_desc.msaaSamples > VK_SAMPLE_COUNT_1_BIT) {
+            pipeline.multisample.rasterizationSamples = m_desc.msaaSamples;
+        }
+        if (mesh.Material()->depthTest) {
+            pipeline.depth.depthTestEnable = VK_TRUE;
+            pipeline.depth.depthCompareOp  = VK_COMPARE_OP_LESS;
+        }
+        if (mesh.Material()->depthBiasConstant != 0) {
+            pipeline.raster.depthBiasEnable         = VK_TRUE;
+            pipeline.raster.depthBiasConstantFactor = mesh.Material()->depthBiasConstant;
+        }
+        if (mesh.Material()->depthWrite) {
+            pipeline.depth.depthWriteEnable = VK_TRUE;
+        }
+        pipeline.raster.cullMode = CullModeFor(mesh.Material()->cullmode, m_desc.flipCullMode);
+        pipeline.addDescriptorSetInfo(spanone { descriptor_info })
+            .setColorBlendStates(spanone { color_blend })
+            .setTopology(m_desc.index_buf        ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                         : m_desc.point_topology ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                                                 : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+            .addInputBindingDescription(bind_descriptions)
+            .addInputAttributeDescription(attr_descriptions);
+        for (auto& spv : spvs) pipeline.addStage(std::move(spv));
+
+        if (! pipeline.create(device, pass, m_desc.pipeline)) {
+            LOG_ERROR("pipeline.create failed for shader '%s'",
+                      mesh.Material()->customShader.shader->name.c_str());
+            return;
+        }
+
+        // Per-shader-output diagnostic + per-node id if it's a 3D model
+        // shader (generic4 etc.) where many nodes share the same
+        // (shader, output) key.  Without the per-id log, Three-Body-style
+        // scenes with 7 generic4 models all going to _rt_default look like
+        // a single pipeline.  Gate on WEKDE_PIPELINE_DIAG=1 to avoid spam
+        // on scenes with hundreds of effect passes.
+        {
+            thread_local std::set<std::string> _pipe_logged;
+            auto key   = mesh.Material()->customShader.shader->name + "_" + m_desc.output;
+            bool first = _pipe_logged.insert(key).second;
+            static const bool s_pipeDiag = []() {
+                const char* v = std::getenv("WEKDE_PIPELINE_DIAG");
+                return v && v[0] && v[0] != '0';
+            }();
+            int32_t node_id = m_desc.node ? m_desc.node->ID() : -1;
+            if (first || s_pipeDiag) {
+                LOG_INFO("pipeline: shader='%s' out='%.*s' node_id=%d "
+                         "draw=%u indexed=%d depthTest=%d depthWrite=%d "
+                         "cull=%s blend=%d",
+                         mesh.Material()->customShader.shader->name.c_str(),
+                         (int)m_desc.output.size(),
+                         m_desc.output.data(),
+                         node_id,
+                         m_desc.draw_count,
+                         m_desc.index_buf ? 1 : 0,
+                         (int)mesh.Material()->depthTest,
+                         (int)mesh.Material()->depthWrite,
+                         mesh.Material()->cullmode.c_str(),
+                         (int)mesh.Material()->blenmode);
+            }
+        }
+
+        // Hideable (terminal or middle): build a second, minimal pipeline that samples
+        // this pass's already-resolved chain input straight through, bound
+        // instead of the real one while the node is hidden (see execute()'s
+        // DecideHideablePass branch). It shares this pass's vertex/index
+        // buffers and framebuffer; only the render-pass OBJECT is a second,
+        // attachment-compatible one -- GraphicsPipeline::create() takes
+        // ownership of whatever vvk::RenderPass it's handed (moves it into
+        // the output PipelineParameters), so handing it the real pipeline's
+        // own m_desc.pipeline.pass would empty that out from under the real
+        // draw. Vulkan only requires the bound pipeline's render pass be
+        // COMPATIBLE with the one active at vkCmdBeginRenderPass time, not
+        // the identical handle, so a second render pass built from the exact
+        // same attachment description is legal to bind against the same
+        // framebuffer.
+        if (m_desc.hideable != HideableKind::None) {
+            std::vector<std::vector<uint>> pt_codes;
+            bool                           pt_ok = PassthroughSpirv(pt_codes);
+            if (! pt_ok) {
+                LOG_ERROR("passthrough shader compile failed for hideable pass "
+                          "(shader '%s')",
+                          mesh.Material()->customShader.shader->name.c_str());
+            }
+
+            std::vector<Uni_ShaderSpv> pt_spvs;
+            ShaderReflected            pt_ref;
+            if (pt_ok) {
+                pt_ok = GenReflect(pt_codes, pt_spvs, pt_ref);
+                if (! pt_ok) {
+                    LOG_ERROR("passthrough shader reflect failed for hideable pass "
+                              "(shader '%s')",
+                              mesh.Material()->customShader.shader->name.c_str());
+                }
+            }
+
+            if (pt_ok && ! pt_ref.blocks.empty() && exists(pt_ref.binding_map, "g_Texture0")) {
+                m_desc.passthrough_tex_binding = (i32)pt_ref.binding_map.at("g_Texture0").binding;
+
+                const auto pt_attr_descriptions =
+                    VertexAttributeDescriptions(mesh, pt_ref.input_location_map);
+
+                DescriptorSetInfo pt_descriptor_info;
+                pt_descriptor_info.push_descriptor = true;
+                pt_descriptor_info.bindings.resize(pt_ref.binding_map.size());
+                std::transform(pt_ref.binding_map.begin(),
+                               pt_ref.binding_map.end(),
+                               pt_descriptor_info.bindings.begin(),
+                               [](auto& item) {
+                                   return item.second;
+                               });
+
+                auto pt_opt = CreateRenderPass(device.handle(),
+                                               output_vk_format,
+                                               loadOp,
+                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                               useDepth,
+                                               depthLoadOp,
+                                               m_desc.msaaSamples);
+                if (! pt_opt.has_value()) {
+                    LOG_ERROR("passthrough CreateRenderPass failed for shader '%s'",
+                              mesh.Material()->customShader.shader->name.c_str());
+                } else {
+                    auto&            pt_pass = pt_opt.value();
+                    GraphicsPipeline pt_pipeline;
+                    pt_pipeline.toDefault();
+                    if (m_desc.msaaSamples > VK_SAMPLE_COUNT_1_BIT) {
+                        pt_pipeline.multisample.rasterizationSamples = m_desc.msaaSamples;
+                    }
+                    // Same depth/cull state as the real pipeline: it draws the
+                    // identical geometry at the identical transform, so a 3D
+                    // node's passthrough must depth-test/write and cull the
+                    // same way or it would show through/behind neighbours the
+                    // real draw wouldn't have.
+                    pt_pipeline.depth  = pipeline.depth;
+                    pt_pipeline.raster = pipeline.raster;
+                    pt_pipeline.addDescriptorSetInfo(spanone { pt_descriptor_info })
+                        .setColorBlendStates(spanone { color_blend })
+                        .setTopology(m_desc.index_buf        ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                                     : m_desc.point_topology ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                                                             : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+                        .addInputBindingDescription(bind_descriptions)
+                        .addInputAttributeDescription(pt_attr_descriptions);
+                    for (auto& spv : pt_spvs) pt_pipeline.addStage(std::move(spv));
+
+                    if (! pt_pipeline.create(device, pt_pass, m_desc.passthrough_pipeline)) {
+                        LOG_ERROR("passthrough pipeline.create failed for shader '%s'",
+                                  mesh.Material()->customShader.shader->name.c_str());
+                    } else if (rr.dyn_buf->allocateSubRef(
+                                   pt_ref.blocks.front().size,
+                                   m_desc.passthrough_ubo_buf,
+                                   device.limits().minUniformBufferOffsetAlignment)) {
+                        rr.dyn_buf->fillBuf(
+                            m_desc.passthrough_ubo_buf, 0, m_desc.passthrough_ubo_buf.size, 0);
+                        auto  pt_block        = pt_ref.blocks.front();
+                        auto* pt_buf          = rr.dyn_buf;
+                        auto* pt_bufref       = &m_desc.passthrough_ubo_buf;
+                        auto* pt_node         = m_desc.node;
+                        auto  pt_cam_override = m_desc.camera_override;
+                        auto* pt_updater      = scene.shaderValueUpdater.get();
+                        // Deliberately does NOT call InitUniforms again for
+                        // this node: that call resets the shared per-node
+                        // WPUniformInfo the real material's update_op above
+                        // already populated (keyed by SceneNode* alone), and
+                        // a second, narrower call would silently drop that
+                        // material's own g_Time/audio/etc. requirements.
+                        // UpdateUniforms only reads that info and writes
+                        // whichever globals it flags; our block just ignores
+                        // (via UpdateUniform's own not-found return) any name
+                        // it doesn't declare, so it's safe to call a second
+                        // time against the same per-node info.
+                        m_desc.passthrough_update_op =
+                            [pt_updater, pt_block, pt_buf, pt_bufref, pt_node, pt_cam_override]() {
+                                sprite_map_t no_sprites;
+                                auto update_unf_op = [&pt_block, pt_buf, pt_bufref](
+                                                         std::string_view              name,
+                                                         const wallpaper::ShaderValue& value) {
+                                    UpdateUniform(pt_buf, *pt_bufref, pt_block, name, value);
+                                };
+                                pt_updater->UpdateUniforms(
+                                    pt_node, no_sprites, update_unf_op, pt_cam_override);
+                            };
+                        m_desc.passthrough_ready = true;
+                    } else {
+                        LOG_ERROR("passthrough UBO allocate failed, size %zu",
+                                  (size_t)pt_ref.blocks.front().size);
+                    }
+                }
+            }
+            if (! m_desc.passthrough_ready) {
+                LOG_ERROR("no passthrough for hideable pass (shader '%s'); hiding it "
+                          "will leave its effect drawn",
+                          mesh.Material()->customShader.shader->name.c_str());
+            }
+        }
+    }
+
+    if (! ref.blocks.empty()) {
+        auto& block = ref.blocks.front();
+        if (! rr.dyn_buf->allocateSubRef(
+                block.size, m_desc.ubo_buf, device.limits().minUniformBufferOffsetAlignment)) {
+            LOG_ERROR("allocate UBO failed, size %zu", (size_t)block.size);
+            return;
+        }
+    }
+
+    if (! ref.blocks.empty()) {
+        std::function<void()> update_dyn_buf_op;
+        if (m_desc.dyn_vertex) {
+            auto& mesh        = *m_desc.node->Mesh();
+            auto* dyn_buf     = rr.dyn_buf;
+            auto& vertex_bufs = m_desc.vertex_bufs;
+            auto& draw_count  = m_desc.draw_count;
+            auto& index_buf   = m_desc.index_buf;
+            auto  point_topo  = m_desc.point_topology;
+            update_dyn_buf_op =
+                [&mesh, &vertex_bufs, &draw_count, &index_buf, dyn_buf, point_topo]() {
+                    if (mesh.Dirty().exchange(false)) {
+                        for (usize i = 0; i < mesh.VertexCount(); i++) {
+                            const auto& vertex = mesh.GetVertexArray(i);
+                            auto&       buf    = vertex_bufs[i];
+                            if (! dyn_buf->writeToBuf(
+                                    buf, { (uint8_t*)vertex.Data(), vertex.DataSizeOf() }))
+                                return;
+                        }
+                        if (mesh.IndexCount() > 0) {
+                            auto& indice = mesh.GetIndexArray(0);
+                            draw_count   = (u32)indice.RenderDrawIndexCount();
+                            auto& buf    = index_buf;
+                            if (! dyn_buf->writeToBuf(
+                                    buf, { (uint8_t*)indice.Data(), indice.DataSizeOf() }))
+                                return;
+                        } else if (point_topo && mesh.VertexCount() > 0) {
+                            // GS particles: draw_count = active vertex count
+                            draw_count           = (u32)mesh.GetVertexArray(0).RenderVertexCount();
+                            static int s_dyn_log = 0;
+                            if (++s_dyn_log % 600 == 1) {
+                                LOG_INFO("GS dyn update: draw_count=%u dataSizeOf=%zu",
+                                         draw_count,
+                                         mesh.GetVertexArray(0).DataSizeOf());
+                            }
+                        }
+                    }
+                };
+        }
+
+        auto  block  = ref.blocks.front();
+        auto* buf    = rr.dyn_buf;
+        auto* bufref = &m_desc.ubo_buf;
+
+        auto* node           = m_desc.node;
+        auto* shader_updater = scene.shaderValueUpdater.get();
+        auto& sprites        = m_desc.sprites_map;
+        auto& vk_textures    = m_desc.vk_textures;
+        auto  cam_override   = m_desc.camera_override;
+
+        auto* p_material = &mesh.Material()->customShader;
+        m_desc.update_op = [shader_updater,
+                            block,
+                            buf,
+                            bufref,
+                            node,
+                            p_material,
+                            &sprites,
+                            &vk_textures,
+                            cam_override,
+                            update_dyn_buf_op]() {
+            auto update_unf_op = [&block, buf, bufref](std::string_view              name,
+                                                       const wallpaper::ShaderValue& value) {
+                UpdateUniform(buf, *bufref, block, name, value);
+            };
+            // Re-upload constValues if they were modified at runtime (user
+            // property / SceneScript change, e.g. a day/night grade).  These
+            // writes must reach EVERY frame-in-flight staging slot: the UBO is
+            // N-buffered, so a value written to only the current slot leaves the
+            // other slot at its prepare-time default and the scene alternates
+            // between the two every frame (a per-FIF A/B flicker).  Broadcast
+            // mirrors the write to all slots, matching how prepare() seeds the
+            // defaults; the dirty flag is one-shot, so without this only the
+            // slot live on the dirty frame would ever see the new value.
+            if (p_material->constValuesDirty) {
+                buf->setBroadcastMode(true);
+                for (auto& v : p_material->constValues) {
+                    if (exists(block.member_map, v.first)) {
+                        UpdateUniform(buf, *bufref, block, v.first, v.second);
+                    }
+                }
+                buf->setBroadcastMode(false);
+                p_material->constValuesDirty = false;
+            }
+            shader_updater->UpdateUniforms(node, sprites, update_unf_op, cam_override);
+            // update image slot for sprites
+            {
+                for (auto& [i, sp] : sprites) {
+                    if (i >= vk_textures.size()) continue;
+                    vk_textures.at(i).active = sp.GetCurFrame().imageId;
+                }
+            }
+            if (update_dyn_buf_op) update_dyn_buf_op();
+        };
+
+        auto exists_unf_op = [&block](std::string_view name) {
+            return exists(block.member_map, name);
+        };
+        shader_updater->InitUniforms(node, exists_unf_op);
+
+        // memset uniform buf
+        buf->fillBuf(*bufref, 0, bufref->size, 0);
+        {
+            auto&      default_values = mesh.Material()->customShader.shader->default_uniforms;
+            auto&      const_values   = mesh.Material()->customShader.constValues;
+            std::array values_array   = { &default_values, &const_values };
+            for (auto& values : values_array) {
+                for (auto& v : *values) {
+                    if (exists(block.member_map, v.first)) {
+                        UpdateUniform(buf, *bufref, block, v.first, v.second);
+                    }
+                }
+            }
+        }
+        m_desc.update_op();
+    }
+
+    {
+        // Non-default RTs clear to transparent so non-content areas don't
+        // affect downstream blend effects (blendAlpha *= blendColors.a).
+        bool non_default_rt = (m_desc.output != SpecTex_Default);
+        if (non_default_rt) {
+            m_desc.clear_value = VkClearValue { .color = { { 0.0f, 0.0f, 0.0f, 0.0f } } };
+        } else {
+            auto& sc           = scene.clearColor;
+            m_desc.clear_value = VkClearValue {
+                .color = { { sc[0], sc[1], sc[2], 1.0f } },
+            };
+        }
+    }
+    for (auto& tex : releaseTexs()) {
+        device.tex_cache().MarkShareReady(tex);
+    }
+    setPrepared();
+}
+
+void CustomShaderPass::recordDepthInit(const vvk::CommandBuffer& cmd) {
+    // Explicitly clear depth buffer to 1.0 on first use each frame.
+    // Using vkCmdClearDepthStencilImage instead of render pass loadOp=CLEAR
+    // to work around drivers where the render pass CLEAR doesn't execute
+    // correctly with a newly-created depth image (RADV GFX1201).
+    //
+    // Tracks per-image-handle in m_depth_inited_frame_tracker so scenes with
+    // multiple depth images (one per RT extent) transition each one on
+    // its own first use.  The previous global bool flagged the first
+    // depth image transitioned and silently skipped all others — Three-
+    // Body (3509243656) has 4+ depth-enabled passes with different RT
+    // sizes, so 3+ stayed UNDEFINED and their draws depth-failed.
+    //
+    // A pass reaching here without the tracker wired is a construction-order
+    // bug (compileRenderGraph should have called setDepthInitedFrameSet on
+    // every pass it added to m_passes), not a condition to degrade from
+    // silently -- assert loudly in debug builds; the guard below still keeps
+    // a release build from dereferencing null.
+    assert((! m_desc.hasDepth || m_depth_inited_frame_tracker) &&
+           "CustomShaderPass::m_depth_inited_frame_tracker not wired by compileRenderGraph");
+    if (ShouldRecordDepthInit(m_desc.hasDepth, m_desc.depthImage, m_depth_inited_frame_tracker)) {
+        m_depth_inited_frame_tracker->insert(m_desc.depthImage);
+        VkImageSubresourceRange depth_range {
+            .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = 1,
+            .baseArrayLayer = 0,
+            .layerCount     = 1,
+        };
+
+        // The depth image arrives here in one of:
+        //   - VK_IMAGE_LAYOUT_UNDEFINED (first frame ever or first frame
+        //     after a Scene reload — the existing fast path)
+        //   - VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL (the path-A
+        //     consumer transition will leave it here at end-of-frame; we
+        //     re-arm it to ATTACHMENT_OPTIMAL via TRANSFER_DST + clear)
+        // Both transition into TRANSFER_DST_OPTIMAL for the clear command.
+        // Using UNDEFINED as oldLayout is permitted by spec regardless of
+        // actual prior layout — Vulkan treats it as "discard" — so we use
+        // UNDEFINED unconditionally here.  This keeps the barrier shape
+        // unchanged across the two paths.
+        VkImageMemoryBarrier to_transfer {
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext               = nullptr,
+            .srcAccessMask       = 0,
+            .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image               = m_desc.depthImage,
+            .subresourceRange    = depth_range,
+        };
+        cmd.PipelineBarrier(
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_transfer);
+
+        // Explicit clear to 1.0
+        VkClearDepthStencilValue clear_depth { 1.0f, 0 };
+        cmd.ClearDepthStencilImage(
+            m_desc.depthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, clear_depth, depth_range);
+
+        // Transition TRANSFER_DST → DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        VkImageMemoryBarrier to_attach {
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext               = nullptr,
+            .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask       = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout           = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image               = m_desc.depthImage,
+            .subresourceRange    = depth_range,
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                            0,
+                            to_attach);
+    }
+}
+
+HideableFrame CustomShaderPass::frameHideable(PassMergeRole role) const {
+    // A blocked pass is a hidden node with hidden ancestors, whether or not it
+    // has a node of its own.
+    const bool              has_node      = m_desc.node != nullptr || m_blocked_frame;
+    const bool              shown         = m_desc.node != nullptr && ! m_blocked_frame;
+    // Called for every pass every frame: the scratch keeps its capacity, so
+    // the steady state allocates nothing.
+    if (m_desc.hideable != HideableKind::None)
+        ChainVisibilityInto(m_desc.chain_effects, m_chain_scratch);
+    else
+        m_chain_scratch.clear();
+    return DecideHideable(m_desc.hideable,
+                          m_chain_scratch,
+                          m_desc.chain_index,
+                          has_node,
+                          shown && m_desc.node->IsVisible(),
+                          shown && m_desc.node->AncestorsVisible(),
+                          m_desc.chain_base_image_written,
+                          m_desc.passthrough_ready,
+                          m_desc.clears_output,
+                          role,
+                          m_desc.passthrough_input_tex_index_a,
+                          m_desc.passthrough_input_tex_index_b);
+}
+
+PassDemandFrame CustomShaderPass::demandFrame() const {
+    return DemandFrameFor(frameHideable(m_desc.merge_role), canCache() && isCached());
+}
+
+PassCacheDecision CustomShaderPass::cacheDecision(PassMergeRole role, bool own_dirty,
+                                                  bool node_visible) const {
+    // compileRenderGraph never merges a cacheable pass, precisely because
+    // the early return in execute() would strand the group's begin or end.  The
+    // role check keeps that a local, checkable fact rather than an invariant
+    // spread across two files: a merged pass re-records instead.
+    return DecidePassCache<ResidencyKey>(
+        canCache(),
+        isCached(),
+        own_dirty,
+        node_visible,
+        m_cached_visible,
+        m_input_keys,
+        m_backward_input_keys,
+        m_rewritten_frame_tracker,
+        m_rewritten_last_frame_tracker,
+        role == PassMergeRole::Standalone,
+        m_desc.out_slot != nullptr && m_desc.out_slot->generation != m_cached_output_generation);
+}
+
+bool CustomShaderPass::outputSkipsRecord() const {
+    return m_desc.out_slot != nullptr &&
+           wallpaper::vulkan::detail::outputAbsent(
+               m_desc.out_slot->managed(), m_desc.out_slot->resident(), outputNeeded());
+}
+
+bool CustomShaderPass::ensureFramebuffer(const Device& device, PassMergeRole role) {
+    // vkCmdBeginRenderPass is the only consumer of the framebuffer, so only
+    // the pass that opens the render pass needs one.
+    switch (DecideFramebufferStep(
+        PassOpensRenderPass(role), m_desc.out_slot, m_desc.fb, m_desc.fb_generation)) {
+    case FbStep::Ready: return true;
+    case FbStep::Fail: return false;
+    case FbStep::Build: break;
+    }
+    // mip0_view aliases view for single-mip images.
+    const FbAttachments     att = FramebufferAttachments(m_desc.msaaSamples,
+                                                         m_desc.hasDepth,
+                                                         m_desc.msaaColorView,
+                                                         m_desc.vk_output.mip0_view,
+                                                         m_desc.depthView);
+    VkFramebufferCreateInfo info {
+        .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .pNext           = nullptr,
+        .flags           = 0,
+        .renderPass      = *m_desc.pipeline.pass,
+        .attachmentCount = att.count,
+        .pAttachments    = att.views,
+        .width           = m_desc.vk_output.extent.width,
+        .height          = m_desc.vk_output.extent.height,
+        .layers          = 1,
+    };
+    vvk::Framebuffer fb;
+    auto             res = device.handle().CreateFramebuffer(info, fb);
+    if (ShouldLogFramebufferFailure(res != VK_SUCCESS, m_fb_failure_logged)) VVK_CHECK(res);
+    if (res != VK_SUCCESS) return false;
+    RetireOldFramebuffer(m_desc.fb, m_fb_retirer);
+    m_desc.fb            = std::move(fb);
+    m_desc.fb_generation = m_desc.out_slot->generation;
+    return true;
+}
+
+std::optional<vvk::Framebuffer> CustomShaderPass::takeFramebuffer() {
+    if (*m_desc.fb == VK_NULL_HANDLE) return std::nullopt;
+    vvk::Framebuffer fb  = std::move(m_desc.fb);
+    m_desc.fb_generation = 0;
+    return fb;
+}
+
+void CustomShaderPass::execute(const Device& device, RenderingResources& rr) {
+    WEK_PROFILE_SCOPE("CustomShaderPass::execute");
+    extern bool g_pass_dump_active;
+    // Per-pass RT dumps copy the output image, which is illegal inside a
+    // render pass instance, and a dump of a merged group would show the
+    // group's combined result under every member's name.  Fall the whole
+    // frame back to one render pass per pass: the flag never changes while a
+    // command buffer is being recorded, so every pass agrees on the fallback
+    // and nobody is left owing a begin or an end.
+    rebindImages();
+    const PassMergeRole role   = g_pass_dump_active ? PassMergeRole::Standalone : m_desc.merge_role;
+    const bool          opens  = PassOpensRenderPass(role);
+    const bool          closes = PassClosesRenderPass(role);
+    // Follow an opener that could not begin its render pass this frame.
+    if (GroupMemberSkips(role, rr.group_abandoned)) {
+        if (closes) rr.group_abandoned = false;
+        return;
+    }
+    // Pass-output caching: when a pass is static, uses no time/pointer/audio
+    // uniforms, is the only writer of its output target, and reads only
+    // images written by other such passes (see canCache() /
+    // VulkanRender::compileRenderGraph for the alias check),
+    // its RT contents persist across frames — so a second-and-later frame
+    // can skip the full record+draw and leave the image untouched.
+    // g_cache_hits / g_cache_misses track behaviour for the periodic diag.
+    extern int g_cache_hits;
+    extern int g_cache_misses;
+    extern int g_invisible_skips;
+    // SceneScripts / user-prop changes / scene-property setters mark
+    // constValuesDirty on the material; we must re-execute so the new
+    // uniform values reach the UBO (otherwise the cached draw freezes
+    // the old values).  The flag is cleared inside the draw lambda.
+    bool own_dirty = false;
+    if (m_desc.node && m_desc.node->Mesh()) {
+        auto* mat = m_desc.node->Mesh()->Material();
+        own_dirty = mat && mat->customShader.constValuesDirty;
+    }
+    const HideableFrame     hf    = frameHideable(role);
+    const PassCacheDecision cache = cacheDecision(role, own_dirty, hf.node_visible);
+    if (cache.invalidate) invalidateCache();
+    if (cache.skip) {
+        g_cache_hits++;
+        return;
+    }
+    g_cache_misses++;
+
+    // Invisible-node fast path.  A node hidden at runtime — by SceneScript
+    // (3body's login UI hides most galaxy objects) or by a user property
+    // wired to layer visibility (a wallpaper's own "Rain on/off" switch) —
+    // draws nothing, so the only thing the pass contributes is its
+    // attachment load/store plus, on an MSAA target, a full-screen resolve.
+    // Skip the whole record so turning a feature off actually hands the GPU
+    // back.
+    //
+    // IsHiddenPassSkippable holds the render-target safety condition: a pass
+    // that owns its RT's clear keeps recording, because dropping it would
+    // leave the image holding last frame's pixels for the next pass that
+    // samples it.
+    // A hidden pass that opens or closes a merged group still records the
+    // boundary — there is no way to hand a render pass instance over — but
+    // its draw is dropped below by the same visibility test.
+    //
+    // A hideable pass that copies or falls back is exempt (DecideHideable sets
+    // records): hiding it must still show whatever came before it in the
+    // chain, which needs the passthrough draw below, not a dropped record.
+    // Without the exemption a terminal writing to the shared _rt_default
+    // (clears_output false whenever this object isn't the first thing drawn
+    // onto the composite) would take the early-return skip and never record
+    // anything. A Terminal copies whenever it is hidden; a Middle copies only
+    // when HiddenEffectMustCopy says its hidden run breaks the chain's
+    // ping-pong parity, and otherwise takes the ordinary path.
+    if (! hf.records) {
+        // The hidden pass may still be the first user of its depth image this
+        // frame.  Hand the initialisation over before bailing out rather than
+        // leaving the image UNDEFINED for a later visible pass that shares it.
+        // Inside a group there is nothing to hand over: merging requires the
+        // same depth image, and the pass that opened the group cleared it.
+        if (CanHandOffDepthInitOnHiddenSkip(role)) {
+            const bool depth_safe_to_skip =
+                m_depth_inited_frame_tracker && IsDepthSafeToSkip(m_desc.hasDepth,
+                                                                  m_desc.depthImage,
+                                                                  *m_depth_inited_frame_tracker);
+            if (! depth_safe_to_skip) recordDepthInit(rr.command);
+        }
+        g_invisible_skips++;
+        return;
+    }
+
+    // Nothing to write into: the slot is managed and nobody needed it this
+    // frame (or its create failed).  Every member of a merged group shares the
+    // output slot, so a group records or skips as a whole.  Ahead of
+    // ensureFramebuffer so an absent output is not mistaken for a failed
+    // framebuffer, which would abandon a group that was merely not needed.
+    if (outputSkipsRecord()) {
+        if (g_pass_dump_active)
+            LOG_DEBUG("pass dump: skip %s -> %s, render target not resident",
+                      m_desc.node && m_desc.node->Mesh() && m_desc.node->Mesh()->Material()
+                          ? m_desc.node->Mesh()->Material()->customShader.shader->name.c_str()
+                          : "???",
+                      m_desc.output.c_str());
+        return;
+    }
+
+    // The framebuffer is built over the live image on the first record and after
+    // every image change.  Nothing to draw into means skip the frame and retry;
+    // a GroupBegin that skips here takes its members with it.
+    if (! ensureFramebuffer(device, role)) {
+        if (FramebufferFailureAbandonsGroup(role)) rr.group_abandoned = true;
+        return;
+    }
+
+    if (m_desc.update_op) m_desc.update_op();
+
+    // Which pipeline this frame actually draws with.  A hideable pass that
+    // must copy binds the passthrough pipeline built in prepare() instead of
+    // its real one; every other pass is unaffected.
+    const bool                draw_passthrough = hf.hide.draw_passthrough;
+    const bool                keep_real_draw   = hf.hide.keep_real_draw;
+    const PipelineParameters& pipeline_to_bind =
+        draw_passthrough ? m_desc.passthrough_pipeline : m_desc.pipeline;
+    if (draw_passthrough && m_desc.passthrough_update_op) m_desc.passthrough_update_op();
+
+    // Which of the chain's two ping-pong buffers the passthrough samples
+    // THIS frame -- re-decided every execute() from the predecessors' live
+    // visibility, not baked in once at graph-compile time.  See
+    // SelectPassthroughSource for why a fixed slot isn't enough (a hidden
+    // immediate predecessor already took the ordinary skip path and is
+    // holding stale content, not this frame's answer).
+    const i32 passthrough_tex_index = hf.passthrough_tex_index;
+
+    // First-frame execution trace: log every pass with order, shader, output, load op, textures
+    {
+        extern int g_exec_pass_counter;
+        extern int g_exec_frame_counter;
+        if (g_exec_frame_counter < 1) {
+            auto shaderName  = m_desc.node && m_desc.node->Mesh() && m_desc.node->Mesh()->Material()
+                                   ? m_desc.node->Mesh()->Material()->customShader.shader->name
+                                   : "???";
+            int  nodeId      = m_desc.node ? m_desc.node->ID() : -1;
+            LOG_INFO("EXEC[%d] pass#%d id=%d shader='%s' out='%.*s' draw=%u visible=%d "
+                     "depth=%d blend=%d tex_count=%zu out_img=%p out_view=%p out_ext=%ux%u",
+                     g_exec_frame_counter,
+                     g_exec_pass_counter,
+                     nodeId,
+                     shaderName.c_str(),
+                     (int)m_desc.output.size(),
+                     m_desc.output.data(),
+                     m_desc.draw_count,
+                     (int)hf.node_visible,
+                     (int)m_desc.hasDepth,
+                     (int)m_desc.blending,
+                     m_desc.vk_textures.size(),
+                     (void*)m_desc.vk_output.handle,
+                     (void*)m_desc.vk_output.mip0_view,
+                     m_desc.vk_output.extent.width,
+                     m_desc.vk_output.extent.height);
+            // Log bound textures
+            for (usize i = 0; i < m_desc.vk_textures.size(); i++) {
+                auto& slot    = m_desc.vk_textures[i];
+                int   binding = m_desc.vk_tex_binding[i];
+                if (binding < 0 || slot.slots.empty()) continue;
+                auto& img = slot.getActive();
+                LOG_INFO("  tex[%zu] binding=%d extent=%ux%u handle=%p",
+                         i,
+                         binding,
+                         img.extent.width,
+                         img.extent.height,
+                         (void*)img.handle);
+            }
+            g_exec_pass_counter++;
+        }
+    }
+
+    auto& cmd    = rr.command;
+    auto& outext = m_desc.vk_output.extent;
+
+    // Transition MSAA color image from UNDEFINED → COLOR_ATTACHMENT_OPTIMAL on
+    // first use.  The latch lives on the owning VmaImageParameters so it dies
+    // with the VkImage handle — a driver-recycled handle for a fresh image
+    // starts un-transitioned and re-emits the barrier (the old global
+    // VkImage-keyed tracker would have incorrectly skipped it).
+    // Both this barrier and recordDepthInit below are illegal once a render
+    // pass instance is open, and both are unnecessary there: merging demands
+    // the same MSAA and depth images, so the pass that opened the group has
+    // already transitioned and cleared them.
+    if (opens && m_desc.msaaSamples > VK_SAMPLE_COUNT_1_BIT && m_desc.msaaColorOwner &&
+        ! m_desc.msaaColorOwner->initial_layout_transitioned) {
+        VkImageMemoryBarrier barrier {
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext               = nullptr,
+            .srcAccessMask       = 0,
+            .dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image               = m_desc.msaaColorImage,
+            .subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            0,
+                            barrier);
+        m_desc.msaaColorOwner->initial_layout_transitioned = true;
+    }
+
+    if (opens) recordDepthInit(cmd);
+
+    VkImageSubresourceRange base_srang {
+        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel   = 0,
+        .levelCount     = VK_REMAINING_MIP_LEVELS,
+        .baseArrayLayer = 0,
+        .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+    };
+    // Reuse the three per-pass scratch vectors (declared in the header,
+    // reserved in prepare()).  Capacity is preserved across calls, so
+    // clear() is O(0) for trivial types and no allocator hit.
+    m_image_barriers_scratch.clear();
+    m_image_infos_scratch.clear();
+    m_descriptor_writes_scratch.clear();
+
+    // Scope-local descriptor buffer infos, alive through the push call below.
+    VkDescriptorBufferInfo desc_buf {};
+    VkDescriptorBufferInfo pt_desc_buf {};
+    bool                   draw_blocked = false;
+
+    // A drawing pass must never find a managed input without an image: the
+    // demand walk makes every sampled slot resident first, so this reports a
+    // walk bug and drops the draw instead of sampling the fallback texture.
+    auto dropDrawForAbsentInput = [&](const RtSlot* in, usize tex_index) {
+        if (! AbsentManagedInputBlocksDraw(in, hf.draws)) return;
+        static int s_absent_input_logs = 0;
+        if (++s_absent_input_logs <= 5)
+            LOG_ERROR("pass '%s' would draw from absent render target %u (texture %zu); "
+                      "draw dropped this frame",
+                      m_desc.output.c_str(),
+                      in->id,
+                      tex_index);
+        assert(false && "demand walk left a sampled render target absent");
+        draw_blocked = true;
+    };
+
+    if (draw_passthrough) {
+        // One sampler: whichever of the chain's two ping-pong buffers
+        // passthrough_tex_index just picked for this frame.
+        if (const auto pt_index = PassthroughSamplerIndex(
+                m_desc.passthrough_tex_binding, passthrough_tex_index, m_desc.vk_textures.size())) {
+            auto& slot = m_desc.vk_textures[*pt_index];
+            if (! slot.slots.empty()) {
+                auto& img = slot.getActive();
+                if (opens)
+                    m_image_barriers_scratch.push_back(VkImageMemoryBarrier {
+                        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                        .pNext               = nullptr,
+                        .srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT,
+                        .dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+                        .oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        .newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image               = img.handle,
+                        .subresourceRange    = base_srang,
+                    });
+                m_image_infos_scratch.push_back(VkDescriptorImageInfo {
+                    img.sampler, img.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+                m_descriptor_writes_scratch.push_back(VkWriteDescriptorSet {
+                    .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .pNext            = nullptr,
+                    .dstSet           = {},
+                    .dstBinding       = (uint32_t)m_desc.passthrough_tex_binding,
+                    .dstArrayElement  = 0,
+                    .descriptorCount  = 1,
+                    .descriptorType   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    .pImageInfo       = &m_image_infos_scratch.back(),
+                    .pBufferInfo      = nullptr,
+                    .pTexelBufferView = nullptr,
+                });
+            } else {
+                dropDrawForAbsentInput(SlotAt(m_desc.in_slots, *pt_index), *pt_index);
+            }
+        }
+        if (m_desc.passthrough_ubo_buf) {
+            pt_desc_buf = {
+                rr.dyn_buf->gpuBuf(),
+                m_desc.passthrough_ubo_buf.offset,
+                m_desc.passthrough_ubo_buf.size,
+            };
+            m_descriptor_writes_scratch.push_back(VkWriteDescriptorSet {
+                .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext            = nullptr,
+                .dstSet           = {},
+                .dstBinding       = 0, // the passthrough vertex shader's UBO binding
+                .dstArrayElement  = 0,
+                .descriptorCount  = 1,
+                .descriptorType   = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pImageInfo       = nullptr,
+                .pBufferInfo      = &pt_desc_buf,
+                .pTexelBufferView = nullptr,
+            });
+        }
+    } else {
+        PlanTextureBindsInto(m_tex_bind_scratch,
+                             m_desc.vk_textures,
+                             m_desc.vk_tex_binding,
+                             m_desc.in_slots,
+                             hf.draws,
+                             static_cast<bool>(m_desc.vk_fallback_tex.sampler));
+        for (const TexBindStep& step : m_tex_bind_scratch) {
+            if (step.how == TexBind::Skip) continue;
+            const usize i       = step.index;
+            auto&       slot    = m_desc.vk_textures[i];
+            const int   binding = m_desc.vk_tex_binding[i];
+
+            VkSampler   sampler;
+            VkImageView view;
+            if (step.how != TexBind::Image) {
+                // in_slots is sized to vk_textures by prepare(); a Desc built
+                // directly (tests) may carry fewer entries.
+                dropDrawForAbsentInput(SlotAt(m_desc.in_slots, i), i);
+                // Omit: nothing to write, either because the record does not draw
+                // or because no fallback texture exists.
+                if (step.how == TexBind::Omit) continue;
+                // Shader declares this texture binding but no texture was loaded.
+                // Bind a 1x1 dummy texture to satisfy the descriptor and avoid
+                // Vulkan validation error VUID-vkCmdDraw-None-08114.
+                sampler = m_desc.vk_fallback_tex.sampler;
+                view    = m_desc.vk_fallback_tex.view;
+            } else {
+                auto& img = slot.getActive();
+                sampler   = img.sampler;
+                view      = img.view;
+
+                // Skipped for a pass recorded inside someone else's render pass:
+                // vkCmdPipelineBarrier may only name attachments there.  Nothing
+                // is lost — this barrier's source access is a read and its layout
+                // does not change, so it orders nothing, and a pass is only
+                // merged when it samples none of the group's attachments.
+                if (opens)
+                    m_image_barriers_scratch.push_back(VkImageMemoryBarrier {
+                        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                        .pNext               = nullptr,
+                        .srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT,
+                        .dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+                        .oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        .newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image               = img.handle,
+                        .subresourceRange    = base_srang,
+                    });
+            }
+
+            // Push the image-info FIRST so its address is stable for the
+            // matching write below.  Capacity reserved at prepare-time →
+            // no realloc → addresses stay valid until the final array push.
+            m_image_infos_scratch.push_back(
+                VkDescriptorImageInfo { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+            m_descriptor_writes_scratch.push_back(VkWriteDescriptorSet {
+                .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext            = nullptr,
+                .dstSet           = {},
+                .dstBinding       = (uint32_t)binding,
+                .dstArrayElement  = 0,
+                .descriptorCount  = 1,
+                .descriptorType   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo       = &m_image_infos_scratch.back(),
+                .pBufferInfo      = nullptr,
+                .pTexelBufferView = nullptr,
+            });
+        }
+
+        if (m_desc.ubo_buf) {
+            desc_buf = {
+                rr.dyn_buf->gpuBuf(),
+                m_desc.ubo_buf.offset,
+                m_desc.ubo_buf.size,
+            };
+            m_descriptor_writes_scratch.push_back(VkWriteDescriptorSet {
+                .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext            = nullptr,
+                .dstSet           = {},
+                .dstBinding       = 0,
+                .dstArrayElement  = 0,
+                .descriptorCount  = 1,
+                .descriptorType   = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pImageInfo       = nullptr,
+                .pBufferInfo      = &desc_buf,
+                .pTexelBufferView = nullptr,
+            });
+        }
+    }
+
+    // Single batched barrier call instead of one per texture
+    if (! m_image_barriers_scratch.empty()) {
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            VK_DEPENDENCY_BY_REGION_BIT,
+                            {},
+                            {},
+                            m_image_barriers_scratch);
+    }
+
+    // The one push — replaces N+1 driver round-trips with 1.
+    if (! m_descriptor_writes_scratch.empty()) {
+        cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                 *pipeline_to_bind.layout,
+                                 0,
+                                 m_descriptor_writes_scratch);
+    }
+
+    // Clear values indexed by attachment:
+    // No MSAA: [0]=color, [1]=depth
+    // MSAA:    [0]=msaa_color, [1]=resolve(unused), [2]=msaa_depth
+    VkClearValue clear_values[3];
+    uint32_t     clearCount;
+    if (m_desc.msaaSamples > VK_SAMPLE_COUNT_1_BIT) {
+        clear_values[0]              = m_desc.clear_value; // msaa color
+        clear_values[1]              = {};                 // resolve (DONT_CARE, ignored)
+        clear_values[2].depthStencil = { 1.0f, 0 };        // msaa depth
+        clearCount                   = m_desc.hasDepth ? 3u : 2u;
+    } else {
+        clear_values[0]              = m_desc.clear_value;
+        clear_values[1].depthStencil = { 1.0f, 0 };
+        clearCount                   = m_desc.hasDepth ? 2u : 1u;
+    }
+
+    VkRenderPassBeginInfo pass_begin_info {
+        .sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .pNext       = nullptr,
+        .renderPass  = *m_desc.pipeline.pass,
+        .framebuffer = *m_desc.fb,
+        .renderArea =
+            VkRect2D {
+                .offset = { 0, 0 },
+                .extent = { outext.width, outext.height },
+            },
+        .clearValueCount = clearCount,
+        .pClearValues    = clear_values,
+    };
+    if (opens) cmd.BeginRenderPass(pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+
+    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_to_bind.handle);
+    VkViewport viewport {
+        .x        = 0,
+        .y        = (float)outext.height,
+        .width    = (float)outext.width,
+        .height   = -(float)outext.height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+    VkRect2D scissor { { 0, 0 }, { outext.width, outext.height } };
+
+    cmd.SetViewport(0, viewport);
+    cmd.SetScissor(0, scissor);
+
+    auto gpu_buf = m_desc.dyn_vertex ? rr.dyn_buf->gpuBuf() : rr.vertex_buf->gpuBuf();
+
+    // Skip draw (but keep render pass begin/end) if node is hidden at runtime
+    // -- unless this is a hideable pass drawing its passthrough,
+    // which must draw (the identical mesh, at the identical transform) to
+    // put the chain's prior content on screen instead of nothing, or one
+    // whose passthrough failed to build and falls back to its real draw.
+    if (hf.draws && ! draw_blocked) {
+        for (usize i = 0; i < m_desc.vertex_bufs.size(); i++) {
+            auto& buf = m_desc.vertex_bufs[i];
+            cmd.BindVertexBuffers((u32)i, 1, &gpu_buf, &buf.offset);
+        }
+        if (m_desc.index_buf) {
+            cmd.BindIndexBuffer(gpu_buf, m_desc.index_buf.offset, m_desc.index_type);
+            cmd.DrawIndexed(m_desc.draw_count, 1, 0, 0, 0);
+        } else {
+            cmd.Draw(m_desc.draw_count, 1, 0, 0);
+        }
+    }
+
+    if (closes) cmd.EndRenderPass();
+
+    // Mip-chain refresh: when this pass wrote to an RT with mips enabled
+    // (pingpongs allocated with has_mipmap=true by WPSceneParser), blit
+    // mip 0 down through mip N-1 via VK_FILTER_LINEAR.  Next pass sampling
+    // at high minification gets a pre-AA'd mip via trilinear LOD selection.
+    // RecGenerateMipmaps handles layout transitions; no-op when mipmap_level == 1.
+    // Blits are illegal inside a render pass, and every member of a group
+    // writes the same image: regenerate once, after the group's last write.
+    if (closes && m_desc.vk_output.mipmap_level > 1 && m_desc.vk_output.handle != VK_NULL_HANDLE) {
+        device.tex_cache().RecGenerateMipmaps(cmd, m_desc.vk_output);
+    }
+
+    // Per-pass RT dump (debug).  When active, record a copy of our output
+    // image into a pre-allocated staging buffer BEFORE any later pass
+    // rewrites the same ping-pong slot.  VulkanRender maps the staging
+    // buffers after the frame's submit+wait and writes PPMs.
+    extern std::vector<PassDumpEntry>* g_pass_dump_entries;
+    extern class Device const*         g_pass_dump_device;
+    if (g_pass_dump_active && g_pass_dump_entries && g_pass_dump_device &&
+        m_desc.vk_output.handle != VK_NULL_HANDLE) {
+        // Forward-declare the structure for header-less access (defined in
+        // VulkanRender.cpp).  We just record the copy here; VulkanRender
+        // owns the staging buffer lifetime + PPM write.
+        extern void g_pass_dump_record(const vvk::CommandBuffer& cmd,
+                                       VkImage                   image,
+                                       VkFormat                  format,
+                                       uint32_t                  w,
+                                       uint32_t                  h,
+                                       const std::string&        shader,
+                                       const std::string&        output,
+                                       int32_t                   node_id);
+        auto shaderName = (m_desc.node && m_desc.node->Mesh() && m_desc.node->Mesh()->Material())
+                              ? m_desc.node->Mesh()->Material()->customShader.shader->name
+                              : std::string("noshader");
+        g_pass_dump_record(cmd,
+                           m_desc.vk_output.handle,
+                           m_desc.vk_output_format,
+                           m_desc.vk_output.extent.width,
+                           m_desc.vk_output.extent.height,
+                           shaderName,
+                           m_desc.output,
+                           m_desc.node ? m_desc.node->ID() : -1);
+    }
+
+    // First-frame draw complete; the RT contents are now stable for any
+    // later-frame cache skip (safe iff canCache(), which VulkanRender set
+    // based on alias analysis — see compileRenderGraph).
+    // A dropped draw wrote nothing of its own (a clearing render pass still
+    // ran), so its output is not a result to cache and consumers have no new
+    // draw to be warned about.
+    if (draw_blocked) return;
+    if (canCache()) markCached(hf.node_visible, m_desc.out_slot ? m_desc.out_slot->generation : 0);
+    // Reaching here means the draw was recorded, so consumers sampling this
+    // output must not trust their own cache.
+    RecordPassDrawn<ResidencyKey>(m_rewritten_frame_tracker, outputKey());
+}
+
+void CustomShaderPass::destory(const Device&, RenderingResources& rr) {
+    m_desc.update_op = {};
+    {
+        auto& buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;
+        for (auto& bufref : m_desc.vertex_bufs) {
+            if (bufref) buf->unallocateSubRef(bufref);
+        }
+        if (m_desc.index_buf) buf->unallocateSubRef(m_desc.index_buf);
+    }
+    if (m_desc.ubo_buf) rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
+}
+
+void CustomShaderPass::setDescTex(u32 index, std::string_view tex_key) {
+    assert(index < m_desc.textures.size());
+    if (index >= m_desc.textures.size()) return;
+    m_desc.textures[index] = tex_key;
+}

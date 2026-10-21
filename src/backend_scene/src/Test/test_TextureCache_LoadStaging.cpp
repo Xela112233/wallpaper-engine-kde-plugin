@@ -1,0 +1,485 @@
+// Pure-helper unit tests for the texture-load staging-pack helpers in
+// Vulkan/TextureCacheDetail.hpp.  The production caller is
+// TextureCache::CreateTex(Image&); these tests pin the offset / round-up /
+// memcpy contract without a Vulkan device.
+#include <doctest.h>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <vector>
+
+#include <vulkan/vulkan.h>
+
+#include "Vulkan/TextureCacheDetail.hpp"
+
+using wallpaper::vulkan::detail::acquireMappedStaging;
+using wallpaper::vulkan::detail::bytesPerBlockForFormat;
+using wallpaper::vulkan::detail::mipOffsets;
+using wallpaper::vulkan::detail::packMipsIntoBuffer;
+using wallpaper::vulkan::detail::packedTotalBytes;
+using wallpaper::vulkan::detail::planUploadPublish;
+using wallpaper::vulkan::detail::shouldLogUploadFailure;
+using wallpaper::vulkan::detail::StagingMapStatus;
+
+namespace
+{
+
+// Counts the staging-buffer allocations a CreateTex-shaped loop performs,
+// given an injected "allocate" callback.  The OLD per-mip-allocation shape
+// records N allocations (one per mip).  The packed-single-buffer shape
+// records exactly 1.  The body deliberately matches the production shape
+// in shape (loop over mips, write each into staging) so a refactor of the
+// real code that regresses to per-mip allocation would also regress this
+// simulator if it were updated in lock-step.
+struct AllocCounter {
+    std::size_t calls { 0 };
+    std::size_t total_bytes { 0 };
+};
+
+// Packed-buffer simulator: one allocation sized to the sum of mip sizes,
+// then per-mip memcpy at the computed offset.  This is the shape
+// CreateTex(Image&) takes post-MEM4.
+inline std::size_t simulatePackedAllocCount(
+    std::span<const std::size_t> mip_sizes,
+    std::size_t                  blockSize,
+    AllocCounter&                counter) {
+    const auto        offsets = mipOffsets(mip_sizes, blockSize);
+    const std::size_t total   = packedTotalBytes(mip_sizes, offsets);
+    if (total > 0) {
+        counter.calls += 1;
+        counter.total_bytes += total;
+    }
+    return offsets.size();
+}
+
+// Per-mip simulator: one allocation per mip (the legacy shape).
+inline std::size_t simulatePerMipAllocCount(
+    std::span<const std::size_t> mip_sizes,
+    AllocCounter&                counter) {
+    for (auto size : mip_sizes) {
+        counter.calls += 1;
+        counter.total_bytes += size;
+    }
+    return mip_sizes.size();
+}
+
+} // namespace
+
+TEST_SUITE("TextureCache per-mip staging") {
+
+    TEST_CASE("mipOffsets: empty input -> empty offsets") {
+        std::vector<std::size_t> sizes;
+        auto                     offs = mipOffsets(sizes);
+        CHECK(offs.empty());
+    }
+
+    TEST_CASE("mipOffsets: single mip starts at zero") {
+        std::vector<std::size_t> sizes = { 4096 };
+        auto                     offs  = mipOffsets(sizes);
+        REQUIRE(offs.size() == 1u);
+        CHECK(offs[0] == 0u);
+    }
+
+    TEST_CASE("mipOffsets: full 4K RGBA8 mip chain accumulates correctly") {
+        // 13 mip levels: 4096*4096*4 ... 1*1*4
+        std::vector<std::size_t> sizes;
+        for (int dim = 4096; dim >= 1; dim /= 2) {
+            sizes.push_back(static_cast<std::size_t>(dim) * dim * 4u);
+        }
+        REQUIRE(sizes.size() == 13u);
+        auto offs = mipOffsets(sizes);
+        REQUIRE(offs.size() == sizes.size());
+        CHECK(offs[0] == 0u);
+        // offsets[i] == sum(sizes[0..i-1])
+        std::size_t cumul = 0;
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            CHECK(offs[i] == cumul);
+            cumul += sizes[i];
+        }
+        // final packed total = sum of all sizes
+        CHECK(packedTotalBytes(sizes, offs) == cumul);
+    }
+
+    TEST_CASE("mipOffsets: 8-byte block alignment (BC1) rounds up between mips") {
+        std::vector<std::size_t> sizes = { 7, 15, 23 };
+        auto                     offs  = mipOffsets(sizes, 8);
+        REQUIRE(offs.size() == 3u);
+        CHECK(offs[0] == 0u);
+        // 0 + 7 = 7 -> round up to 8
+        CHECK(offs[1] == 8u);
+        // 8 + 15 = 23 -> round up to 24
+        CHECK(offs[2] == 24u);
+    }
+
+    TEST_CASE("mipOffsets: 16-byte block alignment (BC3) rounds up between mips") {
+        std::vector<std::size_t> sizes = { 1, 1, 1 };
+        auto                     offs  = mipOffsets(sizes, 16);
+        REQUIRE(offs.size() == 3u);
+        CHECK(offs[0] == 0u);
+        CHECK(offs[1] == 16u);
+        CHECK(offs[2] == 32u);
+    }
+
+    TEST_CASE("bytesPerBlockForFormat: uncompressed formats report 1") {
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_R8G8B8A8_UNORM) == 1u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_R8_UNORM) == 1u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_R16G16B16A16_SFLOAT) == 1u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_R32_SFLOAT) == 1u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_A2B10G10R10_UNORM_PACK32) == 1u);
+    }
+
+    TEST_CASE("bytesPerBlockForFormat: BC1/BC4 report 8") {
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_BC1_RGBA_UNORM_BLOCK) == 8u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_BC1_RGB_UNORM_BLOCK) == 8u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_BC4_UNORM_BLOCK) == 8u);
+    }
+
+    TEST_CASE("bytesPerBlockForFormat: BC2/BC3/BC6H/BC7 report 16") {
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_BC2_UNORM_BLOCK) == 16u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_BC3_UNORM_BLOCK) == 16u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_BC6H_UFLOAT_BLOCK) == 16u);
+        CHECK(bytesPerBlockForFormat(VK_FORMAT_BC7_UNORM_BLOCK) == 16u);
+    }
+
+    TEST_CASE("packMipsIntoBuffer: per-mip bytes land at the computed offsets") {
+        // Construct 3 distinct mip payloads, pack into one buffer, verify
+        // each mip's bytes are present at its computed offset.
+        std::array<std::array<std::uint8_t, 4>, 3> srcs = { {
+            { 0xAA, 0xAA, 0xAA, 0xAA },
+            { 0xBB, 0xBB, 0xBB, 0xBB },
+            { 0xCC, 0xCC, 0xCC, 0xCC },
+        } };
+        std::vector<std::size_t>                                       sizes = { 4, 4, 4 };
+        std::vector<std::pair<const std::uint8_t*, std::size_t>>       mips;
+        for (std::size_t j = 0; j < sizes.size(); ++j) {
+            mips.emplace_back(srcs[j].data(), sizes[j]);
+        }
+        auto                      offs = mipOffsets(sizes);
+        const std::size_t         total = packedTotalBytes(sizes, offs);
+        std::vector<std::uint8_t> dst(total, 0);
+        packMipsIntoBuffer(mips, offs, dst.data());
+
+        for (std::size_t j = 0; j < sizes.size(); ++j) {
+            for (std::size_t i = 0; i < sizes[j]; ++i) {
+                CHECK(dst[offs[j] + i] == srcs[j][i]);
+            }
+        }
+    }
+
+    TEST_CASE(
+        "packMipsIntoBuffer: BC1 16-byte mip blocks pack contiguously with no gaps") {
+        // BC1 mip0 (16 bytes = one 4x4 block); mip1 (16 bytes); both
+        // sizes are themselves a multiple of the block size, so the
+        // cumulative offset never needs rounding.
+        std::array<std::uint8_t, 16> a {};
+        a.fill(0x11);
+        std::array<std::uint8_t, 16> b {};
+        b.fill(0x22);
+        std::vector<std::size_t> sizes = { 16, 16 };
+        std::vector<std::pair<const std::uint8_t*, std::size_t>> mips = {
+            { a.data(), 16 },
+            { b.data(), 16 },
+        };
+        auto                      offs  = mipOffsets(sizes, 8);
+        const std::size_t         total = packedTotalBytes(sizes, offs);
+        std::vector<std::uint8_t> dst(total, 0);
+        packMipsIntoBuffer(mips, offs, dst.data());
+
+        CHECK(offs[0] == 0u);
+        CHECK(offs[1] == 16u);
+        CHECK(total == 32u);
+        for (std::size_t i = 0; i < 16; ++i) CHECK(dst[i] == 0x11);
+        for (std::size_t i = 16; i < 32; ++i) CHECK(dst[i] == 0x22);
+    }
+
+    // -- The load-time allocation-count invariant --------------------------
+    //
+    // These cases pin the *invariant* MEM4 changes: a CreateTex(Image&)
+    // call that uploads a texture with N mip levels must allocate exactly
+    // ONE staging buffer, not N.  The harness mirrors the production
+    // shape (loop over mips, copy each into staging) and counts the
+    // staging-buffer allocations the loop would issue.
+    TEST_CASE(
+        "load-time staging allocations: packed shape allocates exactly 1 buffer per "
+        "texture with N=8 mips") {
+        std::vector<std::size_t> sizes = {
+            1024 * 1024 * 4, 512 * 512 * 4, 256 * 256 * 4, 128 * 128 * 4,
+            64 * 64 * 4,     32 * 32 * 4,   16 * 16 * 4,   8 * 8 * 4,
+        };
+        REQUIRE(sizes.size() == 8u);
+        AllocCounter counter {};
+        const auto   mip_count = simulatePackedAllocCount(sizes, /*blockSize=*/1, counter);
+        CHECK(mip_count == 8u);
+        CHECK(counter.calls == 1u);
+        // total_bytes equals the sum of all mip sizes (no per-mip overhead).
+        std::size_t expected = 0;
+        for (auto s : sizes) expected += s;
+        CHECK(counter.total_bytes == expected);
+    }
+
+    TEST_CASE(
+        "load-time staging allocations: legacy per-mip shape allocates N times (regression "
+        "characterisation)") {
+        std::vector<std::size_t> sizes = {
+            1024 * 1024 * 4, 512 * 512 * 4, 256 * 256 * 4, 128 * 128 * 4,
+            64 * 64 * 4,     32 * 32 * 4,   16 * 16 * 4,   8 * 8 * 4,
+        };
+        AllocCounter counter {};
+        const auto   mip_count = simulatePerMipAllocCount(sizes, counter);
+        CHECK(mip_count == 8u);
+        // The PRE-MEM4 shape would allocate once per mip; this case
+        // documents that pre-existing behaviour for completeness.
+        CHECK(counter.calls == 8u);
+    }
+
+    TEST_CASE(
+        "load-time staging allocations: empty mip list does not allocate") {
+        std::vector<std::size_t> sizes;
+        AllocCounter             counter {};
+        const auto               mip_count = simulatePackedAllocCount(sizes, 1, counter);
+        CHECK(mip_count == 0u);
+        CHECK(counter.calls == 0u);
+        CHECK(counter.total_bytes == 0u);
+    }
+
+    TEST_CASE(
+        "load-time staging allocations: BC3 13-mip chain still allocates exactly 1 buffer") {
+        // BC3 (block size 16): a 4K texture mip chain.  Sizes here are
+        // already block-multiples so no per-mip round-up consumes bytes.
+        std::vector<std::size_t> sizes;
+        for (int dim = 4096; dim >= 4; dim /= 2) {
+            // BC3 stores one byte per pixel after block compression
+            // (16 bytes per 4x4 block = 1 byte/pixel effective).
+            sizes.push_back(static_cast<std::size_t>(dim) * dim);
+        }
+        // include the smallest mips (compressed formats keep one block
+        // minimum even below 4x4)
+        sizes.push_back(16);
+        sizes.push_back(16);
+        AllocCounter counter {};
+        const auto   mip_count = simulatePackedAllocCount(
+            sizes,
+            bytesPerBlockForFormat(VK_FORMAT_BC3_UNORM_BLOCK),
+            counter);
+        CHECK(mip_count == sizes.size());
+        CHECK(counter.calls == 1u);
+    }
+}
+
+// -- Staging acquire: the two failure channels ----------------------------
+//
+// Both TextureCache upload paths (CreateTex's packed load and ReuploadTex's
+// per-frame video/text re-upload) allocate a host-visible staging buffer and
+// map it before copying pixels in.  Either step can refuse under memory
+// pressure, and each refusal has to stop the sequence: mapping a buffer whose
+// allocation failed goes through a null VMA allocator, and copying after a
+// failed map writes a whole frame through a pointer the driver never set.
+// These cases pin the short-circuit ordering without a Vulkan device.
+TEST_SUITE("TextureCache staging acquire") {
+
+    TEST_CASE("a failed allocation stops before the map") {
+        int  create_calls = 0;
+        int  map_calls    = 0;
+        auto res          = acquireMappedStaging(
+            /*reusable=*/false,
+            [&] {
+                ++create_calls;
+                return false;
+            },
+            [&](void** out) {
+                ++map_calls;
+                *out = reinterpret_cast<void*>(0xDEADBEEF);
+                return true;
+            });
+        CHECK(create_calls == 1);
+        CHECK(map_calls == 0);
+        CHECK(res.data == nullptr);
+        CHECK(res.status == StagingMapStatus::CreateFailed);
+    }
+
+    TEST_CASE("a failed map hands back no pointer to copy through") {
+        std::uint8_t scratch = 0;
+        auto         res     = acquireMappedStaging(
+            /*reusable=*/false,
+            [] {
+                return true;
+            },
+            [&](void** out) {
+                // A driver may leave the out-param untouched or scribble on
+                // it; either way a failed map means "do not copy".
+                *out = &scratch;
+                return false;
+            });
+        CHECK(res.data == nullptr);
+        CHECK(res.status == StagingMapStatus::MapFailed);
+    }
+
+    TEST_CASE("a map reporting success without a pointer is a failure") {
+        auto res = acquireMappedStaging(
+            /*reusable=*/false,
+            [] {
+                return true;
+            },
+            [](void** out) {
+                *out = nullptr;
+                return true;
+            });
+        CHECK(res.data == nullptr);
+        CHECK(res.status == StagingMapStatus::MapFailed);
+    }
+
+    TEST_CASE("a reusable buffer is mapped without reallocating") {
+        std::uint8_t scratch      = 0;
+        int          create_calls = 0;
+        auto         res          = acquireMappedStaging(
+            /*reusable=*/true,
+            [&] {
+                ++create_calls;
+                return true;
+            },
+            [&](void** out) {
+                *out = &scratch;
+                return true;
+            });
+        CHECK(create_calls == 0);
+        CHECK(res.data == static_cast<void*>(&scratch));
+        CHECK(res.status == StagingMapStatus::Ok);
+    }
+
+    TEST_CASE("a fresh buffer is allocated then mapped") {
+        std::uint8_t scratch      = 0;
+        int          create_calls = 0;
+        int          map_calls    = 0;
+        auto         res          = acquireMappedStaging(
+            /*reusable=*/false,
+            [&] {
+                ++create_calls;
+                return true;
+            },
+            [&](void** out) {
+                ++map_calls;
+                *out = &scratch;
+                return true;
+            });
+        CHECK(create_calls == 1);
+        CHECK(map_calls == 1);
+        CHECK(res.data == static_cast<void*>(&scratch));
+        CHECK(res.status == StagingMapStatus::Ok);
+    }
+}
+
+// -- Publish policy after an interrupted upload ---------------------------
+//
+// CreateTex stops at the first slot that refuses.  What it does with the
+// partial result decides whether a transient allocation failure is survivable:
+// caching the half-built slots makes every later lookup hit a texture with null
+// image handles, and freeing the decoded CPU bytes throws away the only source
+// a retry could upload from.
+TEST_SUITE("TextureCache upload publish") {
+
+    TEST_CASE("a complete build is cached and its CPU bytes freed") {
+        const auto p = planUploadPublish(/*slots_built=*/3, /*slots_total=*/3,
+                                         /*may_release=*/true);
+        CHECK(p.cache);
+        CHECK(p.release);
+    }
+
+    TEST_CASE("a complete build honours a caller that wants its bytes kept") {
+        const auto p = planUploadPublish(3, 3, /*may_release=*/false);
+        CHECK(p.cache);
+        CHECK_FALSE(p.release);
+    }
+
+    TEST_CASE("an interrupted build is not cached, so a later attempt can retry") {
+        const auto p = planUploadPublish(/*slots_built=*/1, /*slots_total=*/3,
+                                         /*may_release=*/true);
+        CHECK_FALSE(p.cache);
+    }
+
+    TEST_CASE("an interrupted build keeps its CPU bytes — they are the retry's source") {
+        const auto p = planUploadPublish(1, 3, /*may_release=*/true);
+        CHECK_FALSE(p.release);
+    }
+
+    TEST_CASE("a build that refused on the very first slot is not cached either") {
+        const auto p = planUploadPublish(0, 1, true);
+        CHECK_FALSE(p.cache);
+        CHECK_FALSE(p.release);
+    }
+
+    TEST_CASE("an image with no slots is complete by definition") {
+        const auto p = planUploadPublish(0, 0, true);
+        CHECK(p.cache);
+    }
+}
+
+// -- Upload-failure log rate limit ----------------------------------------
+//
+// Video textures re-upload every frame, and a text layer whose upload was
+// refused keeps its dirty flags set and tries again every frame.  A texture
+// that can never upload (a key that was never created) would write one log line
+// per frame forever, so the first few refusals are verbose and the rest are
+// spaced out.
+TEST_SUITE("TextureCache upload failure log") {
+
+    TEST_CASE("the first refusals are all reported") {
+        CHECK(shouldLogUploadFailure(0));
+        CHECK(shouldLogUploadFailure(1));
+        CHECK(shouldLogUploadFailure(2));
+    }
+
+    TEST_CASE("a texture stuck at frame rate goes quiet after the first few") {
+        int logged = 0;
+        for (std::uint64_t i = 0; i < 600; ++i)
+            if (shouldLogUploadFailure(i)) ++logged;
+        CHECK(logged < 10);
+    }
+
+    TEST_CASE("a long-running failure still reports periodically") {
+        int logged = 0;
+        for (std::uint64_t i = 0; i < 6000; ++i)
+            if (shouldLogUploadFailure(i)) ++logged;
+        CHECK(logged >= 5);
+    }
+
+    // The periodic line is spaced from the end of the verbose head, not from
+    // the very first refusal.  Off-by-an-offset here shifts every later line:
+    // counting from zero would fire at 600 and 1200 rather than 603 and 1203,
+    // and a sign slip would fire just short of each interval instead.
+    TEST_CASE("the periodic line is spaced from the end of the verbose head") {
+        CHECK(shouldLogUploadFailure(3));
+        CHECK_FALSE(shouldLogUploadFailure(4));
+        CHECK_FALSE(shouldLogUploadFailure(597));
+        CHECK_FALSE(shouldLogUploadFailure(600));
+        CHECK_FALSE(shouldLogUploadFailure(602));
+        CHECK(shouldLogUploadFailure(603));
+        CHECK_FALSE(shouldLogUploadFailure(604));
+        CHECK(shouldLogUploadFailure(1203));
+    }
+}
+
+// A re-upload source can arrive empty: an Image whose CPU pixels the cache
+// already freed after its first upload. Staging zero bytes asks Vulkan for a
+// zero-size VkBuffer (invalid usage, VK_ERROR_INITIALIZATION_FAILED on RADV),
+// which then reads in the journal as an allocation failure.
+TEST_SUITE("TextureCache re-upload payload check") {
+    TEST_CASE("a mip with bytes and a pointer has a payload") {
+        std::uint8_t px[4] {};
+        CHECK(wallpaper::vulkan::detail::mipHasPayload(4, px));
+    }
+    TEST_CASE("a zero-size mip has none, even with a pointer") {
+        std::uint8_t px[4] {};
+        CHECK_FALSE(wallpaper::vulkan::detail::mipHasPayload(0, px));
+    }
+    TEST_CASE("a released mip (size 0, no pointer) has none") {
+        CHECK_FALSE(wallpaper::vulkan::detail::mipHasPayload(0, nullptr));
+    }
+    TEST_CASE("a size with no pointer has none") {
+        CHECK_FALSE(wallpaper::vulkan::detail::mipHasPayload(16, nullptr));
+    }
+    TEST_CASE("a negative size has none") {
+        std::uint8_t px[4] {};
+        CHECK_FALSE(wallpaper::vulkan::detail::mipHasPayload(-1, px));
+    }
+}

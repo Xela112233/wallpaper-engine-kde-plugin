@@ -1,0 +1,260 @@
+#include <doctest.h>
+
+#include "Scene/PendingUpdateQueues.hpp"
+#include "Scene/SceneMaterial.h"
+#include "Scene/SceneMesh.h"
+#include "UserPropUniformBinding.hpp"
+
+#include <string>
+
+using namespace wallpaper;
+
+// PendingUpdateQueues is the render-thread bridge's pending-update state lifted
+// out of RenderHandler (SceneWallpaper.cpp) so its enqueue/merge/drain semantics
+// are testable without a Vulkan link.  The setters merge per-tick exactly as the
+// live queue did (last-write-wins per key, per-field text-style merge, vectors
+// append in order); the withXLocked() drains hand the caller mutable refs under
+// the group mutex so the render thread keeps holding the lock across the apply.
+TEST_SUITE("PendingUpdateQueues") {
+    TEST_CASE("setNodeTransform: origin then scale keep separate keys; per-key LWW") {
+        PendingUpdateQueues q;
+        q.setNodeTransform(5, "origin", 1.f, 2.f, 3.f);
+        q.setNodeTransform(5, "scale", 4.f, 5.f, 6.f);
+        // A second origin write for the same id wins over the first.
+        q.setNodeTransform(5, "origin", 7.f, 8.f, 9.f);
+
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            CHECK(p.m_pending_transform_updates.size() == 2);
+            auto origin = p.m_pending_transform_updates.at({ 5, "origin" });
+            auto scale  = p.m_pending_transform_updates.at({ 5, "scale" });
+            CHECK(origin == std::array<float, 3> { 7.f, 8.f, 9.f });
+            CHECK(scale == std::array<float, 3> { 4.f, 5.f, 6.f });
+            p.m_pending_transform_updates.clear();
+        });
+    }
+
+    TEST_CASE("setTextStyle: successive per-field posts merge (halign then font)") {
+        PendingUpdateQueues q;
+        q.setTextStyle(3, "right", "", "");
+        q.setTextStyle(3, "", "", "Heavy.otf");
+
+        q.withTextLocked([&](auto& textUpdates, auto& pointsizeUpdates, auto& styleUpdates) {
+            (void)textUpdates;
+            (void)pointsizeUpdates;
+            REQUIRE(styleUpdates.count(3) == 1);
+            const auto& s = styleUpdates.at(3);
+            CHECK(s.halign == "right");
+            CHECK(s.valign == "");
+            CHECK(s.fontName == "Heavy.otf");
+        });
+    }
+
+    TEST_CASE("applyLayerBatch: F_ORIGIN|F_ALPHA unfolds origin + alpha only") {
+        PendingUpdateQueues                  q;
+        PendingUpdateQueues::LayerBatchEntry e {};
+        e.id      = 12;
+        e.flags   = PendingUpdateQueues::F_ORIGIN | PendingUpdateQueues::F_ALPHA;
+        e.origin  = { 10.f, 20.f, 30.f };
+        e.scale   = { 2.f, 2.f, 2.f };  // present but flag unset -> ignored
+        e.angles  = { 90.f, 0.f, 0.f }; // present but flag unset -> ignored
+        e.alpha   = 0.5f;
+        e.visible = 1; // flag unset -> ignored
+        q.applyLayerBatch({ e });
+
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            // origin present, scale/angles absent
+            CHECK(p.m_pending_transform_updates.count({ 12, "origin" }) == 1);
+            CHECK(p.m_pending_transform_updates.count({ 12, "scale" }) == 0);
+            CHECK(p.m_pending_transform_updates.count({ 12, "angles" }) == 0);
+            CHECK(p.m_pending_transform_updates.at({ 12, "origin" }) ==
+                  std::array<float, 3> { 10.f, 20.f, 30.f });
+            // alpha present, visible absent
+            REQUIRE(p.m_pending_alpha_updates.count(12) == 1);
+            CHECK(p.m_pending_alpha_updates.at(12) == 0.5f);
+            CHECK(p.m_pending_visible_updates.count(12) == 0);
+        });
+    }
+
+    TEST_CASE("scene optional: setClearColor sets once, drain resets, second drain empty") {
+        PendingUpdateQueues q;
+        q.setClearColor(0.1f, 0.2f, 0.3f);
+
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            REQUIRE(p.m_pending_clear_color.has_value());
+            CHECK(*p.m_pending_clear_color == std::array<float, 3> { 0.1f, 0.2f, 0.3f });
+            p.m_pending_clear_color.reset(); // mirror the drain's reset()
+        });
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            CHECK_FALSE(p.m_pending_clear_color.has_value());
+        });
+    }
+
+    TEST_CASE("scene optional: setBloomStrength/setBloomThreshold set once, drain resets") {
+        PendingUpdateQueues q;
+        q.setBloomStrength(1.5f);
+        q.setBloomThreshold(0.8f);
+
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            REQUIRE(p.m_pending_bloom_strength.has_value());
+            REQUIRE(p.m_pending_bloom_threshold.has_value());
+            CHECK(*p.m_pending_bloom_strength == 1.5f);
+            CHECK(*p.m_pending_bloom_threshold == 0.8f);
+            p.m_pending_bloom_strength.reset(); // mirror the drain's reset()
+            p.m_pending_bloom_threshold.reset();
+        });
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            CHECK_FALSE(p.m_pending_bloom_strength.has_value());
+            CHECK_FALSE(p.m_pending_bloom_threshold.has_value());
+        });
+    }
+
+    TEST_CASE(
+        "scene optional: a second setBloomStrength before drain overwrites (last-write-wins)") {
+        PendingUpdateQueues q;
+        q.setBloomStrength(1.0f);
+        q.setBloomStrength(2.0f);
+
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            REQUIRE(p.m_pending_bloom_strength.has_value());
+            CHECK(*p.m_pending_bloom_strength == 2.0f);
+        });
+    }
+
+    TEST_CASE("light vectors: two setLightColor append in call order") {
+        PendingUpdateQueues q;
+        q.setLightColor(0, 1.f, 0.f, 0.f);
+        q.setLightColor(2, 0.f, 1.f, 0.f);
+
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            REQUIRE(p.m_pending_light_colors.size() == 2);
+            CHECK(p.m_pending_light_colors[0].index == 0);
+            CHECK(p.m_pending_light_colors[0].color == std::array<float, 3> { 1.f, 0.f, 0.f });
+            CHECK(p.m_pending_light_colors[1].index == 2);
+            CHECK(p.m_pending_light_colors[1].color == std::array<float, 3> { 0.f, 1.f, 0.f });
+        });
+    }
+
+    TEST_CASE("withColorLocked drain empties the color map (clear semantics)") {
+        PendingUpdateQueues q;
+        q.setColorUpdate(7, 0.5f, 0.6f, 0.7f);
+        q.withColorLocked([&](auto& colorUpdates) {
+            REQUIRE(colorUpdates.count(7) == 1);
+            CHECK(colorUpdates.at(7) == std::array<float, 3> { 0.5f, 0.6f, 0.7f });
+            colorUpdates.clear();
+        });
+        q.withColorLocked([&](auto& colorUpdates) {
+            CHECK(colorUpdates.empty());
+        });
+    }
+
+    TEST_CASE("setSystemTextureUpdate: withSystemTexturesLocked sees the same pointer under the "
+              "right key") {
+        PendingUpdateQueues q;
+        auto                img = std::make_shared<Image>();
+        img->key                = "$mediaThumbnail";
+        q.setSystemTextureUpdate("$mediaThumbnail", img);
+
+        q.withSystemTexturesLocked([&](auto& textures) {
+            REQUIRE(textures.count("$mediaThumbnail") == 1);
+            CHECK(textures.at("$mediaThumbnail") == img);
+        });
+    }
+
+    TEST_CASE("withSystemTexturesLocked drain (clearing inside the callback) leaves the next "
+              "call seeing an empty map") {
+        PendingUpdateQueues q;
+        q.setSystemTextureUpdate("$mediaThumbnail", std::make_shared<Image>());
+        q.withSystemTexturesLocked([&](auto& textures) {
+            REQUIRE(! textures.empty());
+            textures.clear();
+        });
+        q.withSystemTexturesLocked([&](auto& textures) {
+            CHECK(textures.empty());
+        });
+    }
+
+    TEST_CASE("a second setSystemTextureUpdate for the same key before a drain overwrites, not "
+              "accumulates") {
+        PendingUpdateQueues q;
+        auto                imgA = std::make_shared<Image>();
+        auto                imgB = std::make_shared<Image>();
+        q.setSystemTextureUpdate("$mediaThumbnail", imgA);
+        q.setSystemTextureUpdate("$mediaThumbnail", imgB);
+
+        q.withSystemTexturesLocked([&](auto& textures) {
+            CHECK(textures.size() == 1);
+            CHECK(textures.at("$mediaThumbnail") == imgB);
+        });
+    }
+
+    TEST_CASE("setUserPropUniform appends in call order") {
+        PendingUpdateQueues q;
+        auto                mesh = std::make_shared<SceneMesh>();
+        q.setUserPropUniform(mesh, "g_A", { 1.f });
+        q.setUserPropUniform(mesh, "g_B", { 2.f, 3.f });
+
+        q.withPropertyLocked([&](PendingUpdateQueues& p) {
+            REQUIRE(p.m_pending_user_prop_uniforms.size() == 2);
+            CHECK(p.m_pending_user_prop_uniforms[0].uniform == "g_A");
+            CHECK(p.m_pending_user_prop_uniforms[1].uniform == "g_B");
+            CHECK(p.m_pending_user_prop_uniforms[1].value == std::vector<float> { 2.f, 3.f });
+            p.m_pending_user_prop_uniforms.clear();
+        });
+    }
+
+    TEST_CASE("drainUserPropUniforms writes the value, flags the material and empties the queue") {
+        PendingUpdateQueues q;
+        auto                mesh = std::make_shared<SceneMesh>();
+        mesh->AddMaterial(SceneMaterial {});
+        q.setUserPropUniform(mesh, "g_A", { 0.25f });
+
+        q.withPropertyLocked([](PendingUpdateQueues& p) {
+            wek::drainUserPropUniforms(p.m_pending_user_prop_uniforms);
+        });
+
+        auto* mat = mesh->Material();
+        REQUIRE(mat->customShader.constValues.count("g_A") == 1u);
+        CHECK(mat->customShader.constValues.at("g_A")[0] == doctest::Approx(0.25f));
+        CHECK(mat->customShader.constValuesDirty);
+        q.withPropertyLocked([](PendingUpdateQueues& p) {
+            CHECK(p.m_pending_user_prop_uniforms.empty());
+        });
+    }
+
+    TEST_CASE("drainUserPropUniforms skips a mesh with no material and still empties the queue") {
+        PendingUpdateQueues q;
+        auto                bare = std::make_shared<SceneMesh>();
+        auto                live = std::make_shared<SceneMesh>();
+        live->AddMaterial(SceneMaterial {});
+        q.setUserPropUniform(bare, "g_A", { 1.f });
+        q.setUserPropUniform(nullptr, "g_A", { 1.f });
+        q.setUserPropUniform(live, "g_A", { 0.5f });
+
+        q.withPropertyLocked([](PendingUpdateQueues& p) {
+            wek::drainUserPropUniforms(p.m_pending_user_prop_uniforms);
+        });
+
+        CHECK(live->Material()->customShader.constValues.at("g_A")[0] == doctest::Approx(0.5f));
+        q.withPropertyLocked([](PendingUpdateQueues& p) {
+            CHECK(p.m_pending_user_prop_uniforms.empty());
+        });
+    }
+
+    TEST_CASE("an entry that is the last owner of its mesh drains safely") {
+        PendingUpdateQueues      q;
+        std::weak_ptr<SceneMesh> weak;
+        {
+            auto mesh = std::make_shared<SceneMesh>();
+            mesh->AddMaterial(SceneMaterial {});
+            weak = mesh;
+            q.setUserPropUniform(mesh, "g_A", { 1.f });
+        } // the queue now holds the only owner
+        REQUIRE_FALSE(weak.expired());
+
+        q.withPropertyLocked([](PendingUpdateQueues& p) {
+            wek::drainUserPropUniforms(p.m_pending_user_prop_uniforms);
+        });
+
+        CHECK(weak.expired());
+    }
+}

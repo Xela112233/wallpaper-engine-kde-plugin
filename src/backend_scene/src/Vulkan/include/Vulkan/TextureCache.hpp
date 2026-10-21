@@ -1,0 +1,328 @@
+#pragma once
+
+#include "Parameters.hpp"
+#include "Type.hpp"
+// Provides the inline ToVkType(TextureFormat) definition.  Must be included
+// here (not just in TextureCache.cpp) so EVERY caller that includes
+// TextureCache.hpp — e.g. VulkanRender/CustomShaderPass.cpp — sees the inline
+// body and doesn't emit an unresolved external reference.  Otherwise the
+// plugin .so fails to dlopen with "undefined symbol: ...ToVkType...".
+#include "TexFormatVk.hpp"
+#include "SamplerDedupDetail.hpp"
+#include "Core/NoCopyMove.hpp"
+#include "Core/MapSet.hpp"
+#include "StagingReuse.hpp"
+#include "Vulkan/RetireRing.hpp"
+#include "Vulkan/TextureCacheDetail.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+
+namespace wallpaper
+{
+
+struct Image;
+
+namespace vulkan
+{
+
+// ToVkType(TextureFormat) is defined inline in TexFormatVk.hpp (included above)
+// so it has a definition in every translation unit that calls it.
+VkSamplerAddressMode ToVkType(TextureWrap);
+VkFilter             ToVkType(TextureFilter);
+
+// Depth-attachment sampler configuration.  NEAREST/CLAMP/no-compare; used to
+// sample _rt_sceneDepth in the volumetric chain.  Pure-data factory so unit
+// tests can pin the contract without a live device.
+VkSamplerCreateInfo GenDepthSamplerInfo();
+
+// Sampler configuration for a texture with the given wrap/filter flags and mip
+// count.  A free function rather than inline at the two CreateTex call sites so
+// a test can pin which wrap flag drives which axis without a live device.
+VkSamplerCreateInfo GenSamplerInfo(const TextureSample& sample, float max_lod,
+                                   float device_max_anisotropy);
+
+enum class TexUsage
+{
+    COLOR,
+    DEPTH
+};
+
+using TexHash = std::size_t;
+
+struct TextureKey {
+    i32           width;
+    i32           height;
+    TexUsage      usage;
+    TextureFormat format;
+    TextureSample sample;
+    uint          mipmap_level { 1 };
+
+    static TexHash HashValue(const TextureKey&);
+};
+
+// Fill colour for a freshly created cache image.
+VkClearColorValue GenInitialClearColor(const TextureKey& key);
+
+// Records the initialisation of an image whose contents are still undefined:
+// clear it whole to `color`, then leave it in `final_layout`.
+void RecClearNewImage(const vvk::CommandBuffer& cmd, VkImage image, const VkClearColorValue& color,
+                      VkImageLayout final_layout);
+
+// Leaves a fresh image in `final_layout` without touching its contents.  A
+// fresh image has nothing to wait for; the first writer's render pass starts
+// from UNDEFINED (clear) or from this layout (load).
+void RecTransitionNewImage(const vvk::CommandBuffer& cmd, VkImage image,
+                           VkImageLayout final_layout);
+
+// Scene-lifetime identity of a render target.  Same type as
+// VulkanRender/RtResidency.hpp's SlotId, which wpVulkan cannot include.
+using SlotId = std::uint32_t;
+
+// A render target's identity for the life of the loaded scene: a counter-
+// allocated id, its texture key and its image.  Passes hold the slot rather
+// than a copy of the image handles, so the image can change under them while
+// the slot stays the same.
+struct RtSlot : NoCopy, NoMove {
+    SlotId     id { 0 };
+    TextureKey key {};
+    // Set for _rt_default and the 1x1 dummy.  Depth and MSAA colour are not
+    // slots at all.
+    bool persist { false };
+    // present == resident.  Pass code copies handles out of it by generation.
+    std::optional<VmaImageParameters> image;
+    // Bumped every time an image is attached, so a pass holding stale copies
+    // of the handles can tell.
+    std::uint32_t generation { 0 };
+    // Frames since some pass needed this slot.
+    std::uint32_t idle_frames { 0 };
+    // Out-of-memory backoff: consecutive failed creates, and the frame before
+    // which no retry is attempted.
+    std::uint32_t create_fail_streak { 0 };
+    std::uint64_t retry_after_frame { 0 };
+
+    // Compile-time aliasing: a slot whose last reader has released it can be
+    // adopted by the next Query with the same texture key.
+    bool             share_ready { false };
+    TexHash          content_hash {};
+    Set<std::string> query_keys;
+    // Bumped on Query hit AND at insert time.  Drives the non-persist LRU
+    // eviction sort when the slot list grows past the soft cap.
+    uint64_t lru_tick { 0 };
+    // Render-graph generation this entry was last requested in.  Eviction
+    // skips current-generation entries because they are live render targets
+    // bound to the active scene's pass framebuffers.  See beginQueryGeneration().
+    uint64_t last_gen { 0 };
+
+    bool                           managed() const { return ! persist; }
+    bool                           resident() const { return image.has_value(); }
+    std::optional<ImageParameters> params() const {
+        if (! image) return std::nullopt;
+        return ImageParameters(*image);
+    }
+    // The image's parameters, or the absent ones (null handles, the key's extent)
+    // when it has none.  Defined below AbsentImageParameters.
+    ImageParameters paramsOrAbsent() const;
+};
+
+// What a pass last copied out of a slot.  Compared against the slot on every
+// execute so the copies follow an image that was attached or released.
+struct BoundImage {
+    std::uint32_t generation { 0 };
+    bool          resident { false };
+};
+
+inline bool BoundImageStale(const BoundImage& bound, const RtSlot& slot) {
+    return bound.generation != slot.generation || bound.resident != slot.resident();
+}
+
+// The slot's image parameters, or nothing for a missing slot or one with no
+// image.
+inline std::optional<ImageParameters> ResidentSlotParams(const RtSlot* s) {
+    return s != nullptr ? s->params() : std::nullopt;
+}
+
+// A pass that copies the image handles out of its slot once (the skybox) needs
+// a slot that never loses its image: persistent, or no slot at all.
+inline bool SlotHoldsFixedImage(const RtSlot* s) { return s == nullptr || ! s->managed(); }
+
+// A copy has nothing to do this frame when either side is missing, the source
+// has no image, or the destination is a managed target nobody needs.
+inline bool CopySkips(const RtSlot* src, const RtSlot* dst, bool dst_needed) {
+    return src == nullptr || dst == nullptr || ! src->resident() ||
+           detail::outputAbsent(dst->managed(), dst->resident(), dst_needed);
+}
+
+// Parameters for a slot with no image: null handles, but the extent and mip
+// count the pass's pipelines and viewport were built for.
+inline ImageParameters AbsentImageParameters(const TextureKey& key) {
+    ImageParameters p {};
+    p.extent       = { (uint32_t)key.width, (uint32_t)key.height, 1 };
+    p.mipmap_level = key.mipmap_level;
+    return p;
+}
+
+inline ImageParameters RtSlot::paramsOrAbsent() const {
+    return params().value_or(AbsentImageParameters(key));
+}
+
+// What a released slot leaves behind until the frames that may still name it
+// have retired.  Members destroy in reverse order, so the framebuffers go
+// before the image they were built over.
+struct RetiredImage {
+    std::optional<VmaImageParameters> image;
+    std::vector<vvk::Framebuffer>     framebuffers;
+};
+
+class TextureCache : NoCopy, NoMove {
+public:
+    TextureCache(const Device&);
+    ~TextureCache();
+
+    void Clear();
+
+    std::optional<ExImageParameters> CreateExTex(uint32_t witdh, uint32_t height, VkFormat,
+                                                 VkImageTiling);
+    ImageSlotsRef                    CreateTex(Image&);
+    // Nodiscard because the two things a caller does after a re-upload —
+    // clearing the layer's dirty flags, handing the frame back to the decoder —
+    // are only correct once the pixels actually landed.
+    [[nodiscard]] bool ReuploadTex(const std::string& key, Image& image);
+
+    // The slot behind a render target name; later calls return the same slot.
+    // Gives it an image now only when it is persistent or residency is off
+    // (managed slots get one when a frame first needs it).  nullptr when that
+    // up-front create failed.
+    RtSlot* QuerySlot(std::string_view key, TextureKey content_hash, bool persist = false);
+
+    std::span<const std::unique_ptr<RtSlot>> slots() const { return m_query_texs; }
+    SlotId                                   slotCount() const { return m_next_slot_id; }
+
+    // Open a new render-graph generation.  Query-texs requested after this
+    // call are stamped with the new generation; eviction never reclaims a
+    // current-generation entry, because those are live render targets still
+    // bound to this scene's pass framebuffers (evicting one is a
+    // use-after-free).  Call once per compileRenderGraph so prior-scene RTs
+    // become reclaimable while the live scene's RTs stay protected regardless
+    // of the soft cap.
+    void beginQueryGeneration() { ++m_query_generation; }
+
+    // Attach a fresh image (image, views, shared sampler) to a managed slot.
+    // Nothing is submitted: the caller records the initial state into the
+    // frame with RecInitialState.  false leaves the slot untouched.
+    bool CreateImageForSlot(RtSlot& slot);
+    // Move the slot's image and the framebuffers built over it into the retire
+    // ring, stamped with the frame that stopped using them.
+    void ReleaseSlot(RtSlot& slot, std::vector<vvk::Framebuffer> framebuffers, std::uint64_t frame);
+    // Retire a framebuffer on its own (a pass rebuilt it over a new image).
+    void RetireFramebuffer(vvk::Framebuffer framebuffer, std::uint64_t frame);
+    // Destroy retired entries no in-flight frame can still name.
+    void CollectRetired(std::uint64_t frame, std::uint64_t frames_in_flight);
+    // Destroy every retired entry; the caller has waited for the device.
+    void        DrainRetired();
+    std::size_t retiredCount() const { return m_retired.size(); }
+    // Leave a freshly attached image in SHADER_READ_ONLY_OPTIMAL, cleared to
+    // GenInitialClearColor(key) when `clear` is set.
+    void RecInitialState(const vvk::CommandBuffer& cmd, const RtSlot& slot, bool clear) const;
+    // True under WEKDE_RT_RESIDENCY=0: managed slots get their image at query
+    // time and are never released.
+    bool eagerManaged() const { return m_eager_managed; }
+
+    void MarkShareReady(std::string_view key);
+
+    void RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParameters& image) const;
+
+    // Lazily creates and caches the NEAREST/CLAMP/no-compare sampler that
+    // CustomShaderPass binds when a pass samples the main depth attachment as
+    // a texture.  Process-lifetime handle owned by this TextureCache.
+    VkSampler GetOrCreateDepthSampler();
+
+    // Hash-keyed VkSampler dedup.  TextureCache::CreateTex used to mint a
+    // fresh VkSampler per texture even when the sampler config matched one
+    // already in the cache; most scenes have ~5-15 unique configs across
+    // 50-200 textures.  Lookup by hashSamplerInfo(info); on miss, create the
+    // VkSampler and store it in the bucket.  Returns a raw, non-owning
+    // VkSampler — the vvk::Sampler is owned by m_sampler_cache and lives
+    // until Clear() (which is called on scene swap, AFTER the images that
+    // reference these samplers are torn down).
+    //
+    // Generalizes the existing single-slot GetOrCreateDepthSampler precedent
+    // on the same class.  Returns VK_NULL_HANDLE on CreateSampler failure
+    // (LOG_ERROR-logged).
+    VkSampler GetOrCreateSampler(const VkSamplerCreateInfo& info);
+
+private:
+    std::optional<VmaImageParameters> CreateTex(TextureKey);
+    // Image, views and sampler only; no submit.  CreateTex adds the clear.
+    // `releasable` marks an image residency may destroy again; large ones get
+    // their own device memory (see DedicatedRtMemory.hpp).
+    std::optional<VmaImageParameters> createImageOnly(const TextureKey&, bool releasable = false);
+    bool                              m_eager_managed { false };
+    void                              allocateCmd();
+    vvk::CommandBuffers               m_tex_cmds;
+    vvk::CommandBuffer                m_tex_cmd;
+
+    const Device&                m_device;
+    Map<std::string, ImageSlots> m_tex_map;
+
+    // Persistent per-texture staging buffers reused by ReuploadTex (video
+    // frames) instead of reallocating a ~frame-sized buffer every frame.
+    // Indexed [slot][mip]; cleared in Clear().
+    Map<std::string, std::vector<std::vector<VmaBufferParameters>>> m_reupload_staging;
+
+    // Consecutive ReuploadTex refusals per texture key.  Feeds
+    // detail::shouldLogUploadFailure: video textures re-upload every frame and
+    // a text layer whose upload was refused retries every frame, so a texture
+    // that can never upload would otherwise write a log line per frame forever.
+    // Reset by the first upload that lands.
+    Map<std::string, std::uint64_t> m_reupload_fail_streak;
+
+    // Record one refused re-upload of `key`; returns whether it should be
+    // logged under the rate limit.
+    bool noteReuploadFailure(const std::string& key);
+
+    // Declared before the images so it outlives them; tokens keep it alive anyway.
+    DedicatedLiveCount                   m_dedicated_live;
+    RetireRing<RetiredImage>             m_retired;
+    std::vector<std::unique_ptr<RtSlot>> m_query_texs;
+    Map<std::string, RtSlot*>            m_query_map;
+    SlotId                               m_next_slot_id { 0 };
+
+    // Monotonic per-Query-call counter; assigned to RtSlot::lru_tick on hit
+    // or insert.  Wraparound is theoretical — even at one Query() per
+    // microsecond, uint64_t lasts ~580k years.
+    uint64_t m_lru_clock { 0 };
+
+    // Bumped once per render-graph compile via beginQueryGeneration().  A
+    // query-tex whose last_gen equals this is live in the current scene and is
+    // never evicted, even above the soft cap; only prior-generation entries
+    // (left over from a previous scene) are reclaimable.
+    uint64_t m_query_generation { 0 };
+
+    // Soft cap on m_query_texs growth.  Env-overridable via
+    // WEK_TEXCACHE_QUERY_CAP (in [8, 4096]); default 64 covers measured
+    // peak (~30-40) on Totoro/Blur/Nightingale with headroom.  Eviction
+    // walks non-persist entries by ascending lru_tick — persist=true
+    // entries are never evicted.  See evictColdQueryTexs().
+    uint32_t m_query_soft_cap { 64 };
+
+    void evictColdQueryTexs();
+    // Creates (with the one-shot clear) the slot's image when it is persistent or
+    // residency is off and it has none yet.  false when that create failed.
+    bool createUpFrontIfNeeded(RtSlot& slot, bool persist);
+
+    // Lazily-allocated depth sampler (NEAREST/CLAMP/no-compare).  See
+    // GetOrCreateDepthSampler().
+    vvk::Sampler m_depth_sampler;
+
+    // Hash-keyed VkSampler dedup cache (MEM5).  Bucket-vector layout —
+    // [hash -> vector<pair<info, vvk::Sampler>>] — disambiguates collisions
+    // via samplerInfoEqual on confirm.  Cleared LAST in Clear() (after the
+    // images that reference these samplers).  See GetOrCreateSampler().
+    SamplerBucketMap<vvk::Sampler> m_sampler_cache;
+};
+
+} // namespace vulkan
+} // namespace wallpaper

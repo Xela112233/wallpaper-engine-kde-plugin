@@ -1,0 +1,134 @@
+#include "SceneVertexArray.h"
+#include <cstring>
+#include <iostream>
+#include <utility>
+#include <algorithm>
+#include <cassert>
+
+using namespace wallpaper;
+
+uint8_t SceneVertexArray::TypeCount(VertexType t) {
+    switch (t) {
+    case VertexType::FLOAT1:
+    case VertexType::UINT1: return 1;
+    case VertexType::FLOAT2:
+    case VertexType::UINT2: return 2;
+    case VertexType::FLOAT3:
+    case VertexType::UINT3: return 3;
+    case VertexType::FLOAT4:
+    case VertexType::UINT4: return 4;
+    }
+    return 1;
+}
+
+uint8_t SceneVertexArray::RealAttributeSize(const SceneVertexArray::SceneVertexAttribute& attr) {
+    return attr.padding ? 4 : TypeCount(attr.type);
+}
+
+SceneVertexArray::SceneVertexArray(const std::vector<SceneVertexAttribute>& attrs,
+                                   const usize                              count)
+    : m_attributes(attrs) {
+    for (const auto& el : m_attributes) {
+        usize size = SceneVertexArray::RealAttributeSize(el);
+        m_oneSize += size;
+    }
+    m_capacity = m_oneSize * count;
+    m_pData    = std::make_unique<float[]>(m_capacity);
+    std::fill(m_pData.get(), m_pData.get() + m_capacity, 0.0f);
+}
+
+SceneVertexArray::SceneVertexArray(SceneVertexArray&& o) noexcept
+    : m_attributes(std::move(o.m_attributes)),
+      m_pData(std::move(o.m_pData)),
+      m_oneSize(o.m_oneSize),
+      m_size(o.m_size),
+      m_capacity(o.m_capacity),
+      m_id(o.m_id) {}
+
+SceneVertexArray& SceneVertexArray::operator=(SceneVertexArray&& o) noexcept {
+    m_attributes = std::move(o.m_attributes);
+    m_pData      = std::move(o.m_pData);
+    m_oneSize    = o.m_oneSize;
+    m_size       = o.m_size;
+    m_capacity   = o.m_capacity;
+    m_id         = o.m_id;
+    return *this;
+}
+
+bool SceneVertexArray::AddVertex(const float* data) {
+    // Off-by-one: `>=` rejected the final valid vertex (and for count=1
+    // made AddVertex always fail since m_size + m_oneSize == m_capacity
+    // on the first call).
+    if (m_size + m_oneSize > m_capacity) return false;
+    usize pos  = 0;
+    usize mpos = 0;
+    for (const auto& el : m_attributes) {
+        auto typeSize = SceneVertexArray::TypeCount(el.type);
+        std::copy(data + pos, data + pos + typeSize, m_pData.get() + mpos);
+        pos += typeSize;
+        mpos += SceneVertexArray::RealAttributeSize(el);
+    }
+    m_size += m_oneSize;
+    return true;
+}
+
+bool SceneVertexArray::SetVertex(std::string_view name, std::span<const float> data) noexcept {
+    u32 offset = 0;
+    for (const auto& el : m_attributes) {
+        if (el.name == name) {
+            usize typeSize = SceneVertexArray::TypeCount(el.type);
+            usize count    = data.size() / typeSize;
+            if (! TrySetSize(count * m_oneSize)) return false;
+
+            for (usize i = 0; i < data.size(); i += typeSize) {
+                auto  start = data.begin() + (isize)i;
+                usize num   = i / typeSize;
+                std::copy(start, start + (isize)typeSize, m_pData.get() + offset + num * m_oneSize);
+            }
+            return true;
+        } else
+            offset += RealAttributeSize(el);
+    }
+    return false;
+}
+
+bool SceneVertexArray::SetVertexs(usize index, std::span<const float> data) noexcept {
+    usize start = index * m_oneSize;
+    if (TrySetSize(start + data.size())) {
+        std::copy(data.begin(), data.end(), m_pData.get() + start);
+        return true;
+    }
+    return false;
+}
+
+bool SceneVertexArray::TrySetSize(usize new_size) noexcept {
+    // Don't assert here: this function is the defensive capacity gate for
+    // SetVertex/SetVertexs and is explicitly allowed to be called with a
+    // too-large new_size (returning false).  The previous `assert` made
+    // the `return false` branch unreachable in debug builds and aborted
+    // on any oversize caller.
+    if (new_size > m_capacity) {
+        return false;
+    }
+    if (new_size > m_size) m_size = new_size;
+    return true;
+}
+
+Map<std::string, SceneVertexArray::SceneVertexAttributeOffset>
+SceneVertexArray::GetAttrOffsetMap() const {
+    Map<std::string, SceneVertexArray::SceneVertexAttributeOffset> result;
+    usize                                                          offset { 0 };
+    for (const auto& attr : m_attributes) {
+        result[attr.name] = (SceneVertexAttributeOffset { .attr = attr, .offset = offset });
+        offset += SceneVertexArray::RealAttributeSize(attr) * sizeof(float);
+    }
+    return result;
+}
+
+bool SceneVertexArray::GetOption(std::string_view name) const {
+    auto it = m_options.find(name); // heterogeneous find via std::less<> — no allocation
+    return it != m_options.end() && it->second;
+}
+void SceneVertexArray::SetOption(std::string_view name, bool value) {
+    m_options[std::string(name)] = value;
+}

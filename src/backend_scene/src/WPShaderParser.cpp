@@ -1,0 +1,1161 @@
+#include "WPShaderParser.hpp"
+
+#include "Fs/IBinaryStream.h"
+#include "Utils/Logging.h"
+#include "Utils/SceneProfiler.h"
+#include "WPJson.hpp"
+
+#include "wpscene/WPUniform.h"
+#include "Fs/VFS.h"
+#include "Utils/Sha.hpp"
+#include "Utils/String.h"
+#include "WPCommon.hpp"
+
+#include "Vulkan/ShaderComp.hpp"
+
+#include <algorithm>
+#include <regex>
+#include <stack>
+#include <charconv>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <unordered_map>
+#include <set>
+
+static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
+
+#define SHADER_DIR    "spvs01"
+#define SHADER_SUFFIX "spvs"
+
+// Header inclusions must precede `using namespace wallpaper;` and the
+// surrounding anonymous namespace below — otherwise headers that declare
+// `namespace wallpaper { ... }` end up nesting inside the anonymous
+// namespace and their symbols become `<anon>::wallpaper::X` rather than
+// `::wallpaper::X`.
+#include "WPShaderTransforms.h"
+#include "ShaderSourceScan.hpp"
+#include "WPShaderPreamble.hpp"
+#include "ShaderComboGuard.hpp"
+
+using namespace wallpaper;
+
+namespace
+{
+
+// Re-bound here for readability of the call sites below.
+static constexpr const char* pre_shader_code      = ::wallpaper::kPreShaderCodeCommon;
+static constexpr const char* pre_shader_code_vert = ::wallpaper::kPreShaderCodeVert;
+static constexpr const char* pre_shader_code_frag = ::wallpaper::kPreShaderCodeFrag;
+static constexpr const char* pre_shader_code_geom = ::wallpaper::kPreShaderCodeGeom;
+
+// Bound on #include expansion.  A workshop shader package is untrusted input and
+// this scanner is purely textual -- it never evaluates #ifndef / #pragma once, so
+// an author's include guard does NOT break a cycle here the way it would in a real
+// preprocessor.  Two headers that include each other is an ordinary authoring
+// pattern, and without a bound it recurses until the parse thread's stack
+// overflows.  That lands as a SIGSEGV, which the Looper's catch(...) -- the net
+// that otherwise keeps a bad scene from killing plasmashell -- cannot intercept.
+constexpr unsigned kMaxIncludeDepth = 16;
+
+inline std::string LoadGlslIncludeImpl(fs::VFS& vfs, const std::string& input, unsigned depth,
+                                       std::set<std::string>& active) {
+    std::string::size_type pos = 0;
+    std::string            output;
+    std::string::size_type linePos = std::string::npos;
+
+    // Helper: is the `#include` token on this line preceded by `//`
+    // earlier in the same line?  Wallpaper shader 2317494988
+    // (Cyberpunk 2077, crt_scan_line) keeps a `//#include "common.hlsli"`
+    // dead-line that previously triggered a spurious VFS miss.
+    auto includeIsCommented = [&](std::string::size_type incPos) {
+        auto lineStart = input.rfind('\n', incPos);
+        lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+        auto cmt = input.find("//", lineStart);
+        return cmt != std::string::npos && cmt < incPos;
+    };
+
+    while (linePos = input.find("#include", pos), linePos != std::string::npos) {
+        auto lineEnd  = input.find_first_of('\n', linePos);
+        // Last line with no trailing newline: clamp so none of the `pos = lineEnd`
+        // assignments below can leave pos == npos, which made the closing
+        // input.substr(pos) throw std::out_of_range.  PreShaderSrc newline-terminates
+        // the top-level source, so only a nested include could reach this.
+        if (lineEnd == std::string::npos) lineEnd = input.size();
+        if (includeIsCommented(linePos)) {
+            // Copy verbatim through the rest of this line and keep scanning.
+            auto next = (lineEnd == std::string::npos) ? input.size() : lineEnd;
+            output.append(input.substr(pos, next - pos));
+            pos = next;
+            continue;
+        }
+        auto lineSize = lineEnd - linePos;
+        auto lineStr  = input.substr(linePos, lineSize);
+        output.append(input.substr(pos, linePos - pos));
+
+        auto qOpen  = lineStr.find_first_of('\"');
+        auto qClose = lineStr.find_last_of('\"');
+        if (qOpen == std::string::npos || qClose == std::string::npos || qClose <= qOpen) {
+            // Malformed #include (no/empty quoted name). Copy the line verbatim
+            // and keep scanning — do NOT run substr(0, npos), which would treat
+            // the whole line as a bogus include name and trigger a spurious VFS
+            // miss. pos is advanced below, so the continue cannot infinite-loop.
+            LOG_INFO("skipped malformed #include (no quoted name): %s", lineStr.c_str());
+            output.append(lineStr);
+            pos = lineEnd;
+            continue;
+        }
+        auto inP         = qOpen + 1;
+        auto includeName = lineStr.substr(inP, qClose - inP);
+        if (depth >= kMaxIncludeDepth) {
+            LOG_ERROR("#include \"%s\" nested deeper than %u, skipping (include cycle?)",
+                      includeName.c_str(),
+                      kMaxIncludeDepth);
+            output.append(lineStr);
+            pos = lineEnd;
+            continue;
+        }
+        // Already being expanded further up this chain -> a cycle.  Skip it and
+        // keep going, so the rest of the header still reaches the compiler.
+        // Erased again below, so a diamond (two headers including a third) still
+        // expands both times, exactly as before.
+        if (! active.insert(includeName).second) {
+            LOG_ERROR("#include \"%s\" is already being expanded, skipping (include cycle)",
+                      includeName.c_str());
+            output.append(lineStr);
+            pos = lineEnd;
+            continue;
+        }
+        auto includeSrc  = fs::GetFileContent(vfs, "/assets/shaders/" + includeName);
+        output.append("\n//-----include " + includeName + "\n");
+        output.append(LoadGlslIncludeImpl(vfs, includeSrc, depth + 1, active));
+        output.append("\n//-----include end\n");
+        active.erase(includeName);
+
+        pos = lineEnd;
+    }
+    output.append(input.substr(pos));
+    return output;
+}
+
+inline std::string LoadGlslInclude(fs::VFS& vfs, const std::string& input) {
+    std::set<std::string> active;
+    return LoadGlslIncludeImpl(vfs, input, 0u, active);
+}
+
+inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
+                          const std::vector<WPShaderTexInfo>& texinfos) {
+    auto& combos       = pWPShaderInfo->combos;
+    auto& wpAliasDict  = pWPShaderInfo->alias;
+    auto& shadervalues = pWPShaderInfo->svs;
+    auto& defTexs      = pWPShaderInfo->defTexs;
+    idx   texcount     = std::ssize(texinfos);
+
+    // Follows the #if nesting so a texture declared inside its own combo's
+    // guard is not mistaken for one the scene bound.
+    ShaderComboGuard combo_guard;
+
+    // pos start of line
+    std::string::size_type pos = 0, lineEnd = std::string::npos;
+    while ((lineEnd = src.find_first_of(('\n'), pos)), true) {
+        const auto clineEnd = lineEnd;
+        const auto line     = src.substr(pos, lineEnd - pos);
+
+        combo_guard.OnLine(line);
+
+        /*
+        if(line.find("attribute ") != std::string::npos || line.find("in ") != std::string::npos) {
+            update_pos = true;
+        }
+        */
+        if (line.find("// [COMBO]") != std::string::npos) {
+            // A hostile shader can have "// [COMBO]" without a '{' on the same
+            // line; substr(npos) throws out_of_range.  Skip the JSON parse if
+            // there's no opening brace — using `continue` here would skip the
+            // pos update at the bottom of the outer loop and infinite-loop.
+            auto brace = line.find_first_of('{');
+            if (brace != std::string::npos) {
+                nlohmann::json combo_json;
+                if (PARSE_JSON(line.substr(brace), combo_json)) {
+                    if (combo_json.contains("combo")) {
+                        std::string name;
+                        int32_t     value = 0;
+                        GET_JSON_NAME_VALUE(combo_json, "combo", name);
+                        GET_JSON_NAME_VALUE(combo_json, "default", value);
+                        combos[name] = std::to_string(value);
+                    }
+                }
+            }
+        } else if (line.find("uniform ") != std::string::npos) {
+            auto brace = line.find_first_of('{');
+            if (line.find("// {") != std::string::npos && brace != std::string::npos) {
+                nlohmann::json sv_json;
+                if (PARSE_JSON(line.substr(brace), sv_json)) {
+                    std::vector<std::string> defines =
+                        utils::SpliteString(line.substr(0, line.find_first_of(';')), ' ');
+
+                    std::string material;
+                    GET_JSON_NAME_VALUE_NOWARN(sv_json, "material", material);
+                    if (! material.empty()) wpAliasDict[material] = defines.back();
+
+                    ShaderValue sv;
+                    std::string name  = defines.back();
+                    bool        istex = name.compare(0, 9, "g_Texture") == 0;
+                    if (istex) {
+                        wpscene::WPUniformTex wput;
+                        wput.FromJson(sv_json);
+                        i32 index { 0 };
+                        STRTONUM(name.substr(9), index);
+                        if (! wput.default_.empty()) defTexs.push_back({ index, wput.default_ });
+
+                        // A slot that is present but empty still binds a 1x1 dummy
+                        // texture, so turning the combo on makes the shader read that
+                        // dummy as if it were real normal/roughness/etc data.  Gate on
+                        // the slot actually holding something.  A shader-declared
+                        // default counts as bound: scene parsing writes it into the
+                        // slot right after this runs.
+                        const bool slot_filled =
+                            index >= 0 && index < texcount && texinfos[(usize)index].enabled;
+                        // A declaration wrapped in its own combo's guard only
+                        // exists once that combo is on, so its default cannot be
+                        // what turns it on.
+                        const bool self_guarded = combo_guard.Guards(wput.combo);
+                        const bool tex_bound =
+                            slot_filled || (! wput.default_.empty() && ! self_guarded);
+
+                        if (! wput.combo.empty()) {
+                            combos[wput.combo] = tex_bound ? "1" : "0";
+                        }
+                        // formatcombo: auto-generate combo from the format field name
+                        // e.g. {"format":"normalmap","formatcombo":true} → NORMALMAP=1
+                        if (sv_json.contains("formatcombo") &&
+                            sv_json.at("formatcombo").get<bool>()) {
+                            std::string format;
+                            GET_JSON_NAME_VALUE_NOWARN(sv_json, "format", format);
+                            if (! format.empty()) {
+                                std::string comboName = format;
+                                std::transform(comboName.begin(),
+                                               comboName.end(),
+                                               comboName.begin(),
+                                               ::toupper);
+                                combos[comboName] = tex_bound ? "1" : "0";
+                            }
+                        }
+                        // Component flags come out of the real texture header, so a
+                        // default that has not been loaded yet has nothing to offer.
+                        if (slot_filled) {
+                            auto& compos = texinfos[(usize)index].composEnabled;
+
+                            usize num = std::min(std::size(compos), std::size(wput.components));
+                            for (usize i = 0; i < num; i++) {
+                                if (compos[i]) combos[wput.components[i].combo] = "1";
+                            }
+                        }
+
+                    } else {
+                        if (sv_json.contains("default")) {
+                            auto        value = sv_json.at("default");
+                            ShaderValue sv;
+                            name = defines.back();
+                            if (value.is_string()) {
+                                std::vector<float> v;
+                                GET_JSON_VALUE(value, v);
+                                sv = std::span<const float>(v);
+                            } else if (value.is_number()) {
+                                sv.setSize(1);
+                                GET_JSON_VALUE(value, sv[0]);
+                            }
+                            shadervalues[name] = sv;
+                        }
+                        if (sv_json.contains("combo")) {
+                            std::string name;
+                            GET_JSON_NAME_VALUE(sv_json, "combo", name);
+                            combos[name] = "1";
+                        }
+                    }
+                    if (defines.back()[0] != 'g') {
+                        LOG_INFO("user shader uniform: '%s' (alias: '%s')",
+                                 defines.back().c_str(),
+                                 material.c_str());
+                    }
+                }
+            }
+        }
+
+        // end
+        if (line.find("void main()") != std::string::npos || clineEnd == std::string::npos) {
+            break;
+        }
+        pos = lineEnd + 1;
+    }
+}
+
+inline usize FindIncludeInsertPos(const std::string& src, usize startPos) {
+    /* rule:
+    after attribute/varying/uniform/struct
+    befor any func
+    not in {}
+    not in #if #endif
+    */
+    (void)startPos;
+
+    auto NposToZero = [](usize p) {
+        return p == std::string::npos ? 0 : p;
+    };
+    auto nextLinePos = [](const std::string& p, usize pos) {
+        return p.find_first_of('\n', pos) + 1;
+    };
+
+    usize mainPos  = src.find("void main(");
+    bool  two_main = src.find("void main(", mainPos + 2) != std::string::npos;
+    if (two_main) return 0;
+
+    usize pos;
+    {
+        // Match attribute/varying/uniform — NOT struct.  Anchoring on `\nstruct `
+        // led to includes being pasted INSIDE multi-line struct bodies (the
+        // regex finds the LAST struct keyword and the next-line insertion
+        // lands between `struct Grid {` and the closing `};`, splitting the
+        // struct and producing a glslang "syntax error, unexpected LEFT_PAREN"
+        // at the first function definition that follows it).  Discovered via
+        // Daisies (3501635854): `struct Grid { vec2 cuv; vec2 puv; vec2 id; }`
+        // got rewritten to `struct Grid {` + ~280 lines of `common_blending.h`
+        // + the original `vec2 cuv; vec2 puv; vec2 id; };` at the bottom.  The
+        // include can sit before the struct just as safely as after it — its
+        // contents (helper functions, blend ops, etc.) don't depend on the
+        // shader's local structs.
+        usize afterPos = FindLastDeclarationLine(src);
+        if (afterPos != std::string::npos) {
+            afterPos = nextLinePos(src, afterPos + 1);
+        }
+        pos = std::min({ NposToZero(afterPos), mainPos });
+    }
+    {
+        std::stack<usize> ifStack;
+        usize             nowPos { 0 };
+        while (true) {
+            auto p = FindIfOrEndif(src, nowPos + 1);
+            if (p > mainPos || p == std::string::npos) break;
+            if (src.substr(p, 3) == "#if") {
+                ifStack.push(p);
+            } else {
+                if (ifStack.empty()) break;
+                usize ifp = ifStack.top();
+                ifStack.pop();
+                usize endp = p;
+                if (pos > ifp && pos <= endp) {
+                    pos = nextLinePos(src, endp + 1);
+                }
+            }
+            nowPos = p;
+        }
+        pos = std::min({ pos, mainPos });
+    }
+
+    return NposToZero(pos);
+}
+
+// TranslateGeometryShader — moved to WPShaderTransforms.h
+
+inline EShLanguage ToGLSL(ShaderType type) {
+    switch (type) {
+    case ShaderType::VERTEX: return EShLangVertex;
+    case ShaderType::GEOMETRY: return EShLangGeometry;
+    case ShaderType::FRAGMENT: return EShLangFragment;
+    default: return EShLangVertex;
+    }
+}
+
+inline std::string Preprocessor(const std::string& in_src, ShaderType type, const Combos& combos,
+                                WPPreprocessorInfo& process_info) {
+    std::string res;
+
+    std::string src = wallpaper::WPShaderParser::PreShaderHeader(in_src, combos, type);
+
+    // Handle #require directive: inject required function implementations
+    {
+        // LightingV1: PBR lighting using g_LightsPosition/g_LightsColorRadius uniforms
+        // that our backend provides.  Uses ComputePBRLightShadow from common_pbr_2.h.
+        static const std::string lightingV1_impl =
+            "\n"
+            "uniform vec4 g_LightsPosition[4];\n"
+            "uniform vec4 g_LightsColorRadius[4];\n"
+            "\n"
+            "// Forward declaration — definition comes from common_pbr_2.h (included later)\n"
+            "vec3 ComputePBRLightShadow(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,\n"
+            "    float radius, float exponent, vec3 specularTint, vec3 baseReflectance,\n"
+            "    float roughness, float metallic, float shadowFactor);\n"
+            "\n"
+            "vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal,\n"
+            "    vec3 viewVector, vec3 specularTint, vec3 f0, float roughness, float metallic)\n"
+            "{\n"
+            "    vec3 light = vec3(0.0);\n"
+            "    for (int i = 0; i < 4; ++i) {\n"
+            "        vec3 lightDelta = g_LightsPosition[i].xyz - worldPos;\n"
+            "        float radius = g_LightsColorRadius[i].w;\n"
+            "        if (radius <= 0.0) continue;\n"
+            "        // Per-light falloff exponent rides in g_LightsPosition[i].w.\n"
+            "        // WPShaderValueUpdater packs SceneLight::exponent() there;\n"
+            "        // legacy paths that don't author exponent get the default 1.0.\n"
+            "        // Clamp away from exactly 0 to keep pow() defined.\n"
+            "        float exp_ = max(g_LightsPosition[i].w, 1e-3);\n"
+            "        light += ComputePBRLightShadow(normal, lightDelta, viewVector,\n"
+            "            albedo, g_LightsColorRadius[i].rgb, radius, exp_,\n"
+            "            specularTint, f0, roughness, metallic, 1.0);\n"
+            "    }\n"
+            "    return light;\n"
+            "}\n";
+
+        thread_local const std::regex re_require(R"((^|\r?\n)#require (.+)(\r?\n))");
+        std::smatch             m;
+        std::string             tmp = src;
+        std::string             result;
+        // Nearly no shader has a #require; skip the full-source regex scan
+        // (a hot spot in scene loads) when the literal cannot occur.
+        const bool has_require = src.find("#require ") != std::string::npos;
+        while (has_require && std::regex_search(tmp, m, re_require)) {
+            result += m.prefix().str() + m[1].str();
+            std::string req_name = m[2].str();
+            // Trim whitespace
+            while (! req_name.empty() && (req_name.back() == ' ' || req_name.back() == '\r'))
+                req_name.pop_back();
+            if (req_name == "LightingV1") {
+                result += lightingV1_impl;
+            } else {
+                result += "//#require " + req_name;
+            }
+            result += m[3].str();
+            tmp = m.suffix().str();
+        }
+        result += tmp;
+        src = result;
+    }
+
+    // Strip stray #endif directives before glslang preprocessing.
+    // Some workshop shaders have unmatched #endif that truncates glslang output.
+    src = StripStrayEndifs(src);
+
+    glslang::TShader::ForbidIncluder includer;
+    glslang::TShader                 shader(ToGLSL(type));
+    const EShMessages emsg { (EShMessages)(EShMsgDefault | EShMsgSpvRules | EShMsgRelaxedErrors |
+                                           EShMsgSuppressWarnings | EShMsgVulkanRules) };
+
+    auto* data = src.c_str();
+    shader.setStrings(&data, 1);
+    shader.preprocess(&vulkan::DefaultTBuiltInResource,
+                      110,
+                      EProfile::ECoreProfile,
+                      false,
+                      false,
+                      emsg,
+                      &res,
+                      includer);
+
+    // (?:^|\s) lets us match "out vec2 foo;" at column 0 (no qualifier) as well as
+    // "smooth out vec4 foo;" where the qualifier precedes the keyword.
+    // The optional (\[\])? handles geometry shader array inputs (e.g., "in vec4 v_Color[];").
+    ForEachStageIoDecl(res, [&process_info](const std::smatch& mc) {
+        if (mc[1] == "in") {
+            process_info.input[mc[2]] = mc[0].str();
+        } else {
+            process_info.output[mc[2]] = mc[0].str();
+        }
+    });
+
+    ForEachTextureSlotUniform(res, [&process_info](const std::smatch& mc) {
+        auto str = mc[1].str();
+        uint slot;
+        auto [ptr, ec] { std::from_chars(str.c_str(), str.c_str() + str.size(), slot) };
+        if (ec != std::errc()) return;
+        process_info.active_tex_slots.insert(slot);
+    });
+    return res;
+}
+
+// NeedsFlatDecoration — moved to WPShaderTransforms.h
+
+inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessorInfo* pre,
+                                  const WPPreprocessorInfo* next) {
+    std::string insert_str {};
+    auto&       cur    = unit.preprocess_info;
+    bool        is_geo = (unit.stage == ShaderType::GEOMETRY);
+
+    // Constant-pattern varying-swap regexes hoisted to compile once, not per
+    // varying inside the loops below (cold-load / wallpaper-switch path).
+    thread_local const std::regex re_out_to_in(R"(\s*out\s)");
+    thread_local const std::regex re_in_to_out(R"(\s*in\s)");
+    thread_local const std::regex re_gs_in_decl(R"(\bin\s+([\w]+)\s+(v_\w+))");
+    thread_local const std::regex re_gs_unsized(R"((\w)\s*;)");
+    thread_local const std::regex re_strip_gs_prefix(R"(\bgs_in_(v_\w+))");
+    thread_local const std::regex re_strip_array(R"(\[\]\s*;)");
+
+    if (pre != nullptr) {
+        for (auto& [k, v] : pre->output) {
+            // For geometry shaders, check for gs_in_ prefixed name
+            bool already_declared =
+                exists(cur.input, k) || (is_geo && exists(cur.input, "gs_in_" + k));
+            if (! already_declared) {
+                auto n = std::regex_replace(v, re_out_to_in, " in ");
+                if (NeedsFlatDecoration(n)) n = "flat " + n;
+                // Geometry shader inputs: unsized arrays with gs_in_ prefix
+                if (is_geo) {
+                    n = std::regex_replace(
+                        n, re_gs_in_decl, "in $1 gs_in_$2");
+                    n = std::regex_replace(n, re_gs_unsized, "$1[];");
+                }
+                insert_str += n + '\n';
+            }
+        }
+    }
+    if (next != nullptr) {
+        for (auto& [k, v] : next->input) {
+            // For geometry shader inputs with gs_in_ prefix,
+            // check canonical name (without prefix) against current outputs
+            std::string canon = k;
+            if (canon.substr(0, 6) == "gs_in_") canon = canon.substr(6);
+            if (! exists(cur.output, k) && ! exists(cur.output, canon)) {
+                auto n = std::regex_replace(v, re_in_to_out, " out ");
+                if (NeedsFlatDecoration(n)) n = "flat " + n;
+                // Strip gs_in_ prefix and [] suffix for non-geometry outputs
+                if (k.substr(0, 6) == "gs_in_") {
+                    n = std::regex_replace(n, re_strip_gs_prefix, "$1");
+                    n = std::regex_replace(n, re_strip_array, ";");
+                }
+                insert_str += n + '\n';
+            }
+        }
+    }
+    thread_local const std::regex re_hold(SHADER_PLACEHOLD.data());
+
+    // LOG_INFO("insert: %s", insert_str.c_str());
+    // return std::regex_replace(
+    //    std::regex_replace(cur.result, re_hold, insert_str), std::regex(R"(\s+\n)"), "\n");
+    return std::regex_replace(unit.src, re_hold, insert_str);
+}
+
+// FixImplicitConversions — moved to WPShaderTransforms.h
+// FixEffectAlpha — moved to WPShaderTransforms.h
+
+inline std::string GenSha1(std::span<const WPShaderUnit> units) {
+    std::string shas;
+    for (auto& unit : units) {
+        shas += utils::genSha1(unit.src);
+    }
+    return utils::genSha1(shas);
+}
+inline std::string GetCachePath(std::string_view scene_id, std::string_view filename) {
+    return std::string("/cache/") + std::string(scene_id) + "/" SHADER_DIR "/" +
+           std::string(filename) + "." SHADER_SUFFIX;
+}
+
+// Read one SPV cache entry.  Everything here is validated: the cache file may
+// be truncated (disk full, a crash mid-write, a half-synced ostree deploy) and
+// what it feeds is vkCreateShaderModule.  A malformed entry must lose the cache
+// hit, not the process.
+inline bool LoadShaderFromFile(std::vector<ShaderCode>& codes, fs::IBinaryStream& file) {
+    codes.clear();
+
+    const i32 ver = ReadSPVVesion(file);
+    if (ver != 1) {
+        LOG_ERROR("spv cache: unsupported format version %d", ver);
+        return false;
+    }
+
+    const usize count = file.ReadUint32();
+    if (count > 16) return false;
+
+    // Build into a local and publish only on success, so a rejected entry
+    // leaves `codes` empty rather than half-filled.
+    std::vector<ShaderCode> out(count);
+    for (usize i = 0; i < count; i++) {
+        auto& c = out[i];
+
+        const u32 size = file.ReadUint32();
+        if (size % 4 != 0) return false;
+        // A declared size larger than the bytes actually left in the file would
+        // turn into a multi-GB resize inside plasmashell before any read fails.
+        if (! CountFitsStream(file, size)) {
+            LOG_ERROR("spv cache: entry %zu declares %u bytes past end of file", i, size);
+            return false;
+        }
+
+        c.resize(size / 4);
+        if (file.Read((char*)c.data(), size) != size) {
+            // A short read leaves zero-padded, malformed SPIR-V that would go
+            // straight to the driver.
+            LOG_ERROR("spv cache: short read on entry %zu (%u bytes)", i, size);
+            return false;
+        }
+    }
+
+    codes = std::move(out);
+    return true;
+}
+
+inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStreamW& file) {
+    char nop[256] { '\0' };
+
+    WriteSPVVesion(file, 1);
+    file.WriteUint32((u32)codes.size());
+    for (const auto& c : codes) {
+        u32 size = (u32)c.size() * 4;
+        file.WriteUint32(size);
+        file.Write((const char*)c.data(), size);
+    }
+    file.Write(nop, sizeof(nop));
+}
+
+// Standalone compile function: runs Finalprocessor + FixImplicitConversions + glslang.
+//
+// Serialized across threads via vulkan::GlslangSerialiseMutex().  Two
+// third-party / standard-library races would
+// otherwise fire under parallel async compilation:
+//
+//   1. libstdc++ std::regex_search with a `thread_local const std::regex` shared between
+//      threads can read freed NFA state in `_NFA_base::_M_sub_count`.  This is
+//      observable in WPShaderTransforms.h's FixImplicitConversions.
+//   2. glslang's keyword scanner uses an internal `unordered_set<const char*>` that
+//      is not thread-safe; concurrent `tokenizeIdentifier` calls UAF on its
+//      hashtable buckets.
+//
+// Caching dedupes by SHA1 so the same shader still only compiles once total —
+// the lock just serializes the per-shader work across threads.
+static bool CompileShaderUnits(std::vector<WPShaderUnit>& units, std::vector<ShaderCode>& codes) {
+    std::lock_guard<std::mutex>         _guard(vulkan::GlslangSerialiseMutex());
+    std::vector<vulkan::ShaderCompUnit> vunits(units.size());
+    for (usize i = 0; i < units.size(); i++) {
+        auto&               unit     = units[i];
+        auto&               vunit    = vunits[i];
+        WPPreprocessorInfo* pre_info = i >= 1 ? &units[i - 1].preprocess_info : nullptr;
+        WPPreprocessorInfo* post_info =
+            i + 1 < units.size() ? &units[i + 1].preprocess_info : nullptr;
+
+        unit.src = Finalprocessor(unit, pre_info, post_info);
+        unit.src = FixImplicitConversions(unit.src);
+        // Apply to both stages: the vertex shader computes v_AudioShift
+        // but the fragment shader is the one that multiplies by u_*Offset
+        // inside the texture sample.  Fragment is where the clamp takes
+        // effect; vertex is untouched by this regex.
+        unit.src = ClampAudioReactiveShift(unit.src);
+        if (unit.stage == ShaderType::FRAGMENT) {
+            unit.src = FixCombineAlpha(unit.src);
+            unit.src = FixEffectAlpha(unit.src);
+            unit.src = FixFragmentGlPosition(unit.src);
+        }
+
+        vunit.src   = unit.src;
+        vunit.stage = ToGLSL(unit.stage);
+    }
+
+    // Fix cross-stage varying type mismatches
+    if (units.size() >= 2) {
+        auto parseVaryings = [](const std::string& src, const char* kw) {
+            std::map<std::string, std::string> m;
+            std::regex                         re(std::string(R"(\b)") + kw +
+                          R"(\s+(vec[234]|float)\s+(\w+)\s*(\[\])?\s*;)");
+            for (auto it = std::sregex_iterator(src.begin(), src.end(), re);
+                 it != std::sregex_iterator();
+                 ++it)
+                m[(*it)[2].str()] = (*it)[1].str();
+            return m;
+        };
+        auto dim = [](const std::string& t) -> int {
+            if (t == "float") return 1;
+            if (t == "vec2") return 2;
+            if (t == "vec3") return 3;
+            if (t == "vec4") return 4;
+            return 0;
+        };
+        auto upgradeVarying = [&dim](std::string&       src,
+                                     const char*        io_kw,
+                                     const std::string& name,
+                                     const std::string& old_type,
+                                     const std::string& new_type) {
+            std::regex  re_decl(std::string("\\b") + io_kw + "\\s+" + old_type + "\\s+" + name +
+                               R"(\s*(\[\])?\s*;)");
+            std::string suffix = "$1";
+            src                = std::regex_replace(
+                src, re_decl, std::string(io_kw) + " " + new_type + " " + name + suffix + ";");
+
+            if (std::string(io_kw) == "out") {
+                int         od = dim(old_type), nd = dim(new_type);
+                std::string pad;
+                for (int p = 0; p < nd - od; p++) pad += ", 0.0";
+                std::regex re_assign("\\b" + name + "(\\s*=\\s*)((?!" + new_type +
+                                     "\\s*\\()[^;]+);");
+                src =
+                    std::regex_replace(src, re_assign, name + "$1" + new_type + "($2" + pad + ");");
+            } else if (std::string(io_kw) == "in") {
+                // After widening fragment's `in vec2 v_TexCoord;` → `vec4`,
+                // any bare reference to v_TexCoord that expected the OLD
+                // narrower type (assignments, function args, texture coords)
+                // becomes a type mismatch.  FixImplicitConversions already
+                // ran for this stage and recorded v_TexCoord as vec2.
+                //
+                // Rather than patching specific sinks (texture(), assignment,
+                // user fn args, etc.), append the original-width swizzle to
+                // EVERY bare reference of `name` that isn't already swizzled
+                // and isn't part of the declaration.  This restores the
+                // original-width semantics throughout, matching what would
+                // have happened if FixImplicitConversions had seen the upgrade.
+                //
+                // Drivers: Fami (3034862641), Adventurous (3036962127),
+                // rhythm in garden (3496072356); Jett × Jinx (3031735486).
+                int od = dim(old_type), nd = dim(new_type);
+                if (nd > od) {
+                    const char* swz_old =
+                        (od == 1) ? ".x" : (od == 2) ? ".xy" : ".xyz";
+                    // Bare name → name.<swz_old>.  Skip names already followed
+                    // by `.` (already swizzled) or `(` (function call shadow).
+                    std::regex re_use(std::string("\\b") + name +
+                                      R"(\b(?![\.\(]))");
+                    src = std::regex_replace(src, re_use, name + swz_old);
+                    // Repair the declaration which got over-swizzled by the
+                    // pass above: `in NEWTYPE name.<swz>;` → `in NEWTYPE name;`.
+                    std::regex re_decl_swz(std::string("\\bin\\s+") + new_type +
+                                           R"(\s+)" + name + R"(\.\w+\s*;)");
+                    src = std::regex_replace(
+                        src, re_decl_swz, "in " + new_type + " " + name + ";");
+                    // Also repair if author used `varying NEWTYPE name.<swz>;`.
+                    std::regex re_decl_var(std::string("\\bvarying\\s+") +
+                                           new_type + R"(\s+)" + name +
+                                           R"(\.\w+\s*;)");
+                    src = std::regex_replace(src, re_decl_var,
+                                             "varying " + new_type + " " +
+                                                 name + ";");
+                }
+            }
+        };
+
+        for (usize pair = 0; pair + 1 < units.size(); pair++) {
+            auto outVars     = parseVaryings(units[pair].src, "out");
+            auto inVars      = parseVaryings(units[pair + 1].src, "in");
+            bool out_changed = false, in_changed = false;
+
+            for (auto& [name, itype] : inVars) {
+                auto it = outVars.find(name);
+                if (it == outVars.end() || it->second == itype) continue;
+                int od = dim(it->second), id = dim(itype);
+                if (od == 0 || id == 0) continue;
+
+                if (id > od) {
+                    upgradeVarying(units[pair].src, "out", name, it->second, itype);
+                    out_changed = true;
+                } else {
+                    upgradeVarying(units[pair + 1].src, "in", name, itype, it->second);
+                    in_changed = true;
+                }
+            }
+
+            // Reconcile uniforms with mismatched types across stages.  Driver:
+            // The Blur (3562086244) — `uniform vec2 u_refResolution` in vert
+            // but `uniform float u_refResolution` in frag.  GLSL linker errors
+            // with "Types must match".  We widen the narrower stage's
+            // declaration to match the wider, and rewrite bare references in
+            // that stage to swizzle to the original width.
+            auto vertUniforms = parseVaryings(units[pair].src, "uniform");
+            auto fragUniforms = parseVaryings(units[pair + 1].src, "uniform");
+            auto reconcileUniform = [&dim](std::string&       src,
+                                           const std::string& name,
+                                           const std::string& old_type,
+                                           const std::string& new_type) {
+                int od = dim(old_type), nd = dim(new_type);
+                if (od == 0 || nd == 0 || nd <= od) return;
+                // Rewrite every bare `name` reference to `name.<swz>` first.
+                // This includes the declaration, which we'll fix in step 2.
+                // The original-type-width swizzle preserves arithmetic
+                // semantics (e.g. `name * 0.05` stays a scalar via `.x`).
+                const char* swz = (od == 1) ? ".x" : (od == 2) ? ".xy" : ".xyz";
+                std::regex re_use(R"(\b)" + name + R"(\b(?!\.))");
+                src = std::regex_replace(src, re_use, name + swz);
+                // Now repair the declaration: `uniform OLD name.<swz>;` →
+                // `uniform NEW name;`.
+                std::regex re_decl(R"(\buniform\s+)" + old_type + R"(\s+)" +
+                                   name + R"(\.\w+\s*;)");
+                src = std::regex_replace(
+                    src, re_decl, "uniform " + new_type + " " + name + ";");
+            };
+            for (auto& [name, vtype] : vertUniforms) {
+                auto it = fragUniforms.find(name);
+                if (it == fragUniforms.end() || it->second == vtype) continue;
+                int vd = dim(vtype), fd = dim(it->second);
+                if (vd == 0 || fd == 0) continue;
+                if (vd > fd) {
+                    reconcileUniform(units[pair + 1].src, name, it->second, vtype);
+                    in_changed = true;
+                } else {
+                    reconcileUniform(units[pair].src, name, vtype, it->second);
+                    out_changed = true;
+                }
+            }
+
+            if (out_changed) vunits[pair].src = units[pair].src;
+            if (in_changed) vunits[pair + 1].src = units[pair + 1].src;
+        }
+    }
+
+    vulkan::ShaderCompOpt opt;
+    opt.client_ver             = glslang::EShTargetVulkan_1_1;
+    opt.auto_map_bindings      = true;
+    opt.auto_map_locations     = true;
+    opt.relaxed_errors_glsl    = true;
+    opt.relaxed_rules_vulkan   = true;
+    opt.suppress_warnings_glsl = true;
+
+    // Geometry shader: rename VS outputs to match GS input names
+    {
+        bool has_gs = false;
+        for (auto& u : units) {
+            if (u.stage == ShaderType::GEOMETRY) {
+                has_gs = true;
+                break;
+            }
+        }
+        if (has_gs) {
+            std::vector<std::pair<std::string, std::string>> gs_renames;
+            for (auto& unit : units) {
+                if (unit.stage != ShaderType::GEOMETRY) continue;
+                std::regex re_gs_in(
+                    R"(\bin\s+(?:flat\s+)?(?:vec[234]|float|int|ivec[234])\s+(gs_in_(\w+))\s*\[\])");
+                for (auto it = std::sregex_iterator(unit.src.begin(), unit.src.end(), re_gs_in);
+                     it != std::sregex_iterator();
+                     ++it) {
+                    gs_renames.push_back({ (*it)[2].str(), (*it)[1].str() });
+                }
+            }
+
+            for (auto& unit : units) {
+                if (unit.stage != ShaderType::VERTEX) continue;
+                for (auto& [canon, gs_name] : gs_renames) {
+                    std::regex re_decl(
+                        "\\bout\\s+((?:flat\\s+)?(?:vec[234]|float|int|ivec[234])\\s+)" + canon +
+                        "\\s*;");
+                    unit.src = std::regex_replace(unit.src, re_decl, "out $1" + gs_name + ";");
+                    std::regex re_use("\\b" + canon + "\\b");
+                    unit.src = std::regex_replace(unit.src, re_use, gs_name);
+                }
+            }
+
+            for (usize i = 0; i < units.size(); i++) {
+                vunits[i].src = units[i].src;
+            }
+
+            // Dump GS shaders for debugging (thread-safe counter)
+            {
+                static std::atomic<int> dump_idx { 0 };
+                int                     idx = dump_idx.fetch_add(1);
+                if (idx < 5) {
+                    const char* stage_names[] = { "VERTEX", "GEOMETRY", "FRAGMENT" };
+                    for (usize i = 0; i < vunits.size(); i++) {
+                        int         si   = (vunits[i].stage == EShLangVertex)     ? 0
+                                           : (vunits[i].stage == EShLangGeometry) ? 1
+                                                                                  : 2;
+                        std::string path = "/tmp/gs_dump_" + std::to_string(idx) + "_" +
+                                           std::string(stage_names[si]) + ".glsl";
+                        std::ofstream f(path);
+                        if (f) f << vunits[i].src;
+                        LOG_INFO("GS dump[%d]: stage=%s → %s (%zu bytes)",
+                                 idx,
+                                 stage_names[si],
+                                 path.c_str(),
+                                 vunits[i].src.size());
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<vulkan::Uni_ShaderSpv> spvs(units.size());
+
+    if (! vulkan::CompileAndLinkShaderUnits(vunits, opt, spvs)) {
+        return false;
+    }
+
+    codes.clear();
+    for (auto& spv : spvs) {
+        codes.emplace_back(std::move(spv->spirv));
+    }
+    return true;
+}
+
+// Compiled-SPV memo, keyed by the sha1 of the post-preprocess unit sources.
+//
+// This holds VALUES, never a handle into caller memory.  It used to hold
+// `std::vector<ShaderCode>*` pointers into the `SceneShader`s a scene load was
+// building, written through by an end-of-parse flush — so a load that died
+// between the two (a throw out of WPSceneParser::Parse, or an effect chain
+// dropped after some of its passes had already compiled) left dangling
+// pointers that the NEXT load's flush wrote through.  Values cannot express
+// that bug.
+//
+// The dedupe is what the memo is for: a scene references the same shader from
+// many materials and glslang is the expensive part of a cold load.
+// `s_compileMtx` covers the whole find-compile-insert so one shader compiles
+// once even when two screens load the same wallpaper at the same time.
+static std::mutex                                               s_compileMtx;
+static std::unordered_map<std::string, std::vector<ShaderCode>> s_spvMemo;
+static std::size_t                                              s_memoCompiles { 0 };
+static std::chrono::steady_clock::duration                      s_memoCompileTime {
+    std::chrono::steady_clock::duration::zero()
+};
+
+} // namespace
+
+std::string WPShaderParser::PreShaderSrc(fs::VFS& vfs, const std::string& src,
+                                         WPShaderInfo*                       pWPShaderInfo,
+                                         const std::vector<WPShaderTexInfo>& texinfos) {
+    std::string            newsrc(src);
+    std::string::size_type pos = 0;
+    std::string            include;
+    // Helper: is the `#include` at incPos commented out (preceded by `//`
+    // earlier on the same line)?  Driver: Cyberpunk 2077 (2317494988)
+    // ships `//#include "common.hlsli"` in crt_scan_line.frag — without
+    // this guard the dead-line still triggers a VFS lookup + miss.
+    auto includeIsCommented = [&src](std::string::size_type incPos) {
+        auto lineStart = src.rfind('\n', incPos);
+        lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+        auto cmt = src.find("//", lineStart);
+        return cmt != std::string::npos && cmt < incPos;
+    };
+    while (pos = src.find("#include", pos), pos != std::string::npos) {
+        if (includeIsCommented(pos)) {
+            // Step past this token so the next find scans the rest of the
+            // shader; leave newsrc untouched (the dead-line stays a comment).
+            pos = src.find_first_of('\n', pos);
+            if (pos == std::string::npos) break;
+            continue;
+        }
+        auto begin = pos;
+        pos        = src.find_first_of('\n', pos);
+        // Hostile shader without a trailing newline after #include — treat
+        // the rest of src as the include line. Without this, pos==npos
+        // makes (pos - begin) wrap to SIZE_MAX and replace/substr abort.
+        auto len = (pos == std::string::npos) ? src.size() - begin : pos - begin;
+        newsrc.replace(begin, len, len, ' ');
+        include.append(src.substr(begin, len) + "\n");
+        if (pos == std::string::npos) break;
+    }
+    include = LoadGlslInclude(vfs, include);
+
+    ParseWPShader(include, pWPShaderInfo, texinfos);
+    ParseWPShader(newsrc, pWPShaderInfo, texinfos);
+
+    newsrc.insert(FindIncludeInsertPos(newsrc, 0), include);
+    return newsrc;
+}
+
+std::string WPShaderParser::PreShaderHeader(const std::string& src, const Combos& combos,
+                                            ShaderType type) {
+    std::string pre(pre_shader_code);
+    if (type == ShaderType::VERTEX) pre += pre_shader_code_vert;
+    if (type == ShaderType::GEOMETRY) pre += pre_shader_code_geom;
+    if (type == ShaderType::FRAGMENT) pre += pre_shader_code_frag;
+    // Append #define combos directly into `pre` instead of copying it into a
+    // separate `header` string first (that copy of the shader header block was
+    // pure waste — `pre` is not reused afterward).
+    for (const auto& c : combos) {
+        std::string cup(c.first);
+        std::transform(c.first.begin(), c.first.end(), cup.begin(), ::toupper);
+        if (c.second.empty()) {
+            LOG_ERROR("combo '%s' can't be empty", cup.c_str());
+            continue;
+        }
+        pre.append("#define " + cup + " " + c.second + "\n");
+    }
+    // The preamble maps HLSL's log10 onto GLSL with a function-like macro.  A
+    // shader that carries its own log10 helper would have the macro expanded
+    // inside the definition (`float(log(float x) / ...)`), which glslang
+    // rejects — the tone-mapping effect from workshop 2812601803 does exactly
+    // that.  Drop the macro again so the shader's function wins.
+    static const std::regex defines_log10(
+        R"(\b(?:float|half|double|vec[234]|half[234])\s+log10\s*\()");
+    if (std::regex_search(src, defines_log10)) {
+        pre.append("#undef log10\n");
+    }
+    return pre + src;
+}
+
+void WPShaderParser::InitGlslang() {
+    std::lock_guard<std::mutex> _guard(vulkan::GlslangSerialiseMutex());
+    glslang::InitializeProcess();
+}
+void WPShaderParser::FinalGlslang() {
+    std::lock_guard<std::mutex> _guard(vulkan::GlslangSerialiseMutex());
+    glslang::FinalizeProcess();
+}
+
+bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderUnit> units,
+                                  std::vector<ShaderCode>& codes, fs::VFS& vfs,
+                                  WPShaderInfo*                    shader_info,
+                                  std::span<const WPShaderTexInfo> texs) {
+    WEK_PROFILE_SCOPE("WPShaderParser::CompileToSpv");
+    (void)texs;
+
+    {
+        // Single lock around BOTH the HLSL→GLSL translator passes AND the
+        // Preprocessor — both share the same root concurrency hazard:
+        //  - TranslateGeometryShader / TranslateHlslClip are in WPShaderTransforms.h
+        //    and use `thread_local const std::regex` extensively. libstdc++'s regex
+        //    matcher reads internal NFA state without synchronisation; two
+        //    threads calling regex_search on the same static regex can read
+        //    freed `_NFA_base::_M_sub_count` and SIGSEGV in `_Executor::_M_dfs`.
+        //    Reproduces on particle wallpapers with geometry shaders
+        //    (e.g. 'genericparticle' with geom stage 2732 bytes) under
+        //    concurrent CompileToSpv calls from multiple ParseParticleObj
+        //    invocations.
+        //  - Preprocessor() invokes glslang::TShader::preprocess, which holds
+        //    non-thread-safe static keyword tables.
+        // See the GlslangSerialiseMutex comment in Vulkan/Shader.cpp for the full
+        // race rationale.  The translator + preprocessor block was scoped to
+        // the lock together because both surfaces share the same compilation
+        // critical section; splitting them lets CompileToSpv from parallel
+        // ParseParticleObj calls race in TranslateGeometryShader.
+        std::lock_guard<std::mutex> _guard(vulkan::GlslangSerialiseMutex());
+
+        // Translate WE geometry shader syntax to GLSL before preprocessing.
+        // Fragment units also pick up the HLSL clip()-statement rewrite so the
+        // volumetric-fog shader family (and any other material that ships HLSL
+        // clip()) translates cleanly.
+        for (auto& unit : units) {
+            if (unit.stage == ShaderType::GEOMETRY) {
+                unit.src = TranslateGeometryShader(unit.src);
+            } else if (unit.stage == ShaderType::FRAGMENT) {
+                unit.src = TranslateHlslClip(unit.src);
+            }
+        }
+
+        std::for_each(units.begin(), units.end(), [shader_info](auto& unit) {
+            unit.src =
+                Preprocessor(unit.src, unit.stage, shader_info->combos, unit.preprocess_info);
+        });
+    }
+
+    // Post-preprocessing: inject GS layout declarations with evaluated max_vertices.
+    for (auto& unit : units) {
+        if (unit.stage != ShaderType::GEOMETRY) continue;
+
+        // TRAILSUBDIVISION comes from workshop content (a scene's material
+        // `combos`, or a `// [COMBO]` line in a shipped shader), so it is an
+        // attacker-controlled int32.  std::stoi would throw on a non-numeric
+        // value and `4 + subdiv * 2` overflows for anything past INT_MAX/2.
+        // Clamp to what a geometry shader can actually emit: Vulkan guarantees
+        // maxGeometryOutputVertices >= 256, and WE ropes subdivide in the low
+        // tens.
+        constexpr int kMaxSubdiv = 126; // 4 + 126*2 == 256
+        int           maxVerts   = 4;
+        auto          it         = shader_info->combos.find("TRAILSUBDIVISION");
+        if (it != shader_info->combos.end()) {
+            int  subdiv = 0;
+            auto first  = it->second.data();
+            auto last   = first + it->second.size();
+            if (std::from_chars(first, last, subdiv).ec != std::errc()) {
+                LOG_ERROR("TRAILSUBDIVISION '%s' is not a number - using %d",
+                          it->second.c_str(),
+                          maxVerts);
+            } else {
+                subdiv   = std::clamp(subdiv, 0, kMaxSubdiv);
+                maxVerts = 4 + subdiv * 2;
+            }
+        }
+
+        std::string layouts = "layout(points) in;\n"
+                              "layout(triangle_strip, max_vertices = " +
+                              std::to_string(maxVerts) + ") out;\n\n";
+        auto ver_pos = unit.src.find("#version");
+        if (ver_pos != std::string::npos) {
+            auto eol = unit.src.find('\n', ver_pos);
+            if (eol != std::string::npos)
+                unit.src.insert(eol + 1, layouts);
+            else
+                unit.src += "\n" + layouts;
+        } else {
+            unit.src = layouts + unit.src;
+        }
+    }
+
+    bool has_cache_dir = vfs.IsMounted("cache");
+
+    if (has_cache_dir) {
+        std::string sha1            = GenSha1(units);
+        std::string cache_file_path = GetCachePath(scene_id, sha1);
+
+        if (vfs.Contains(cache_file_path)) {
+            // Disk cache hit — load synchronously
+            auto cache_file = vfs.Open(cache_file_path);
+            if (! cache_file || ! ::LoadShaderFromFile(codes, *cache_file)) {
+                LOG_ERROR("load shader from \'%s\' failed", cache_file_path.c_str());
+                return false;
+            }
+            return true;
+        }
+
+        // Cache miss — compile now, memoise the RESULT, publish it into `codes`
+        // before returning.
+        //
+        // Compilation is serialised, not parallel: glslang's keyword scanner
+        // caches `const char*` keys in a process-global hash table that is not
+        // safe under concurrent reads, so CompileShaderUnits takes
+        // GlslangSerialiseMutex anyway.  This used to be a
+        // std::async(std::launch::deferred) task run from an end-of-parse
+        // flush, which bought dedupe and batched disk writes but ran the
+        // compile on the flushing thread all the same — while parking a raw
+        // pointer to the caller's buffer for the whole parse.
+        std::lock_guard<std::mutex> lock(s_compileMtx);
+
+        auto memo = s_spvMemo.find(sha1);
+        if (memo == s_spvMemo.end()) {
+            const auto              t0        = std::chrono::steady_clock::now();
+            auto                    units_vec = std::vector<WPShaderUnit>(units.begin(),
+                                                                          units.end());
+            std::vector<ShaderCode> result;
+            if (! CompileShaderUnits(units_vec, result)) {
+                result.clear(); // never publish or cache a partial module set
+            }
+            if (result.empty()) {
+                // Memoise the empty result so a shader that will never compile
+                // is not retried once per material that references it.
+                LOG_ERROR("shader compilation failed for %s", sha1.c_str());
+            } else if (auto cache_file = vfs.OpenW(cache_file_path); cache_file) {
+                ::SaveShaderToFile(result, *cache_file);
+            }
+            s_memoCompileTime += std::chrono::steady_clock::now() - t0;
+            s_memoCompiles++;
+            memo = s_spvMemo.emplace(std::move(sha1), std::move(result)).first;
+        }
+
+        // A failed compile publishes an empty `codes` and still reports success,
+        // which is what the deferred path did: the material stays alive and
+        // SceneImageEffectLayer::RemoveFailedEffects reaps just the dead pass.
+        // Returning false here would fail the whole material and drop the entire
+        // effect chain instead of the one bad pass.
+        codes = memo->second;
+        return true;
+
+    } else {
+        // No cache dir — compile synchronously
+        auto units_vec = std::vector<WPShaderUnit>(units.begin(), units.end());
+        return CompileShaderUnits(units_vec, codes);
+    }
+}
+
+std::size_t WPShaderParser::MemoCompileCount() {
+    std::lock_guard<std::mutex> lock(s_compileMtx);
+    return s_memoCompiles;
+}
+
+void WPShaderParser::ClearSpvMemo() {
+    std::lock_guard<std::mutex> lock(s_compileMtx);
+    if (s_memoCompiles > 0) {
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(s_memoCompileTime).count();
+        LOG_INFO("Shader compilation: %zu unique shaders in %lld ms",
+                 s_memoCompiles,
+                 (long long)ms);
+    }
+    s_spvMemo.clear();
+    s_memoCompiles    = 0;
+    s_memoCompileTime = std::chrono::steady_clock::duration::zero();
+}

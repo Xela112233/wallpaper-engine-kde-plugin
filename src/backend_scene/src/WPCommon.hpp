@@ -1,0 +1,122 @@
+#pragma once
+#include <string>
+#include <string_view>
+#include <charconv>
+#include "Fs/IBinaryStream.h"
+#include "Utils/Logging.h"
+#include "Core/StringHelper.hpp"
+
+namespace wallpaper
+{
+
+// Compute the ortho camera's (width, height) from scene.json's `general.zoom`
+// and the scene's ortho size.  WE's zoom is a divisor: 1 → native; 0.5 → camera
+// sees 2× the world (zoomed out); 2 → camera sees half (zoomed in).
+//
+// Pre-fix, ParseCamera ran `context.ortho_w / (i32)general.zoom` which:
+//   * Truncates 0.5 to 0 → integer division by zero → SIGFPE on the load
+//     thread → silent process death.
+//   * Loses fractional precision even when non-zero (zoom=1.5 → cast to 1).
+//
+// Found by the 2026-05-15 audit on Spiraling Sunlight (1850341785) and
+// Astronaut (2530355779) — both ship `general.zoom` as a user-property slider
+// with default 0.5.  Multi-monitor 5760×1080 ortho is incidental.
+//
+// Returns positive ints; falls back to the native ortho size when the divisor
+// is non-positive or the quotient rounds to zero.
+inline std::pair<int32_t, int32_t>
+ComputeOrthoCameraSize(int32_t ortho_w, int32_t ortho_h, float zoom) {
+    const float zoom_div = zoom > 0.0f ? zoom : 1.0f;
+    int32_t     cam_w    = static_cast<int32_t>(static_cast<float>(ortho_w) / zoom_div);
+    int32_t     cam_h    = static_cast<int32_t>(static_cast<float>(ortho_h) / zoom_div);
+    if (cam_w <= 0) cam_w = ortho_w;
+    if (cam_h <= 0) cam_h = ortho_h;
+    return { cam_w, cam_h };
+}
+
+inline int32_t ReadVersion(std::string_view prefix, fs::IBinaryStream& file) {
+    char str_v[9] { '\0' };
+    file.Read(str_v, 9);
+    // Bound the view explicitly: Read() may have filled all 9 bytes with
+    // non-null content, so decaying str_v to const char* (as the implicit
+    // string_view ctor does) would strlen past the end of the stack array.
+    const std::string_view ver(str_v, sizeof(str_v));
+    if (! sstart_with(ver, prefix)) return 0;
+
+    char* str_int = str_v + 4;
+    int   slot;
+    auto [ptr, ec] { std::from_chars(str_int, std::end(str_v), slot) };
+    if (ec != std::errc()) {
+        LOG_ERROR("read version of \'%.*s\' failed", 8, str_v);
+        return 0;
+    }
+    return slot;
+}
+inline void WriteVersion(std::string_view prefix, fs::IBinaryStreamW& file, int ver) {
+    char buf[9] { '\0' };
+    std::snprintf(buf, sizeof(buf), "%.4s%.4d", prefix.data(), ver);
+    file.Write(buf, sizeof(buf));
+}
+
+inline int32_t ReadTexVesion(fs::IBinaryStream& file) { return ReadVersion("TEX", file); }
+inline int32_t ReadMDLVesion(fs::IBinaryStream& file) { return ReadVersion("MDL", file); }
+
+// Sanity-check a stream-derived element count before vector::resize. Hostile
+// inputs declare counts (e.g., 0xFFFFFFFF) whose allocation OOMs the process
+// long before any subsequent read fails. Each entry consumes at least
+// `min_stride_bytes` from the stream, so `count` cannot exceed the bytes
+// remaining divided by the stride. Default stride 1 is the conservative
+// upper bound when the per-entry size has variable parts (strings, nested
+// blocks); tighter strides (e.g., sizeof(Vertex)) can be passed at sites
+// where the layout is fully fixed.
+inline bool CountFitsStream(const fs::IBinaryStream& file, std::size_t count,
+                            std::size_t min_stride_bytes = 1) noexcept {
+    if (min_stride_bytes == 0) return false;
+    auto pos  = file.Tell();
+    auto size = file.Size();
+    if (pos < 0 || size < 0 || pos > size) return false;
+    auto remaining = static_cast<std::size_t>(size - pos);
+    return count <= remaining / min_stride_bytes;
+}
+
+// DIY
+inline int32_t ReadSPVVesion(fs::IBinaryStream& file) { return ReadVersion("SPV", file); }
+inline void WriteSPVVesion(fs::IBinaryStreamW& file, int ver) { WriteVersion("SPVS", file, ver); }
+
+// Whether a layer's final composite (or a compose layer's own effect camera)
+// should go through the ortho overlay camera ("global_ortho") instead of the
+// scene's real camera.  A perspective scene keeps "global_ortho" around
+// specifically so flat layers can composite in pixel space; a layer only
+// wants that when the overlay actually exists, the layer itself isn't
+// declared perspective, and it doesn't inherit a 3D model's transform (which
+// is already in scene units, so re-projecting it through the pixel-space
+// overlay would scale it by the model's scale).
+inline bool UsesOrthoOverlayCamera(bool hasGlobalOrtho, bool layerPerspective,
+                                   bool inheritsModelSpace) {
+    return hasGlobalOrtho && ! layerPerspective && ! inheritsModelSpace;
+}
+
+// Whether an effect layer's final composite takes its parent group's transform.
+// Offscreen dependencies render centred in their own targets, and a fullscreen
+// layer composites through the effect camera, where a group's pixel-space
+// offset would push it off the target.
+inline bool InheritsParentTransform(bool offscreen, bool fullscreen, bool hasParent) {
+    return hasParent && ! offscreen && ! fullscreen;
+}
+
+// Camera for an effect layer's final composite; empty keeps the scene's active
+// camera. A fullscreen layer has no position or size of its own: its final
+// quad is the 2x2 card at the origin, which only the 2x2 "effect" camera
+// stretches over the whole target. Through the scene camera it lands as a few
+// pixels in the corner and the layer's effects never reach the screen. A
+// project layer is different -- it carries the scene's real size and origin,
+// so the scene camera already places it.
+inline std::string FinalCompositeCamera(bool fullscreen, bool hasGlobalOrtho, bool layerPerspective,
+                                        bool inheritsModelSpace) {
+    if (fullscreen) return "effect";
+    if (UsesOrthoOverlayCamera(hasGlobalOrtho, layerPerspective, inheritsModelSpace))
+        return "global_ortho";
+    return {};
+}
+
+} // namespace wallpaper

@@ -1,0 +1,214 @@
+#include "Swapchain.hpp"
+
+#include "Device.hpp"
+
+#include <algorithm>
+
+using namespace wallpaper::vulkan;
+
+struct SwapChainSupportDetails {
+    VkSurfaceCapabilitiesKHR        capabilities;
+    std::vector<VkSurfaceFormatKHR> formats;
+    std::vector<VkPresentModeKHR>   presentModes;
+};
+
+namespace
+{
+
+// Human-readable name for a VkPresentModeKHR — used in the create-time
+// LOG_NOTICE so a user bug report indicates which mode was actually picked.
+const char* present_mode_name(VkPresentModeKHR m) {
+    switch (m) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR:    return "IMMEDIATE";
+        case VK_PRESENT_MODE_MAILBOX_KHR:      return "MAILBOX";
+        case VK_PRESENT_MODE_FIFO_KHR:         return "FIFO";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+        default:                                return "UNKNOWN";
+    }
+}
+
+bool querySwapChainSupport(const vvk::PhysicalDevice& gpu, VkSurfaceKHR surface,
+                           SwapChainSupportDetails& details) {
+    VVK_CHECK_BOOL_RE(gpu.GetSurfaceCapabilitiesKHR(surface, details.capabilities));
+    VVK_CHECK_BOOL_RE(gpu.GetSurfaceFormatsKHR(surface, details.formats));
+    VVK_CHECK_BOOL_RE(gpu.GetSurfacePresentModesKHR(surface, details.presentModes));
+    // chooseSwapSurfaceFormat indexes element 0 unconditionally, so an empty
+    // list is a read past the end rather than a failed create.  A surface
+    // advertising no format cannot be presented to anyway.
+    if (details.formats.empty()) {
+        LOG_ERROR("surface advertises no formats");
+        return false;
+    }
+    return true;
+}
+
+VkSurfaceFormatKHR chooseSwapSurfaceFormat(std::span<const VkSurfaceFormatKHR> availableFormats) {
+    for (const auto& availableFormat : availableFormats) {
+        if (availableFormat.format == VK_FORMAT_B8G8R8A8_UNORM ||
+            availableFormat.format == VK_FORMAT_R8G8B8A8_UNORM) {
+            if (availableFormat.colorSpace == VK_COLORSPACE_SRGB_NONLINEAR_KHR)
+                return availableFormat;
+        }
+    }
+    auto& format = availableFormats[0];
+    LOG_NOTICE("swapchain format: %s, color space: %s",
+               vvk::ToString(format.format),
+               vvk::ToString(format.colorSpace));
+    return format;
+}
+
+std::optional<vvk::ImageView> CreateSwapImageView(const vvk::Device& device, VkFormat format,
+                                                  VkImage image) {
+    VkImageViewCreateInfo ci {
+        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext    = nullptr,
+        .image    = image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format   = format,
+        .subresourceRange =
+            VkImageSubresourceRange {
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel   = 0,
+                .levelCount     = 1,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+    };
+    vvk::ImageView view;
+    if (auto res = device.CreateImageView(ci, view); res == VK_SUCCESS) {
+        return view;
+    }
+    return std::nullopt;
+}
+} // namespace
+
+const vvk::SwapchainKHR& Swapchain::handle() const { return m_handle; }
+VkFormat                 Swapchain::format() const { return m_format.format; };
+VkExtent2D               Swapchain::extent() const { return m_extent; };
+
+std::span<const ImageParameters> Swapchain::images() const { return m_images; }
+
+VkPresentModeKHR Swapchain::presentMode() const { return m_present_mode; };
+
+bool Swapchain::Create(Device& device, VkSurfaceKHR surface, VkExtent2D extent, Swapchain& swap) {
+    SwapChainSupportDetails swap_details;
+    if (! querySwapChainSupport(device.gpu(), surface, swap_details)) return false;
+
+    swap.m_format = chooseSwapSurfaceFormat(swap_details.formats);
+
+    const auto& surfaceCapabilities = swap_details.capabilities;
+
+    const uint32_t image_count = chooseSwapchainImageCount(surfaceCapabilities);
+    swap.m_extent              = chooseSwapchainExtent(surfaceCapabilities, extent);
+
+    swap.m_present_mode = pickPresentMode(swap_details.presentModes,
+                                          swap.m_present_policy,
+                                          swap.m_target_fps,
+                                          swap.m_output_refresh_hz);
+    // Diagnostic: log the picked mode so a user bug report indicates which
+    // mode the surface ended up on (the Auto policy fall-backs are not
+    // observable in the QML config, only here).
+    LOG_NOTICE("swapchain present mode = %s on %dHz output for fps %d (policy=%d)",
+               present_mode_name(swap.m_present_mode),
+               swap.m_output_refresh_hz,
+               swap.m_target_fps,
+               static_cast<int>(swap.m_present_policy));
+    VkSurfaceTransformFlagBitsKHR preTransform   = surfaceCapabilities.currentTransform;
+    VkCompositeAlphaFlagBitsKHR   compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+
+    VkSwapchainCreateInfoKHR sci {
+        .sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .pNext            = nullptr,
+        .surface          = surface,
+        .minImageCount    = image_count,
+        .imageFormat      = swap.m_format.format,
+        .imageColorSpace  = swap.m_format.colorSpace,
+        .imageExtent      = swap.m_extent,
+        .imageArrayLayers = 1,
+        .imageUsage       = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .preTransform     = preTransform,
+        .compositeAlpha   = compositeAlpha,
+        .presentMode      = swap.m_present_mode,
+        .clipped          = true,
+        .oldSwapchain     = nullptr,
+    };
+
+    VVK_CHECK_BOOL_RE(device.device().CreateSwapchainKHR(sci, swap.m_handle));
+    {
+        std::vector<VkImage> images;
+        VVK_CHECK_BOOL_RE(swap.m_handle.GetImages(images));
+        std::transform(
+            images.begin(), images.end(), std::back_inserter(swap.m_images), [&](auto image) {
+                ImageParameters image_paras {};
+                image_paras.handle = image;
+                image_paras.extent = { swap.m_extent.width, swap.m_extent.height, 1 };
+                if (auto opt = CreateSwapImageView(device.device(), swap.m_format.format, image);
+                    opt.has_value()) {
+                    swap.m_imageviews.emplace_back(std::move(opt.value()));
+                    image_paras.view = *swap.m_imageviews.back();
+                }
+                return image_paras;
+            });
+    }
+    return true;
+}
+
+bool Swapchain::Recreate(Device& device, VkSurfaceKHR surface, VkExtent2D extent) {
+    SwapChainSupportDetails swap_details;
+    if (! querySwapChainSupport(device.gpu(), surface, swap_details)) return false;
+
+    m_format = chooseSwapSurfaceFormat(swap_details.formats);
+
+    const auto& surfaceCapabilities = swap_details.capabilities;
+
+    const uint32_t image_count = chooseSwapchainImageCount(surfaceCapabilities);
+    m_extent                   = chooseSwapchainExtent(surfaceCapabilities, extent);
+    m_present_mode             = pickPresentMode(
+        swap_details.presentModes, m_present_policy, m_target_fps, m_output_refresh_hz);
+    // No LOG_INFO at the Recreate site — would spam on Wayland resize.
+    // The Create-site log suffices for first-frame diagnostics.
+
+    // Hand the driver the old swapchain so it can recycle pool memory.
+    // The image views referencing the old swapchain's images must be
+    // dropped before the old handle is destroyed (Vulkan validation).
+    vvk::SwapchainKHR old_handle = std::move(m_handle);
+    m_images.clear();
+    m_imageviews.clear();
+
+    VkSwapchainCreateInfoKHR sci {
+        .sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .pNext            = nullptr,
+        .surface          = surface,
+        .minImageCount    = image_count,
+        .imageFormat      = m_format.format,
+        .imageColorSpace  = m_format.colorSpace,
+        .imageExtent      = m_extent,
+        .imageArrayLayers = 1,
+        .imageUsage       = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .preTransform     = surfaceCapabilities.currentTransform,
+        .compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode      = m_present_mode,
+        .clipped          = true,
+        .oldSwapchain     = *old_handle,
+    };
+
+    VVK_CHECK_BOOL_RE(device.device().CreateSwapchainKHR(sci, m_handle));
+    {
+        std::vector<VkImage> images;
+        VVK_CHECK_BOOL_RE(m_handle.GetImages(images));
+        std::transform(images.begin(), images.end(), std::back_inserter(m_images), [&](auto image) {
+            ImageParameters image_paras {};
+            image_paras.handle = image;
+            image_paras.extent = { m_extent.width, m_extent.height, 1 };
+            if (auto opt = CreateSwapImageView(device.device(), m_format.format, image);
+                opt.has_value()) {
+                m_imageviews.emplace_back(std::move(opt.value()));
+                image_paras.view = *m_imageviews.back();
+            }
+            return image_paras;
+        });
+    }
+    return true;
+}

@@ -1,0 +1,2824 @@
+#include <doctest.h>
+
+#include "WPTexImageParser.hpp"
+#include "TexVariants.hpp"
+#include "Fs/VFS.h"
+#include "Fs/MemBinaryStream.h"
+#include "Type.hpp"
+#include "Utils/Logging.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <lz4.h>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+using namespace wallpaper;
+using namespace wallpaper::fs;
+
+// ---------------------------------------------------------------------------
+// Mock filesystem: serves pre-built binary blobs keyed by VFS-internal path
+// ---------------------------------------------------------------------------
+class MockFs : public Fs {
+public:
+    void AddFile(std::string path, std::vector<uint8_t> data) {
+        m_files[std::move(path)] = std::move(data);
+    }
+
+    // Every Open() sleeps this long before returning.  Lets a test tell
+    // concurrent Parse() calls (wall time near one delay) apart from
+    // serial ones (wall time near N * delay).
+    void SetOpenDelay(std::chrono::milliseconds d) { m_openDelay = d; }
+
+    // Make Open() throw for one path, standing in for the throws a
+    // malformed .tex provokes deeper inside Parse() (sized resize, .at()
+    // on a sprite-frame index).  Open() is simply the cheapest place in
+    // this mock to put one.
+    void SetThrowOn(std::string path) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_throwOn.insert(std::move(path));
+    }
+    void ClearThrows() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_throwOn.clear();
+    }
+
+    bool Contains(std::string_view path) const override {
+        return m_files.count(std::string(path)) > 0;
+    }
+
+    std::shared_ptr<IBinaryStream> Open(std::string_view path) override {
+        // Held across the delay (not just the bookkeeping below) so a test can
+        // read back how many Open() calls PrefetchTextures actually had in
+        // flight at once — the one place worker_count's helper-thread count
+        // becomes externally observable, rather than just "faster than serial".
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_activeOpens++;
+            m_peakConcurrentOpens = std::max(m_peakConcurrentOpens, m_activeOpens);
+        }
+        if (m_openDelay.count() > 0) std::this_thread::sleep_for(m_openDelay);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_activeOpens--;
+        m_openCount[std::string(path)]++;
+        if (m_throwOn.count(std::string(path)) > 0) {
+            throw std::runtime_error("mock open failure: " + std::string(path));
+        }
+        auto it = m_files.find(std::string(path));
+        if (it == m_files.end()) return nullptr;
+        auto copy = it->second; // copy so stream owns its data
+        return std::make_shared<MemBinaryStream>(std::move(copy));
+    }
+
+    std::shared_ptr<IBinaryStreamW> OpenW(std::string_view) override { return nullptr; }
+
+    // How many times was a given VFS-internal path opened?
+    int openCount(const std::string& path) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto                        it = m_openCount.find(path);
+        return it == m_openCount.end() ? 0 : it->second;
+    }
+
+    // Highest number of Open() calls that were simultaneously in flight
+    // (inside the delay above) over this mock's lifetime.
+    int peakConcurrentOpens() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_peakConcurrentOpens;
+    }
+
+private:
+    std::unordered_map<std::string, std::vector<uint8_t>> m_files;
+    mutable std::mutex                                    m_mutex;
+    std::unordered_map<std::string, int>                  m_openCount;
+    std::unordered_set<std::string>                       m_throwOn;
+    std::chrono::milliseconds                             m_openDelay { 0 };
+    int                                                   m_activeOpens { 0 };
+    int                                                   m_peakConcurrentOpens { 0 };
+};
+
+// ---------------------------------------------------------------------------
+// Binary builder helpers
+// ---------------------------------------------------------------------------
+namespace
+{
+
+// Append raw bytes
+void append(std::vector<uint8_t>& buf, const void* data, size_t n) {
+    auto p = static_cast<const uint8_t*>(data);
+    buf.insert(buf.end(), p, p + n);
+}
+
+void appendInt32(std::vector<uint8_t>& buf, int32_t v) { append(buf, &v, 4); }
+void appendUint32(std::vector<uint8_t>& buf, uint32_t v) { append(buf, &v, 4); }
+void appendFloat(std::vector<uint8_t>& buf, float v) { append(buf, &v, 4); }
+
+// Write a 9-byte TEX version header (matches WriteVersion format)
+void appendTexVersion(std::vector<uint8_t>& buf, int ver) {
+    char hdr[9] {};
+    std::snprintf(hdr, sizeof(hdr), "%.4s%.4d", "TEX", ver);
+    append(buf, hdr, 9);
+}
+
+// Build the common .tex header portion (TEXV+TEXI+fields+TEXB)
+// Returns the buffer so callers can append image data / sprite data after it
+std::vector<uint8_t> makeTexHeader(int texvVer, int texiVer, int texbVer, int32_t type,
+                                   uint32_t flags, int32_t width, int32_t height, int32_t mapWidth,
+                                   int32_t mapHeight, int32_t count) {
+    std::vector<uint8_t> buf;
+    buf.reserve(256);
+    appendTexVersion(buf, texvVer); // TEXV
+    appendTexVersion(buf, texiVer); // TEXI
+    appendInt32(buf, type);         // texture type
+    appendUint32(buf, flags);       // flags
+    appendInt32(buf, width);
+    appendInt32(buf, height);
+    appendInt32(buf, mapWidth);
+    appendInt32(buf, mapHeight);
+    appendInt32(buf, 0);            // unknown, skipped
+    appendTexVersion(buf, texbVer); // TEXB
+    appendInt32(buf, count);
+    return buf;
+}
+
+// Append one mipmap's data for texb==1 (no LZ4 fields)
+void appendMipmapV1(std::vector<uint8_t>& buf, int32_t w, int32_t h,
+                    const std::vector<uint8_t>& pixels) {
+    appendInt32(buf, w);
+    appendInt32(buf, h);
+    appendInt32(buf, static_cast<int32_t>(pixels.size()));
+    append(buf, pixels.data(), pixels.size());
+}
+
+// Append one mipmap's data for texb==2 (with LZ4 fields)
+void appendMipmapV2(std::vector<uint8_t>& buf, int32_t w, int32_t h,
+                    const std::vector<uint8_t>& pixels, bool compress = false) {
+    appendInt32(buf, w);
+    appendInt32(buf, h);
+    if (compress) {
+        int               maxDst = LZ4_compressBound(static_cast<int>(pixels.size()));
+        std::vector<char> compressed(static_cast<size_t>(maxDst));
+        int compressedSize = LZ4_compress_default(reinterpret_cast<const char*>(pixels.data()),
+                                                  compressed.data(),
+                                                  static_cast<int>(pixels.size()),
+                                                  maxDst);
+        appendInt32(buf, 1); // LZ4_compressed = true
+        appendInt32(buf, static_cast<int32_t>(pixels.size()));
+        appendInt32(buf, compressedSize);
+        append(buf, compressed.data(), static_cast<size_t>(compressedSize));
+    } else {
+        appendInt32(buf, 0); // LZ4_compressed = false
+        appendInt32(buf, 0); // decompressed_size (unused when not compressed)
+        appendInt32(buf, static_cast<int32_t>(pixels.size()));
+        append(buf, pixels.data(), pixels.size());
+    }
+}
+
+// Build a complete simple RGBA8 .tex file (1 image, 1 mipmap, texb=1, no sprite)
+std::vector<uint8_t> makeSimpleRGBA8Tex(int32_t w, int32_t h) {
+    auto buf = makeTexHeader(1, 1, 1, /*type=RGBA8*/ 0, /*flags=*/0, w, h, w, h, /*count=*/1);
+    // image 0: 1 mipmap
+    appendInt32(buf, 1); // mipmap_count
+    std::vector<uint8_t> pixels(static_cast<size_t>(w * h * 4), 0xAB);
+    appendMipmapV1(buf, w, h, pixels);
+    return buf;
+}
+
+// Mount a .tex blob into VFS at the path WPTexImageParser expects
+void mountTex(VFS& vfs, const std::string& name, std::vector<uint8_t> data) {
+    // WPTexImageParser opens "/assets/materials/<name>.tex"
+    // VFS mount at "/assets" strips to "/materials/<name>.tex"
+    auto mockFs = std::make_unique<MockFs>();
+    mockFs->AddFile("/materials/" + name + ".tex", std::move(data));
+    vfs.Mount("/assets", std::move(mockFs));
+}
+
+// Captures the last message the sink saw, so a test can assert Parse()
+// logged the rejection reason it expects rather than just checking the
+// nullptr return (which every rejection branch produces alike).
+std::string g_lastLogMessage;
+void        captureLastLogMessage(int /*level*/, const char* msg) { g_lastLogMessage = msg; }
+
+} // namespace
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+TEST_SUITE("WPTexImageParser") {
+    TEST_CASE("Valid RGBA8 texture — Parse") {
+        VFS  vfs;
+        auto texData = makeSimpleRGBA8Tex(4, 4);
+        mountTex(vfs, "test_rgba8", std::move(texData));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_rgba8");
+
+        REQUIRE(img != nullptr);
+        CHECK(img->key == "test_rgba8");
+        CHECK(img->header.format == TextureFormat::RGBA8);
+        CHECK(img->header.width == 4);
+        CHECK(img->header.height == 4);
+        CHECK(img->header.count == 1);
+        CHECK(img->header.isSprite == false);
+        REQUIRE(img->slots.size() == 1);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        CHECK(img->slots[0].mipmaps[0].width == 4);
+        CHECK(img->slots[0].mipmaps[0].height == 4);
+        CHECK(img->slots[0].mipmaps[0].size == 4 * 4 * 4);
+        // Verify pixel data
+        CHECK(img->slots[0].mipmaps[0].data.get()[0] == 0xAB);
+    }
+
+    TEST_CASE("Valid RGBA8 texture — ParseHeader") {
+        VFS  vfs;
+        auto texData = makeSimpleRGBA8Tex(8, 8);
+        mountTex(vfs, "test_hdr", std::move(texData));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("test_hdr");
+
+        CHECK(header.format == TextureFormat::RGBA8);
+        CHECK(header.width == 8);
+        CHECK(header.height == 8);
+        CHECK(header.count == 1);
+        CHECK(header.isSprite == false);
+    }
+
+    TEST_CASE("BC1 (DXT1) format") {
+        // type=7 → BC1
+        auto buf = makeTexHeader(1, 1, 1, 7, 0, 4, 4, 4, 4, 1);
+        // BC1: 8 bytes per 4x4 block = 8 bytes for a 4x4 texture
+        appendInt32(buf, 1); // mipmap_count
+        std::vector<uint8_t> blockData(8, 0);
+        appendMipmapV1(buf, 4, 4, blockData);
+
+        VFS vfs;
+        mountTex(vfs, "test_bc1", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_bc1");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.format == TextureFormat::BC1);
+    }
+
+    TEST_CASE("BC3 (DXT5) format") {
+        auto buf = makeTexHeader(1, 1, 1, 4, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> blockData(16, 0); // 16 bytes per 4x4 block
+        appendMipmapV1(buf, 4, 4, blockData);
+
+        VFS vfs;
+        mountTex(vfs, "test_bc3", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_bc3");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.format == TextureFormat::BC3);
+    }
+
+    TEST_CASE("BC2 (DXT3) format") {
+        auto buf = makeTexHeader(1, 1, 1, 6, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> blockData(16, 0);
+        appendMipmapV1(buf, 4, 4, blockData);
+
+        VFS vfs;
+        mountTex(vfs, "test_bc2", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_bc2");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.format == TextureFormat::BC2);
+    }
+
+    TEST_CASE("RG8 format") {
+        auto buf = makeTexHeader(1, 1, 1, 8, 0, 2, 2, 2, 2, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(2 * 2 * 2, 0);
+        appendMipmapV1(buf, 2, 2, pixels);
+
+        VFS vfs;
+        mountTex(vfs, "test_rg8", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_rg8");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.format == TextureFormat::RG8);
+    }
+
+    TEST_CASE("R8 format") {
+        auto buf = makeTexHeader(1, 1, 1, 9, 0, 2, 2, 2, 2, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(2 * 2, 0);
+        appendMipmapV1(buf, 2, 2, pixels);
+
+        VFS vfs;
+        mountTex(vfs, "test_r8", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_r8");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.format == TextureFormat::R8);
+    }
+
+    TEST_CASE("Unknown format type falls back to RGBA8") {
+        auto buf = makeTexHeader(1, 1, 1, 99, 0, 2, 2, 2, 2, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(2 * 2 * 4, 0);
+        appendMipmapV1(buf, 2, 2, pixels);
+
+        VFS vfs;
+        mountTex(vfs, "test_unk", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_unk");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.format == TextureFormat::RGBA8);
+    }
+
+    TEST_CASE("Alias texture fallback — missing file") {
+        VFS vfs;
+        // Mount an empty filesystem so Contains returns false
+        auto mockFs = std::make_unique<MockFs>();
+        vfs.Mount("/assets", std::move(mockFs));
+
+        WPTexImageParser parser(&vfs);
+
+        SUBCASE("Parse returns 1x1 white fallback") {
+            auto img = parser.Parse("_alias_missing");
+            REQUIRE(img != nullptr);
+            CHECK(img->key == "_alias_missing");
+            CHECK(img->header.width == 1);
+            CHECK(img->header.height == 1);
+            CHECK(img->header.format == TextureFormat::RGBA8);
+            REQUIRE(img->slots.size() == 1);
+            REQUIRE(img->slots[0].mipmaps.size() == 1);
+            auto* px = img->slots[0].mipmaps[0].data.get();
+            CHECK(px[0] == 255);
+            CHECK(px[1] == 255);
+            CHECK(px[2] == 255);
+            CHECK(px[3] == 255);
+        }
+
+        SUBCASE("ParseHeader returns 1x1 fallback header") {
+            auto header = parser.ParseHeader("_alias_missing");
+            CHECK(header.width == 1);
+            CHECK(header.height == 1);
+            CHECK(header.format == TextureFormat::RGBA8);
+            CHECK(header.count == 1);
+        }
+    }
+
+    TEST_CASE("Alias texture with existing file — parses normally") {
+        VFS  vfs;
+        auto texData = makeSimpleRGBA8Tex(2, 2);
+        mountTex(vfs, "_alias_exists", std::move(texData));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("_alias_exists");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.width == 2);
+        CHECK(img->header.height == 2);
+    }
+
+    TEST_CASE("Sprite with out-of-range imageId — disables sprite") {
+        // Build a sprite texture: 1 image, sprite flag set
+        uint32_t spriteFlag = (1u << 2); // WPTexFlagEnum::sprite = bit 2
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 16, 16, 1);
+
+        // Image 0: 1 mipmap (texb=2, so LZ4 fields present)
+        appendInt32(buf, 1); // mipmap_count
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0);
+        appendMipmapV2(buf, 16, 16, pixels);
+
+        // Sprite section
+        appendTexVersion(buf, 2); // texs version
+        appendInt32(buf, 1);      // framecount = 1
+
+        // Frame with out-of-range imageId (only 1 image, so imageId=1 is OOB)
+        appendInt32(buf, 1);     // imageId = 1 (invalid, only index 0 exists)
+        appendFloat(buf, 0.1f);  // frametime
+        appendFloat(buf, 0.0f);  // x
+        appendFloat(buf, 0.0f);  // y
+        appendFloat(buf, 16.0f); // xAxis[0]
+        appendFloat(buf, 0.0f);  // xAxis[1]
+        appendFloat(buf, 0.0f);  // yAxis[0]
+        appendFloat(buf, 16.0f); // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_oob", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_oob");
+        // Should disable sprite instead of crashing
+        CHECK(header.isSprite == false);
+    }
+
+    TEST_CASE("Sprite with negative imageId — disables sprite") {
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 8, 8, 8, 8, 1);
+
+        appendInt32(buf, 1); // mipmap_count
+        std::vector<uint8_t> pixels(8 * 8 * 4, 0);
+        appendMipmapV2(buf, 8, 8, pixels);
+
+        appendTexVersion(buf, 2); // texs
+        appendInt32(buf, 1);      // framecount
+
+        appendInt32(buf, -1); // imageId = -1 (invalid)
+        appendFloat(buf, 0.1f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 8.0f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 8.0f);
+
+        VFS vfs;
+        mountTex(vfs, "sprite_neg", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_neg");
+        CHECK(header.isSprite == false);
+    }
+
+    TEST_CASE("Valid sprite — parsed correctly") {
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 16, 16, 1);
+
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0);
+        appendMipmapV2(buf, 16, 16, pixels);
+
+        appendTexVersion(buf, 2); // texs
+        appendInt32(buf, 1);      // framecount = 1
+
+        appendInt32(buf, 0);     // imageId = 0 (valid)
+        appendFloat(buf, 0.5f);  // frametime
+        appendFloat(buf, 0.0f);  // x
+        appendFloat(buf, 0.0f);  // y
+        appendFloat(buf, 16.0f); // xAxis[0]
+        appendFloat(buf, 0.0f);  // xAxis[1]
+        appendFloat(buf, 0.0f);  // yAxis[0]
+        appendFloat(buf, 16.0f); // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_ok", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_ok");
+        CHECK(header.isSprite == true);
+        CHECK(header.spriteAnim.numFrames() == 1);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        CHECK(frame.imageId == 0);
+        CHECK(frame.frametime == doctest::Approx(0.5f));
+    }
+
+    TEST_CASE("Sprite mipmap_pow2 with non-square image (kills w*h→w/h mutant)") {
+        // 2x4 sprite: width*height = 8 (isPow2=true), width/height = 0 (isPow2=false)
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 2, 4, 2, 4, 1);
+
+        // Image 0: 1 mipmap, 2x4
+        appendInt32(buf, 1);                       // mipmap_count
+        std::vector<uint8_t> pixels(2 * 4 * 4, 0); // 2x4 RGBA
+        appendMipmapV2(buf, 2, 4, pixels);
+
+        // Sprite section
+        appendTexVersion(buf, 2); // texs version
+        appendInt32(buf, 1);      // framecount = 1
+
+        appendInt32(buf, 0);    // imageId = 0
+        appendFloat(buf, 0.1f); // frametime
+        appendFloat(buf, 0.0f); // x
+        appendFloat(buf, 0.0f); // y
+        appendFloat(buf, 2.0f); // xAxis[0]
+        appendFloat(buf, 0.0f); // xAxis[1]
+        appendFloat(buf, 0.0f); // yAxis[0]
+        appendFloat(buf, 4.0f); // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_2x4", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_2x4");
+        CHECK(header.isSprite == true);
+        // 2 * 4 = 8 → isPow2 = true
+        // If mutated to 2 / 4 = 0 → isPow2 = false (KILLED)
+        CHECK(header.mipmap_pow2 == true);
+    }
+
+    TEST_CASE("Sprite mipmap_larger true when atlas exceeds map (padded picture)") {
+        // A plain picture stored as a single sprite frame inside a larger
+        // power-of-two container: 10x8 content in a 16x16 .tex.  ParseHeader's
+        // sprite branch used to leave mipmap_larger at its default false (only
+        // the full Parse() path computed it), so WPSceneParser collapsed the
+        // image's UV mapRate to {1,1} and the picture filled just the map/tex
+        // fraction of its quad.  Driver: Tomb Raider 1179142239 background
+        // (3500x2188 image in a 4096x4096 .tex rendered into the top-left).
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 10, 8, 1);
+
+        appendInt32(buf, 1); // mipmap_count
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0);
+        appendMipmapV2(buf, 16, 16, pixels);
+
+        appendTexVersion(buf, 2); // texs
+        appendInt32(buf, 1);      // framecount = 1
+        appendInt32(buf, 0);      // imageId = 0
+        appendFloat(buf, 0.1f);   // frametime
+        appendFloat(buf, 0.0f);   // x
+        appendFloat(buf, 0.0f);   // y
+        appendFloat(buf, 10.0f);  // xAxis[0] (content width)
+        appendFloat(buf, 0.0f);   // xAxis[1]
+        appendFloat(buf, 0.0f);   // yAxis[0]
+        appendFloat(buf, 8.0f);   // yAxis[1] (content height)
+
+        VFS vfs;
+        mountTex(vfs, "sprite_padded", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_padded");
+        CHECK(header.isSprite == true);
+        CHECK(header.mapWidth == 10);
+        CHECK(header.mapHeight == 8);
+        // mip0 area 16*16=256 > map area 10*8=80 → must be true.
+        CHECK(header.mipmap_larger == true);
+    }
+
+    TEST_CASE("Sprite mipmap_larger false when atlas equals map (animated sheet)") {
+        // Real animated sprite sheets store map == atlas (per-frame size lives
+        // in the frame axes, not map dims), so the padded-picture fix must NOT
+        // flip mipmap_larger for them — otherwise their g_Texture0Resolution
+        // would change and shift particle UVs.
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 16, 16, 1);
+
+        appendInt32(buf, 1); // mipmap_count
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0);
+        appendMipmapV2(buf, 16, 16, pixels);
+
+        appendTexVersion(buf, 2); // texs
+        appendInt32(buf, 1);      // framecount = 1
+        appendInt32(buf, 0);      // imageId = 0
+        appendFloat(buf, 0.1f);   // frametime
+        appendFloat(buf, 0.0f);   // x
+        appendFloat(buf, 0.0f);   // y
+        appendFloat(buf, 16.0f);  // xAxis[0]
+        appendFloat(buf, 0.0f);   // xAxis[1]
+        appendFloat(buf, 0.0f);   // yAxis[0]
+        appendFloat(buf, 16.0f);  // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_sheet_eq", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_sheet_eq");
+        CHECK(header.isSprite == true);
+        // mip0 area 16*16=256 == map area 16*16=256, not greater → false.
+        CHECK(header.mipmap_larger == false);
+    }
+
+    TEST_CASE("Sprite frame width computed from xAxis magnitude (kills +→- mutant)") {
+        // xAxis = (3, 4) → width = sqrt(9+16) = 5
+        // If mutated to sqrt(9-16) = sqrt(-7) → NaN → frame.width != 5
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 10, 10, 10, 10, 1);
+
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(10 * 10 * 4, 0);
+        appendMipmapV2(buf, 10, 10, pixels);
+
+        appendTexVersion(buf, 2);
+        appendInt32(buf, 1);
+
+        appendInt32(buf, 0);    // imageId
+        appendFloat(buf, 0.1f); // frametime
+        appendFloat(buf, 0.0f); // x
+        appendFloat(buf, 0.0f); // y
+        appendFloat(buf, 3.0f); // xAxis[0]
+        appendFloat(buf, 4.0f); // xAxis[1] — non-zero!
+        appendFloat(buf, 0.0f); // yAxis[0]
+        appendFloat(buf, 8.0f); // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_diag", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_diag");
+        CHECK(header.isSprite == true);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        // width = sqrt(3^2 + 4^2) = sqrt(25) = 5
+        CHECK(frame.width == doctest::Approx(5.0f));
+        // height = sqrt(0 + 64) = 8
+        CHECK(frame.height == doctest::Approx(8.0f));
+    }
+
+    TEST_CASE("Sprite texs v3 with extra width/height fields") {
+        // texs version 3 has extra width/height int32s after framecount
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 8, 8, 8, 8, 1);
+
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(8 * 8 * 4, 0);
+        appendMipmapV2(buf, 8, 8, pixels);
+
+        appendTexVersion(buf, 3); // texs version 3
+        appendInt32(buf, 1);      // framecount
+        appendInt32(buf, 128);    // extra width (texs==3)
+        appendInt32(buf, 128);    // extra height (texs==3)
+
+        // Frame data (floats since texs >= 2)
+        appendInt32(buf, 0);    // imageId
+        appendFloat(buf, 0.2f); // frametime
+        appendFloat(buf, 0.0f); // x
+        appendFloat(buf, 0.0f); // y
+        appendFloat(buf, 8.0f); // xAxis[0]
+        appendFloat(buf, 0.0f); // xAxis[1]
+        appendFloat(buf, 0.0f); // yAxis[0]
+        appendFloat(buf, 8.0f); // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_v3", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_v3");
+        CHECK(header.isSprite == true);
+        CHECK(header.spriteAnim.numFrames() == 1);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        CHECK(frame.frametime == doctest::Approx(0.2f));
+    }
+
+    TEST_CASE("Sprite texs v1 uses integer frame coordinates") {
+        // texs version 1 reads frame x/y/xAxis/yAxis as int32, not float
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 16, 16, 1);
+
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0);
+        appendMipmapV2(buf, 16, 16, pixels);
+
+        appendTexVersion(buf, 1); // texs version 1
+        appendInt32(buf, 1);      // framecount
+
+        // Frame data (int32s for texs==1)
+        appendInt32(buf, 0);    // imageId
+        appendFloat(buf, 0.3f); // frametime (still float)
+        appendInt32(buf, 2);    // x (int)
+        appendInt32(buf, 3);    // y (int)
+        appendInt32(buf, 6);    // xAxis[0] (int)
+        appendInt32(buf, 8);    // xAxis[1] (int)
+        appendInt32(buf, 0);    // yAxis[0] (int)
+        appendInt32(buf, 10);   // yAxis[1] (int)
+
+        VFS vfs;
+        mountTex(vfs, "sprite_v1", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_v1");
+        CHECK(header.isSprite == true);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        CHECK(frame.frametime == doctest::Approx(0.3f));
+        // x = 2/16 = 0.125, y = 3/16 = 0.1875
+        CHECK(frame.x == doctest::Approx(2.0f / 16.0f));
+        CHECK(frame.y == doctest::Approx(3.0f / 16.0f));
+        // width = sqrt(6^2 + 8^2) = sqrt(100) = 10
+        CHECK(frame.width == doctest::Approx(10.0f));
+    }
+
+    TEST_CASE("Sprite mipmap_pow2 with non-power-of-two product") {
+        // 3x5 sprite: width*height = 15 (isPow2=false), width/height = 0 (isPow2=false)
+        // This test verifies the multiplication is correct for non-pow2 dimensions
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 3, 5, 3, 5, 1);
+
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(3 * 5 * 4, 0);
+        appendMipmapV2(buf, 3, 5, pixels);
+
+        appendTexVersion(buf, 2);
+        appendInt32(buf, 1);
+
+        appendInt32(buf, 0);
+        appendFloat(buf, 0.1f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 3.0f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 0.0f);
+        appendFloat(buf, 5.0f);
+
+        VFS vfs;
+        mountTex(vfs, "sprite_3x5", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_3x5");
+        CHECK(header.isSprite == true);
+        CHECK(header.mipmap_pow2 == false); // 3*5=15 not pow2
+    }
+
+    TEST_CASE("LZ4 compressed mipmap") {
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+
+        // Create pixel data and compress it
+        std::vector<uint8_t> pixels(4 * 4 * 4);
+        for (size_t i = 0; i < pixels.size(); i++) {
+            pixels[i] = static_cast<uint8_t>(i & 0xFF);
+        }
+
+        appendInt32(buf, 1); // mipmap_count
+        appendMipmapV2(buf, 4, 4, pixels, /*compress=*/true);
+
+        VFS vfs;
+        mountTex(vfs, "test_lz4", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_lz4");
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots.size() == 1);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        CHECK(img->slots[0].mipmaps[0].size == static_cast<isize>(pixels.size()));
+        // Verify decompressed data matches original
+        auto* data = img->slots[0].mipmaps[0].data.get();
+        for (size_t i = 0; i < pixels.size(); i++) {
+            CHECK(data[i] == pixels[i]);
+        }
+    }
+
+    TEST_CASE("Oversized decompressed_size returns nullptr (OOM guard)") {
+        // Fuzz finding (oom-f282830d880e0ebc5ae123ee52c5fe2a20c1d163): a
+        // crafted texb=2 mipmap header with a decompressed_size in the
+        // hundreds-of-MB range triggers std::vector<char>(N) inside
+        // Lz4Decompress before LZ4 even runs.  The 256 MB cap rejects the
+        // header instead of attempting the allocation.
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);                                       // mipmap_count
+        appendInt32(buf, 4);                                       // width
+        appendInt32(buf, 4);                                       // height
+        appendInt32(buf, 1);                                       // LZ4_compressed = true
+        appendInt32(buf, 512 * 1024 * 1024);                       // decompressed_size = 512 MB
+        appendInt32(buf, 16);                                      // src_size = 16
+        for (int i = 0; i < 16; i++) buf.push_back(0);             // 16 bytes of payload
+
+        VFS vfs;
+        mountTex(vfs, "test_oom_dsize", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("test_oom_dsize") == nullptr);
+    }
+
+    TEST_CASE("MP4 placeholder buffer caps oversized dimensions (OOM guard)") {
+        // Fuzz finding (oom-aa47057a0c3b665efa41381957e7a441c40a2fda): a
+        // crafted .tex header pointed at the MP4-fallback code path with
+        // mipmap dimensions in the ten-thousands × ten-thousands range,
+        // making std::make_unique<uint8_t[]>(w*h*4) request ~676 MB.  The
+        // dimension-only guard (Rgba8ByteSize caps at 64K × 64K = 16 GB)
+        // wasn't tight enough; cap raw_size against the same 256 MB limit
+        // used for decompressed_size.  Use texb=2 + MP4 magic in the
+        // payload so the parser takes the MP4 branch.
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 13000, 13000, 13000, 13000, 1);
+        appendInt32(buf, 1);                                       // mipmap_count
+        appendInt32(buf, 13000);                                   // width (≈676MB at *4)
+        appendInt32(buf, 13000);                                   // height
+        appendInt32(buf, 0);                                       // LZ4_compressed = false
+        appendInt32(buf, 0);                                       // decompressed_size (unused)
+        appendInt32(buf, 16);                                      // src_size
+        // 16 bytes of payload with "ftyp" at offset 4 to trigger MP4 branch
+        for (int i = 0; i < 4; i++) buf.push_back(0);              // size field
+        const char ftyp[] = { 'f', 't', 'y', 'p' };
+        for (char c : ftyp) buf.push_back(static_cast<uint8_t>(c));
+        for (int i = 0; i < 8; i++) buf.push_back(0);              // remainder
+
+        VFS vfs;
+        mountTex(vfs, "test_oom_mp4_placeholder", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        // Must reject — does not allocate ~676 MB and does not crash.
+        CHECK(parser.Parse("test_oom_mp4_placeholder") == nullptr);
+    }
+
+    TEST_CASE("Decompressed_size at cap is accepted (boundary)") {
+        // Pin the cap: 256 MB ≤ decompressed_size must still pass the guard.
+        // Use a tiny src so the test stays fast; the LZ4 decode itself will
+        // fail and the parser returns nullptr — but for a different reason
+        // than the OOM guard.  We can't distinguish those cleanly from a
+        // black-box test, so just assert no crash and parser returns cleanly.
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);                                       // mipmap_count
+        appendInt32(buf, 4);                                       // width
+        appendInt32(buf, 4);                                       // height
+        appendInt32(buf, 1);                                       // LZ4_compressed = true
+        appendInt32(buf, 256 * 1024 * 1024);                       // decompressed_size = 256 MB (== cap)
+        appendInt32(buf, 16);                                      // src_size = 16
+        for (int i = 0; i < 16; i++) buf.push_back(0);
+
+        VFS vfs;
+        mountTex(vfs, "test_oom_cap", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        // Expect nullptr (LZ4_decompress_safe will fail on the 16-byte
+        // garbage with decompressed_size at cap), and no crash / no OOM
+        // (proved by reaching here).
+        CHECK(parser.Parse("test_oom_cap") == nullptr);
+    }
+
+    TEST_CASE("Zero src_size returns nullptr") {
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1); // mipmap_count
+        appendInt32(buf, 4); // mip width
+        appendInt32(buf, 4); // mip height
+        appendInt32(buf, 0); // src_size = 0
+
+        VFS vfs;
+        mountTex(vfs, "test_zero", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_zero");
+        CHECK(img == nullptr);
+    }
+
+    TEST_CASE("Zero width returns nullptr (boundary, kills <=0 → <0 mutant)") {
+        // width == 0 must hit the early-return.  Under cxx_le_to_lt the guard
+        // becomes `< 0` and lets zero through, allocating a 0-size buffer and
+        // eventually writing to NULL mipmap.data.
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 0, 4, 0, 4, 1);
+        appendInt32(buf, 1);  // mipmap_count
+        appendInt32(buf, 0);  // mip width = 0
+        appendInt32(buf, 4);  // mip height
+        appendInt32(buf, 64); // src_size (non-zero so other checks pass)
+        std::vector<uint8_t> pixels(64, 0);
+        append(buf, pixels.data(), pixels.size());
+
+        VFS vfs;
+        mountTex(vfs, "test_zerow", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_zerow");
+        CHECK(img == nullptr);
+    }
+
+    TEST_CASE("Zero height returns nullptr (boundary)") {
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 0, 4, 0, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 4);
+        appendInt32(buf, 0); // mip height = 0
+        appendInt32(buf, 64);
+        std::vector<uint8_t> pixels(64, 0);
+        append(buf, pixels.data(), pixels.size());
+
+        VFS vfs;
+        mountTex(vfs, "test_zeroh", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_zeroh");
+        CHECK(img == nullptr);
+    }
+
+    TEST_CASE("Negative width returns nullptr") {
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, -1, 4, 4, 4, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, -1); // mip width < 0
+        appendInt32(buf, 4);  // mip height
+        appendInt32(buf, 64); // src_size
+        std::vector<uint8_t> pixels(64, 0);
+        append(buf, pixels.data(), pixels.size());
+
+        VFS vfs;
+        mountTex(vfs, "test_negw", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_negw");
+        CHECK(img == nullptr);
+    }
+
+    TEST_CASE("Negative count returns nullptr") {
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, -1);
+
+        VFS vfs;
+        mountTex(vfs, "test_negcount", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_negcount");
+        CHECK(img == nullptr);
+    }
+
+    TEST_CASE("Non-existent file returns nullptr") {
+        VFS  vfs;
+        auto mockFs = std::make_unique<MockFs>();
+        vfs.Mount("/assets", std::move(mockFs));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("nonexistent");
+        CHECK(img == nullptr);
+    }
+
+    TEST_CASE("Texture flags — clampUVs and noInterpolation") {
+        // flags: bit 0 = noInterpolation, bit 1 = clampUVs
+        uint32_t flags = (1u << 0) | (1u << 1);
+        auto     buf   = makeTexHeader(1, 1, 1, 0, flags, 2, 2, 2, 2, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(2 * 2 * 4, 0);
+        appendMipmapV1(buf, 2, 2, pixels);
+
+        VFS vfs;
+        mountTex(vfs, "test_flags", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_flags");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.sample.wrapS == TextureWrap::CLAMP_TO_EDGE);
+        CHECK(img->header.sample.wrapT == TextureWrap::CLAMP_TO_EDGE);
+        CHECK(img->header.sample.magFilter == TextureFilter::NEAREST);
+        CHECK(img->header.sample.minFilter == TextureFilter::NEAREST);
+    }
+
+    TEST_CASE("Multiple images") {
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 2, 2, 2, 2, 2); // count=2
+        for (int i = 0; i < 2; i++) {
+            appendInt32(buf, 1); // mipmap_count
+            std::vector<uint8_t> pixels(2 * 2 * 4, static_cast<uint8_t>(i + 1));
+            appendMipmapV1(buf, 2, 2, pixels);
+        }
+
+        VFS vfs;
+        mountTex(vfs, "test_multi", std::move(buf));
+
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_multi");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.count == 2);
+        REQUIRE(img->slots.size() == 2);
+        CHECK(img->slots[0].mipmaps[0].data.get()[0] == 1);
+        CHECK(img->slots[1].mipmaps[0].data.get()[0] == 2);
+    }
+
+    // --- Mutation testing: TEXB v3/v4 header version branches ---
+
+    // Build texb v3 header (has imageType field after TEXB+count)
+    std::vector<uint8_t> makeTexHeaderV3(int32_t imageType, int32_t w, int32_t h) {
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, w, h, w, h, 1);
+        appendInt32(buf, imageType); // imageType field (texb >= 3)
+        return buf;
+    }
+
+    // Build texb v4 header (has imageType + isVideoMp4 fields)
+    std::vector<uint8_t> makeTexHeaderV4(int32_t imageType, int32_t w, int32_t h) {
+        auto buf = makeTexHeader(1, 1, 4, 0, 0, w, h, w, h, 1);
+        appendInt32(buf, imageType); // imageType (texb >= 3)
+        appendInt32(buf, 0);         // isVideoMp4 (texb >= 4)
+        return buf;
+    }
+
+    TEST_CASE("TEXB v3 header reads imageType — parses successfully") {
+        // texb==3 must read the imageType field; if ge_to_gt mutant fires
+        // (>= 3 becomes > 3), the imageType int won't be consumed and
+        // the stream will be misaligned, causing a parse failure.
+        // Use imageType=UNKNOWN(-1) so the parser takes the raw-copy branch
+        // instead of stbi_load — the raw RGBA payload here is not a valid
+        // image container, and the stbi pre-validation guard would reject it.
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, -1); // imageType = UNKNOWN (texb >= 3)
+        appendInt32(buf, 1); // mipmap count
+        std::vector<uint8_t> pixels(4 * 4 * 4, 0xCC);
+        appendMipmapV2(buf, 4, 4, pixels);
+
+        VFS vfs;
+        mountTex(vfs, "texb3_test", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("texb3_test");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].width == 4);
+        CHECK(img->slots[0].height == 4);
+    }
+
+    TEST_CASE("TEXB v4 header reads imageType and an empty variant table") {
+        // imageType=UNKNOWN(-1) routes through the raw-copy branch (the raw
+        // RGBA payload here is not a valid image container, so the stbi
+        // pre-validation guard would otherwise reject it).
+        auto buf = makeTexHeader(1, 1, 4, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, -1); // imageType = UNKNOWN (texb >= 3)
+        appendInt32(buf, 0);  // variant count      (texb >= 4)
+        appendInt32(buf, 1); // mipmap count
+        appendInt32(buf, 4); // w
+        appendInt32(buf, 4); // h
+        appendInt32(buf, 0);
+        appendInt32(buf, 0); // LZ4
+        std::vector<uint8_t> pixels(4 * 4 * 4, 0xDD);
+        appendInt32(buf, (int32_t)pixels.size());
+        append(buf, pixels.data(), pixels.size());
+
+        VFS vfs;
+        mountTex(vfs, "texb4_test", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("texb4_test");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].width == 4);
+        CHECK(img->slots[0].height == 4);
+    }
+
+    TEST_CASE("Mipmap size = width * height * sizeof(uint8_t)") {
+        // Kills mul_to_div on line 225: mipmap.size = src_size * sizeof(uint8_t)
+        // and line 219: src_size = w * h * 4
+        auto buf = makeSimpleRGBA8Tex(8, 4);
+        VFS  vfs;
+        mountTex(vfs, "size_check", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("size_check");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].mipmaps[0].size == 8 * 4 * 4);
+    }
+
+    // --- Mutation testing: sprite with texs=1 (integer frame data) ---
+
+    TEST_CASE("Sprite texs=1 with non-zero coords verifies division") {
+        // Kills div_to_mul on lines 299-300: x=(float)ReadInt32()/spriteWidth
+        // With x=8, spriteWidth=32: 8/32=0.25, but 8*32=256
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 32, 16, 32, 16, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(32 * 16 * 4, 0);
+        appendMipmapV2(buf, 32, 16, pixels);
+        appendTexVersion(buf, 1); // texs=1 (integer format)
+        appendInt32(buf, 1);      // framecount
+        appendInt32(buf, 0);      // imageId
+        appendFloat(buf, 0.1f);   // frametime
+        appendInt32(buf, 8);      // x (int) → 8/32 = 0.25
+        appendInt32(buf, 4);      // y (int) → 4/16 = 0.25
+        appendInt32(buf, 16);     // xAxis[0]
+        appendInt32(buf, 0);      // xAxis[1]
+        appendInt32(buf, 0);      // yAxis[0]
+        appendInt32(buf, 8);      // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_v1_div", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_v1_div");
+        CHECK(header.isSprite == true);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        CHECK(frame.x == doctest::Approx(0.25f));
+        CHECK(frame.y == doctest::Approx(0.25f));
+        // xAxis[0]/spriteWidth = 16/32 = 0.5
+        CHECK(frame.xAxis[0] == doctest::Approx(0.5f));
+        // yAxis[1]/spriteHeight = 8/16 = 0.5
+        CHECK(frame.yAxis[1] == doctest::Approx(0.5f));
+    }
+
+    TEST_CASE("Sprite texs=1 reads integer frame coordinates") {
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 32, 32, 32, 32, 1);
+        // Image 0: 1 mipmap
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(32 * 32 * 4, 0);
+        appendMipmapV2(buf, 32, 32, pixels);
+        // Sprite section with texs=1 (integer format)
+        appendTexVersion(buf, 1); // texs=1
+        appendInt32(buf, 1);      // framecount
+        appendInt32(buf, 0);      // imageId
+        appendFloat(buf, 0.1f);   // frametime
+        // texs==1: 6 int32 values (x, y, xAxis[0], xAxis[1], yAxis[0], yAxis[1])
+        appendInt32(buf, 0);  // x (int)
+        appendInt32(buf, 0);  // y (int)
+        appendInt32(buf, 16); // xAxis[0] (int)
+        appendInt32(buf, 0);  // xAxis[1] (int)
+        appendInt32(buf, 0);  // yAxis[0] (int)
+        appendInt32(buf, 16); // yAxis[1] (int)
+
+        VFS vfs;
+        mountTex(vfs, "sprite_v1", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_v1");
+        CHECK(header.isSprite == true);
+        CHECK(header.spriteAnim.numFrames() == 1);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        CHECK(frame.imageId == 0);
+        CHECK(frame.frametime == doctest::Approx(0.1f));
+        // x = 0/32 = 0.0, y = 0/32 = 0.0
+        CHECK(frame.x == doctest::Approx(0.0f));
+        CHECK(frame.y == doctest::Approx(0.0f));
+        // width = sqrt(16^2 + 0^2) = 16
+        CHECK(frame.width == doctest::Approx(16.0f));
+        // height = sqrt(0^2 + 16^2) = 16
+        CHECK(frame.height == doctest::Approx(16.0f));
+        // rate = height / width = 1.0
+        CHECK(frame.rate == doctest::Approx(1.0f));
+    }
+
+    TEST_CASE("Sprite frame coordinate division by sprite dimensions") {
+        // Kills div_to_mul: sf.x = (float)file.ReadInt32() / spriteWidth
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 64, 32, 64, 32, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(64 * 32 * 4, 0);
+        appendMipmapV2(buf, 64, 32, pixels);
+        appendTexVersion(buf, 2); // texs=2 (float format)
+        appendInt32(buf, 1);      // framecount
+        appendInt32(buf, 0);      // imageId
+        appendFloat(buf, 0.5f);   // frametime
+        appendFloat(buf, 16.0f);  // x (float)
+        appendFloat(buf, 8.0f);   // y (float)
+        appendFloat(buf, 32.0f);  // xAxis[0]
+        appendFloat(buf, 0.0f);   // xAxis[1]
+        appendFloat(buf, 0.0f);   // yAxis[0]
+        appendFloat(buf, 16.0f);  // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_coords", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_coords");
+        CHECK(header.isSprite == true);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        // x = 16.0/64 = 0.25, y = 8.0/32 = 0.25
+        CHECK(frame.x == doctest::Approx(0.25f));
+        CHECK(frame.y == doctest::Approx(0.25f));
+        // xAxis[0]/spriteWidth = 32/64 = 0.5
+        CHECK(frame.xAxis[0] == doctest::Approx(0.5f));
+        // yAxis[1]/spriteHeight = 16/32 = 0.5
+        CHECK(frame.yAxis[1] == doctest::Approx(0.5f));
+        // width = sqrt(32^2 + 0^2) = 32
+        CHECK(frame.width == doctest::Approx(32.0f));
+        // height = sqrt(0^2 + 16^2) = 16
+        CHECK(frame.height == doctest::Approx(16.0f));
+        // rate = 16 / 32 = 0.5
+        CHECK(frame.rate == doctest::Approx(0.5f));
+    }
+
+    TEST_CASE("Sprite texs=3 reads extra width/height fields") {
+        // Kills gt_to_ge and gt_to_le on line 275: texs > 3 → error
+        // texs=3 should NOT trigger the error; texs=4 should
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 16, 16, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0);
+        appendMipmapV2(buf, 16, 16, pixels);
+        appendTexVersion(buf, 3); // texs=3
+        appendInt32(buf, 1);      // framecount
+        // texs==3 has extra width/height before frames
+        appendInt32(buf, 16); // extra width
+        appendInt32(buf, 16); // extra height
+        // Frame data (texs >= 2 → float format)
+        appendInt32(buf, 0);     // imageId
+        appendFloat(buf, 0.5f);  // frametime
+        appendFloat(buf, 0.0f);  // x
+        appendFloat(buf, 0.0f);  // y
+        appendFloat(buf, 16.0f); // xAxis[0]
+        appendFloat(buf, 0.0f);  // xAxis[1]
+        appendFloat(buf, 0.0f);  // yAxis[0]
+        appendFloat(buf, 16.0f); // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_v3", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_v3");
+        CHECK(header.isSprite == true);
+        CHECK(header.spriteAnim.numFrames() == 1);
+    }
+
+    TEST_CASE("Count of zero produces valid empty image") {
+        // Kills lt_to_le on line 164: count < 0 returns nullptr
+        // count=0 should NOT return nullptr — it's valid (empty slots)
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 0);
+        VFS  vfs;
+        mountTex(vfs, "test_zero_count", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_zero_count");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots.size() == 0);
+    }
+
+    TEST_CASE("Multiple mipmaps parsed correctly") {
+        // Kills post_inc_to_post_dec on loop counter (line 175)
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 2); // 2 mipmaps
+        // Mipmap 0: 4x4
+        std::vector<uint8_t> pix4(4 * 4 * 4, 0xAA);
+        appendMipmapV1(buf, 4, 4, pix4);
+        // Mipmap 1: 2x2
+        std::vector<uint8_t> pix2(2 * 2 * 4, 0xBB);
+        appendMipmapV1(buf, 2, 2, pix2);
+
+        VFS vfs;
+        mountTex(vfs, "test_2mip", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("test_2mip");
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots[0].mipmaps.size() == 2);
+        CHECK(img->slots[0].mipmaps[0].width == 4);
+        CHECK(img->slots[0].mipmaps[1].width == 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // stbi container path (TEXB v3+, imageType != UNKNOWN)
+    // Kills:
+    //   * src_size = w*h*4 mutation (→ w*h*3): size would be 3, not 4
+    //   * type != UNKNOWN mutation (→ == UNKNOWN): falls through to raw path, size stays 21
+    //   * texb >= 3 is already killed by "TEXB v3 header reads imageType" test
+    // -----------------------------------------------------------------------
+
+    // Minimal 1x1 red-pixel TGA (type 2, uncompressed true-color, 24 bpp, BGR order).
+    // 18-byte header + 3-byte pixel.  stbi decodes to RGBA {255,0,0,255} when
+    // called with n_req=4.
+    static const uint8_t kRedPixelTga[] = { /* id_len */ 0x00,
+                                            /* cmap_t */ 0x00,
+                                            /* img_t  */ 0x02, // uncompressed true-color
+                                            /* cmap spec: first_entry, length, entry_size */
+                                            0x00,
+                                            0x00,
+                                            0x00,
+                                            0x00,
+                                            0x00,
+                                            /* x_origin */ 0x00,
+                                            0x00,
+                                            /* y_origin */ 0x00,
+                                            0x00,
+                                            /* width   */ 0x01,
+                                            0x00, // 1 px (little-endian)
+                                            /* height  */ 0x01,
+                                            0x00,               // 1 px
+                                            /* bpp     */ 0x18, // 24
+                                            /* img_desc*/ 0x00,
+                                            /* pixel (BGR): blue=0, green=0, red=255 */
+                                            0x00,
+                                            0x00,
+                                            0xFF };
+
+    // Minimal 2x3 TGA (6 pixels, 24bpp). Kills w*h → w/h mutant: 2*3*4=24 vs 2/3*4=0.
+    static const uint8_t kTga2x3[] = {
+        0x00,
+        0x00,
+        0x02, // id_len=0, cmap=0, img_type=2
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00, // cmap spec
+        0x00,
+        0x00,
+        0x00,
+        0x00, // x/y origin
+        0x02,
+        0x00, // width=2
+        0x03,
+        0x00, // height=3
+        0x18,
+        0x00, // bpp=24, img_desc=0
+        // 6 pixels (BGR): all red
+        0x00,
+        0x00,
+        0xFF,
+        0x00,
+        0x00,
+        0xFF,
+        0x00,
+        0x00,
+        0xFF,
+        0x00,
+        0x00,
+        0xFF,
+        0x00,
+        0x00,
+        0xFF,
+        0x00,
+        0x00,
+        0xFF,
+    };
+
+    TEST_CASE("TEXB v3 stbi path — 2x3 TGA kills w*h mutation") {
+        auto buf = makeTexHeader(2, 3, 3, 0, 0, 1, 1, 1, 1, 1);
+        appendInt32(buf, 17); // imageType = TARGA
+        appendInt32(buf, 1);  // mipmap_count
+        std::vector<uint8_t> tgaData(kTga2x3, kTga2x3 + sizeof(kTga2x3));
+        appendMipmapV2(buf, 2, 3, tgaData);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_2x3", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("stbi_2x3");
+
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        auto& mip = img->slots[0].mipmaps[0];
+        CHECK(mip.width == 2);
+        CHECK(mip.height == 3);
+        // w*h*4 = 2*3*4 = 24. If mutated to w/h*4 = 0*4 = 0 (wrong!)
+        CHECK(mip.size == 24);
+    }
+
+    TEST_CASE("TEXB v3 stbi path — valid TGA decoded to RGBA") {
+        // imageType = TARGA (17) → stbi decodes, src_size = w*h*4 = 4
+        auto buf = makeTexHeader(1, 1, 3, /*tex_fmt=*/0, /*flags=*/0, 1, 1, 1, 1, /*count=*/1);
+        appendInt32(buf, 17); // imageType = TARGA
+        appendInt32(buf, 1);  // mipmap_count
+        std::vector<uint8_t> tgaData(kRedPixelTga, kRedPixelTga + sizeof(kRedPixelTga));
+        appendMipmapV2(buf, 1, 1, tgaData);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_tga_v3", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("stbi_tga_v3");
+
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots.size() == 1);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        auto& mip = img->slots[0].mipmaps[0];
+        CHECK(mip.width == 1);
+        CHECK(mip.height == 1);
+        // src_size is set to w*h*4 after stbi decode — mutation w*h*3 would give 3
+        CHECK(mip.size == 4);
+        // stbi fills alpha=255 for opaque RGB sources; pixel order is RGBA
+        REQUIRE(mip.data.get() != nullptr);
+        CHECK(mip.data.get()[0] == 255); // R
+        CHECK(mip.data.get()[1] == 0);   // G
+        CHECK(mip.data.get()[2] == 0);   // B
+        CHECK(mip.data.get()[3] == 255); // A (stbi adds opaque alpha for 24-bit source)
+    }
+
+    TEST_CASE("TEXB v3 stbi path skipped when imageType is UNKNOWN") {
+        // imageType = UNKNOWN (-1) → raw-copy path, size stays at sizeof(TGA)=21
+        // Kills the != UNKNOWN → == UNKNOWN mutant on the branch condition.
+        auto buf = makeTexHeader(1, 1, 3, /*tex_fmt=*/0, /*flags=*/0, 1, 1, 1, 1, /*count=*/1);
+        appendInt32(buf, -1); // imageType = UNKNOWN
+        appendInt32(buf, 1);
+        std::vector<uint8_t> tgaData(kRedPixelTga, kRedPixelTga + sizeof(kRedPixelTga));
+        appendMipmapV2(buf, 1, 1, tgaData);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_unknown_v3", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("stbi_unknown_v3");
+
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        auto& mip = img->slots[0].mipmaps[0];
+        // Raw path: size = sizeof(TGA) = 21, not 4
+        CHECK(mip.size == (int32_t)sizeof(kRedPixelTga));
+    }
+
+    TEST_CASE("TEXB v2 stbi path never triggered — raw copy always used") {
+        // texb=2: condition texb>=3 is false even though imageType field is absent.
+        // Raw data kept as-is; size = sizeof(TGA) = 21.
+        auto buf = makeTexHeader(1, 1, 2, /*tex_fmt=*/0, /*flags=*/0, 1, 1, 1, 1, /*count=*/1);
+        // No imageType field for texb=2
+        appendInt32(buf, 1);
+        std::vector<uint8_t> tgaData(kRedPixelTga, kRedPixelTga + sizeof(kRedPixelTga));
+        appendMipmapV2(buf, 1, 1, tgaData);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_v2_raw", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("stbi_v2_raw");
+
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        auto& mip = img->slots[0].mipmaps[0];
+        // Raw path: size = 21
+        CHECK(mip.size == (int32_t)sizeof(kRedPixelTga));
+    }
+
+    // -----------------------------------------------------------------------
+    // Long-tail mutation killers
+    // -----------------------------------------------------------------------
+
+    // src_size==8 with non-MP4 payload exposes the `src_size > 8` boundary.
+    // Original lets size==8 fall through to memcmp (which fails, so we hit the
+    // raw-copy path).  Under cxx_gt_to_ge: still enters memcmp branch (matches
+    // original).  Under cxx_gt_to_le: NEVER enters MP4 branch — also still
+    // raw-copy path.  Together with the second clause `result.size() >= 8`,
+    // they require an 8-byte non-"ftyp" payload to discriminate.  Use a buffer
+    // that DOES have "ftyp" at offset 4 — under cxx_gt_to_ge or cxx_gt_to_le
+    // the MP4 detection at size==8 must fire (or not) consistently, and the
+    // behavior must match.
+    TEST_CASE("MP4 detection requires src_size > 8 (boundary at 8 bytes)") {
+        // src_size = 8 exactly with "ftyp" at offset 4 — boundary: original
+        // `> 8` is false → raw-copy path → size = 8.  Under `>= 8` the MP4
+        // branch fires, sets isVideoTexture=true, and overwrites size with
+        // Rgba8ByteSize(w, h) = 4*4*4 = 64.
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);                                          // mipmap_count
+        appendInt32(buf, 4);                                          // mip width
+        appendInt32(buf, 4);                                          // mip height
+        appendInt32(buf, 0);                                          // LZ4_compressed = false
+        appendInt32(buf, 0);                                          // decompressed_size
+        appendInt32(buf, 8);                                          // src_size = 8
+        // 8 raw bytes: 4 bytes pad + "ftyp"
+        const uint8_t fake[8] = { 0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p' };
+        for (uint8_t b : fake) buf.push_back(b);
+
+        VFS vfs;
+        mountTex(vfs, "mp4_boundary", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("mp4_boundary");
+        REQUIRE(img != nullptr);
+        // MP4 branch must NOT fire at size==8 (original `> 8` is false).
+        CHECK_FALSE(img->header.isVideoTexture);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        // Raw-copy path keeps src_size=8.
+        CHECK(img->slots[0].mipmaps[0].size == 8);
+    }
+
+    // src_size > 8 with "ftyp" at offset 4 must trigger the MP4 path.  Pairs
+    // with the above to pin down the boundary in both directions.  Without
+    // this, cxx_gt_to_le (which makes the guard `<= 8`) wouldn't be detected.
+    TEST_CASE("MP4 detection fires at src_size > 8 with ftyp signature") {
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 4);
+        appendInt32(buf, 4);
+        appendInt32(buf, 0);  // LZ4 false
+        appendInt32(buf, 0);  // decompressed_size
+        appendInt32(buf, 12); // src_size = 12 (>8)
+        // 12 bytes: 4 bytes pad + "ftyp" + 4 trailing bytes
+        const uint8_t fake[12] = {
+            0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'
+        };
+        for (uint8_t b : fake) buf.push_back(b);
+
+        VFS vfs;
+        mountTex(vfs, "mp4_detect", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("mp4_detect");
+        REQUIRE(img != nullptr);
+        // MP4 branch fires → isVideoTexture true, size set to RGBA placeholder.
+        CHECK(img->header.isVideoTexture);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        // RGBA placeholder of 4x4 = 64 bytes.
+        CHECK(img->slots[0].mipmaps[0].size == 64);
+    }
+
+    // ParseHeader with count==0 in the non-sprite path must read the trailing
+    // mipmap_count + width + height and call SetHeaderPow2 — kills the
+    // cxx_lt_to_le mutation on `header.count < 0` (which would convert it to
+    // `<= 0` and early-return at count==0, leaving mipmap_pow2 unset).
+    TEST_CASE("ParseHeader with count==0 still reads trailing mipmap_pow2 size") {
+        auto buf = makeTexHeader(1, 1, 1, /*type*/ 0, /*flags*/ 0,
+                                 /*tex_w*/ 4, /*tex_h*/ 4,
+                                 /*map_w*/ 4, /*map_h*/ 4,
+                                 /*count*/ 0);
+        // Non-sprite trailing: mipmap_count, width, height
+        appendInt32(buf, 1);
+        appendInt32(buf, 8); // width = 8 (pow2)
+        appendInt32(buf, 8); // height = 8
+
+        VFS vfs;
+        mountTex(vfs, "header_count_zero", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("header_count_zero");
+        // SetHeaderPow2 sets mipmap_pow2 from one of (8, 8) → both pow2 → true.
+        CHECK(header.mipmap_pow2 == true);
+        CHECK(header.count == 0);
+    }
+
+    // Multi-image .tex: parser must iterate i_image until image_count.  Under
+    // cxx_post_inc_to_post_dec on the i_image loop, only image[0] is written
+    // and slots[1] stays default-constructed (width/height=0).
+    TEST_CASE("Multiple images with distinct sizes verifies image-loop ++ (kills i++ → i--)") {
+        // count=2: two images with distinct dimensions.
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 2);
+        // image 0: 4x4
+        appendInt32(buf, 1);
+        std::vector<uint8_t> p0(4 * 4 * 4, 0xAA);
+        appendMipmapV1(buf, 4, 4, p0);
+        // image 1: 8x2 (distinct dimensions from image 0)
+        appendInt32(buf, 1);
+        std::vector<uint8_t> p1(8 * 2 * 4, 0xBB);
+        appendMipmapV1(buf, 8, 2, p1);
+
+        VFS vfs;
+        mountTex(vfs, "multi_distinct", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("multi_distinct");
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots.size() == 2);
+        // image[1] must be parsed — under i-- mutation it'd remain default.
+        CHECK(img->slots[1].width == 8);
+        CHECK(img->slots[1].height == 2);
+        REQUIRE(img->slots[1].mipmaps.size() == 1);
+        CHECK(img->slots[1].mipmaps[0].width == 8);
+        CHECK(img->slots[1].mipmaps[0].height == 2);
+        CHECK(img->slots[1].mipmaps[0].data.get()[0] == 0xBB);
+    }
+
+    // Sprite header parser branches on `texb > 1` to consume two extra
+    // int32 fields per mipmap (LZ4_compressed + decompressed_size).  Under
+    // cxx_gt_to_ge (`>= 1`), texb=1 sprites also try to consume those — the
+    // stream then misaligns and the sprite section fails to parse.  Test pins
+    // texb=1 sprite parsing.  Note: texb v1 sprites are rare but the parse
+    // must remain stable.
+    TEST_CASE("Sprite with texb=1 parses without consuming LZ4 fields (kills texb val>1 → val>=1)") {
+        // Build a sprite with texb=1 (NO LZ4 fields between width/height and
+        // src_size).  The sprite section that follows the mipmap data must be
+        // parseable; under the mutation, the parser would consume 8 extra
+        // bytes per mipmap and corrupt the stream.
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 1, 0, spriteFlag, 16, 16, 16, 16, 1);
+        // Image 0: 1 mipmap, texb=1 layout (no LZ4 fields)
+        appendInt32(buf, 1); // mipmap_count
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0xCD);
+        appendMipmapV1(buf, 16, 16, pixels); // texb=1: w, h, size, pixels — no LZ4 fields
+
+        // Sprite section
+        appendTexVersion(buf, 2); // texs version
+        appendInt32(buf, 1);      // framecount
+        appendInt32(buf, 0);      // imageId = 0 (valid)
+        appendFloat(buf, 0.5f);   // frametime
+        appendFloat(buf, 0.0f);   // x
+        appendFloat(buf, 0.0f);   // y
+        appendFloat(buf, 16.0f);  // xAxis[0]
+        appendFloat(buf, 0.0f);   // xAxis[1]
+        appendFloat(buf, 0.0f);   // yAxis[0]
+        appendFloat(buf, 16.0f);  // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_texb1", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_texb1");
+        // Sprite must parse cleanly.  Under the mutation the framecount /
+        // imageId reads garbage and the sprite is disabled.
+        CHECK(header.isSprite == true);
+        CHECK(header.spriteAnim.numFrames() == 1);
+        auto& frame = header.spriteAnim.GetCurFrame();
+        CHECK(frame.imageId == 0);
+        CHECK(frame.frametime == doctest::Approx(0.5f));
+    }
+
+    TEST_CASE("Hostile image_count does not OOM-resize") {
+        // Fuzz-found regression. img.header.count came straight from the .tex
+        // header into img.slots.resize(image_count) with no upper bound — a
+        // count near INT32_MAX requested ~80 GB. CountFitsStream now bounds
+        // it against bytes-remaining; Parse should return nullptr cleanly.
+        auto buf = makeTexHeader(1, 1, 1, /*type=RGBA8*/ 0, /*flags=*/0, 4, 4, 4, 4,
+                                 /*count=*/0x10000000);
+        VFS vfs;
+        mountTex(vfs, "hostile_count", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("hostile_count");
+        CHECK(img == nullptr);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fuzz-hardening bounds: image_count, mipmap_count, mip dims, cumulative
+    // byte budget, and stbi pre-validation.  Each test pins one rejection
+    // branch in Parse().  Real WP textures sit well under all caps (≤6 slots,
+    // ≤13 mips, ≤4K per side); hostile inputs trip the cap and return nullptr
+    // without ever allocating the budget they declared.
+    // -----------------------------------------------------------------------
+
+    TEST_CASE("Plausibility cap on image_count rejects large stream-fitting values") {
+        // 32 slots × 1 byte/slot = 32 bytes — fits the stream, so the
+        // pre-existing CountFitsStream check accepts it.  The new plausibility
+        // cap (16 slots) is what rejects this — WP ships at most 6 (cube map).
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, /*count=*/32);
+        // Pad with bytes so CountFitsStream(file, 32) succeeds.
+        for (int i = 0; i < 256; i++) buf.push_back(0);
+        VFS vfs;
+        mountTex(vfs, "many_slots", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("many_slots") == nullptr);
+    }
+
+    TEST_CASE("Plausibility cap on mipmap_count rejects large stream-fitting values") {
+        // 64 mips × 1 byte = 64 bytes — fits stream.  Plausibility cap (24)
+        // rejects — WP ships at most 13 mips (log2(8K)).
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, /*mipmap_count=*/64);
+        for (int i = 0; i < 512; i++) buf.push_back(0);
+        VFS vfs;
+        mountTex(vfs, "many_mips", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("many_mips") == nullptr);
+    }
+
+    TEST_CASE("Mip dimension cap rejects oversized width/height") {
+        // mipmap.width = 32768 exceeds the 16384 plausibility cap.
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);                                    // mipmap_count
+        appendInt32(buf, /*mip width=*/32768);
+        appendInt32(buf, /*mip height=*/4);
+        appendInt32(buf, /*src_size=*/16);
+        for (int i = 0; i < 16; i++) buf.push_back(0);
+        VFS vfs;
+        mountTex(vfs, "huge_w", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("huge_w") == nullptr);
+    }
+
+    TEST_CASE("Mip dimension cap accepts 16384 (boundary)") {
+        // 16384 × 1 is right at the cap and must NOT be rejected by the
+        // dimension guard — the cap is `>`, not `>=`.  Parse succeeds via the
+        // raw-copy path; the only assertion is no-crash + no-OOM (proved by
+        // reaching here).
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 16384, 1, 16384, 1, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 16384);
+        appendInt32(buf, 1);
+        appendInt32(buf, 4);
+        for (int i = 0; i < 4; i++) buf.push_back(0);
+        VFS vfs;
+        mountTex(vfs, "edge_dim", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("edge_dim");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].width == 16384);
+        CHECK(img->slots[0].height == 1);
+    }
+
+    TEST_CASE("Cumulative-byte cap rejects real LZ4 mips exceeding the decompressed budget") {
+        // 4 mips of 40000 genuinely-compressed bytes each (160000 decompressed
+        // total) against a constructor-injected 100000-byte budget. Unlike a
+        // garbage LZ4 payload (which fails decompression before the cumulative
+        // gate is ever reached), a real payload lets Parse() actually get to
+        // the gate this test is pinning -- and the rejection is logged.
+        constexpr int kMipCount           = 4;
+        constexpr int kDecompressedPerMip = 40000;
+        auto          buf                 = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, kMipCount);
+        for (int i = 0; i < kMipCount; i++) {
+            std::vector<uint8_t> pixels(kDecompressedPerMip, 0x11);
+            appendMipmapV2(buf, 4, 4, pixels, /*compress=*/true);
+        }
+        VFS vfs;
+        mountTex(vfs, "cumulative_real", std::move(buf));
+
+        g_lastLogMessage.clear();
+        wallpaper_log_test::setSink(&captureLastLogMessage);
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/100000);
+        auto             img = parser.Parse("cumulative_real");
+        wallpaper_log_test::setSink(nullptr);
+
+        CHECK(img == nullptr);
+        CHECK(g_lastLogMessage.find("cumulative retained bytes") != std::string::npos);
+    }
+
+    TEST_CASE("Cumulative budget charges only retained (decompressed) bytes for an LZ4 mip") {
+        // A single genuinely-compressed mip whose compressed src_size plus
+        // decompressed_size together exceed a tight budget, but whose
+        // decompressed_size alone fits under it. The compressed buffer is
+        // transient -- Lz4Decompress's result replaces it and the original is
+        // freed -- so only the decompressed bytes should count against the
+        // budget. Before the accounting fix Parse() charged src_size +
+        // decompressed_size and rejected this; after the fix it charges only
+        // what slot.mipmaps[].data actually keeps and accepts it.
+        std::vector<uint8_t> pixels(20000, 0x5A); // highly compressible payload
+        int                  maxDst = LZ4_compressBound(static_cast<int>(pixels.size()));
+        std::vector<char>    compressed(static_cast<size_t>(maxDst));
+        int compressedSize = LZ4_compress_default(reinterpret_cast<const char*>(pixels.data()),
+                                                  compressed.data(),
+                                                  static_cast<int>(pixels.size()),
+                                                  maxDst);
+        REQUIRE(compressedSize > 0);
+
+        i64 decompressedSize = static_cast<i64>(pixels.size());
+        // Strictly between "decompressed alone" and "decompressed +
+        // compressed" -- the boundary the two charging schemes disagree on.
+        i64 budget = decompressedSize + compressedSize / 2;
+
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1); // mipmap_count
+        appendInt32(buf, 4); // width
+        appendInt32(buf, 4); // height
+        appendInt32(buf, 1); // LZ4_compressed = true
+        appendInt32(buf, static_cast<int32_t>(pixels.size())); // decompressed_size
+        appendInt32(buf, compressedSize);                      // src_size
+        append(buf, compressed.data(), static_cast<size_t>(compressedSize));
+
+        VFS vfs;
+        mountTex(vfs, "retained_only", std::move(buf));
+
+        WPTexImageParser parser(&vfs, budget);
+        CHECK(parser.Parse("retained_only") != nullptr);
+    }
+
+    TEST_CASE("Cumulative budget charges src_size for raw (non-LZ4) mips") {
+        // Uncompressed mips carry no decompressed_size field at all
+        // (texb==1), so the only retained-byte charge possible is src_size
+        // itself. 3 mips whose combined src_size crosses a tight budget must
+        // reject even though nothing here is LZ4-compressed.
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, /*mipmap_count=*/3);
+        for (int i = 0; i < 3; i++) {
+            std::vector<uint8_t> pixels(4000, 0x22);
+            appendMipmapV1(buf, 4, 4, pixels);
+        }
+        VFS vfs;
+        mountTex(vfs, "raw_budget", std::move(buf));
+
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/10000); // < 3 * 4000
+        CHECK(parser.Parse("raw_budget") == nullptr);
+    }
+
+    TEST_CASE("Cumulative budget rejects an MP4-placeholder mip exceeding the budget") {
+        // The MP4 branch retains a black Rgba8ByteSize(w, h) placeholder
+        // buffer instead of the decoded frame -- that buffer is exactly as
+        // resident as any other mip's, so it has to be charged against
+        // m_maxTotalBytes the same way. A 4x4 placeholder is 4*4*4 = 64
+        // bytes; a 10-byte budget must reject it.
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1); // mipmap_count
+        appendInt32(buf, 4); // mip width
+        appendInt32(buf, 4); // mip height
+        appendInt32(buf, 0); // LZ4_compressed = false
+        appendInt32(buf, 0); // decompressed_size
+        appendInt32(buf, 12); // src_size = 12 (>8, triggers MP4 detection)
+        const uint8_t fake[12] = {
+            0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'
+        };
+        for (uint8_t b : fake) buf.push_back(b);
+
+        VFS vfs;
+        mountTex(vfs, "mp4_over_budget", std::move(buf));
+
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/10); // < 64-byte placeholder
+        CHECK(parser.Parse("mp4_over_budget") == nullptr);
+    }
+
+    TEST_CASE("Cumulative budget accepts an MP4-placeholder mip within the budget") {
+        // Same shape as above with a budget above the 64-byte placeholder --
+        // must still parse and produce the black placeholder frame.
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 4);
+        appendInt32(buf, 4);
+        appendInt32(buf, 0);
+        appendInt32(buf, 0);
+        appendInt32(buf, 12);
+        const uint8_t fake[12] = {
+            0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'
+        };
+        for (uint8_t b : fake) buf.push_back(b);
+
+        VFS vfs;
+        mountTex(vfs, "mp4_under_budget", std::move(buf));
+
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/1000); // > 64-byte placeholder
+        auto             img = parser.Parse("mp4_under_budget");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.isVideoTexture);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        CHECK(img->slots[0].mipmaps[0].size == 64);
+    }
+
+    TEST_CASE("stbi pre-validation rejects embedded TGA with huge declared dims") {
+        // 10000×10000 TGA inside an otherwise-empty .tex: stbi would allocate
+        // ~400MB output before failing on truncated input.  The pre-validation
+        // guard rejects up front by reading stbi_info_from_memory.
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, /*imageType=*/17);  // TARGA
+        appendInt32(buf, /*mipmap_count=*/1);
+        // TGA header: 18 bytes, declares 10000x10000, 24bpp uncompressed.
+        std::vector<uint8_t> tga(18, 0);
+        tga[2]  = 2;  // image type: uncompressed true-color
+        tga[12] = 0x10; tga[13] = 0x27;  // width = 10000 (little-endian)
+        tga[14] = 0x10; tga[15] = 0x27;  // height = 10000
+        tga[16] = 24;  // bpp
+        appendMipmapV2(buf, /*mip_w=*/4, /*mip_h=*/4, tga);
+        VFS vfs;
+        mountTex(vfs, "stbi_huge_dim", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("stbi_huge_dim") == nullptr);
+    }
+
+    TEST_CASE("stbi pre-validation rejects embedded TGA exceeding mip container dims") {
+        // 100×100 TGA in a 4×4 mip container — the parser overwrites
+        // mipmap.size with stbi's w*h*4, so silently accepting the larger
+        // embedded image would propagate a mismatched-dim mip downstream.
+        // Reject at the parser instead.
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, /*imageType=*/17);  // TARGA
+        appendInt32(buf, /*mipmap_count=*/1);
+        std::vector<uint8_t> tga(18, 0);
+        tga[2]  = 2;
+        tga[12] = 100; tga[13] = 0;
+        tga[14] = 100; tga[15] = 0;
+        tga[16] = 24;
+        appendMipmapV2(buf, /*mip_w=*/4, /*mip_h=*/4, tga);
+        VFS vfs;
+        mountTex(vfs, "stbi_mip_mismatch", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("stbi_mip_mismatch") == nullptr);
+    }
+
+    TEST_CASE("stbi pre-validation rejects malformed embedded image (info-fails)") {
+        // Bytes that don't decode as any image format stbi understands: the
+        // pre-validation gate rejects rather than letting stbi do partial
+        // allocation work before failing.
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, /*imageType=*/17);  // TARGA
+        appendInt32(buf, /*mipmap_count=*/1);
+        std::vector<uint8_t> garbage(64, 0xAB);  // not a valid image header
+        appendMipmapV2(buf, /*mip_w=*/4, /*mip_h=*/4, garbage);
+        VFS vfs;
+        mountTex(vfs, "stbi_garbage", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("stbi_garbage") == nullptr);
+    }
+
+    TEST_CASE("Cumulative budget charges only the decoded size for an embedded image mip") {
+        // A real, decodable 4x4 TGA padded with trailing filler bytes so the
+        // mip container (src_size) is far bigger than what stbi actually
+        // decodes (stbi_out = 4*4*4 = 64 bytes). Before the fix, Parse()
+        // charged the container bytes for this mip AND stbi_out on top for
+        // the same mip; after the fix, only stbi_out counts, since the
+        // container bytes are freed once stbi has decoded its own buffer.
+        std::vector<uint8_t> tga(18, 0);
+        tga[2]  = 2; // uncompressed true-color
+        tga[12] = 4; tga[13] = 0; // width = 4
+        tga[14] = 4; tga[15] = 0; // height = 4
+        tga[16] = 24;             // bpp
+        for (int i = 0; i < 4 * 4 * 3; i++) tga.push_back(0x40); // pixel data
+        tga.resize(tga.size() + 5000, 0);                       // container padding
+
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, /*imageType=*/17); // TARGA
+        appendInt32(buf, /*mipmap_count=*/1);
+        appendMipmapV2(buf, /*mip_w=*/4, /*mip_h=*/4, tga);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_padded_container", std::move(buf));
+
+        // Budget sits above stbi_out (64) but far below container size (~5090
+        // bytes) + stbi_out -- exactly what the two charging schemes disagree on.
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/100);
+        auto             img = parser.Parse("stbi_padded_container");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].mipmaps[0].size == 4 * 4 * 4);
+    }
+
+    TEST_CASE("A raw-copy mip that exactly fills the remaining budget is accepted") {
+        // Plain (non-LZ4, non-embedded) mip whose src_size is set to exactly
+        // the injected budget. The gate is `>`, so a charge equal to what's
+        // left must still pass -- only a charge that goes over may reject.
+        constexpr int kBudget = 128;
+        auto          buf     = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1); // mipmap_count
+        std::vector<uint8_t> pixels(kBudget, 0x33);
+        appendMipmapV1(buf, 4, 4, pixels);
+
+        VFS vfs;
+        mountTex(vfs, "raw_exact_budget", std::move(buf));
+
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/kBudget);
+        auto             img = parser.Parse("raw_exact_budget");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].mipmaps[0].size == kBudget);
+    }
+
+    TEST_CASE("An embedded-image mip that exactly fills the remaining budget is accepted") {
+        // 2x2 TGA -> stbi_out = 2*2*4 = 16 bytes. Budget set to exactly 16:
+        // same boundary as the raw-copy case above, but on the branch that
+        // gates on stbi's decoded size instead of the container bytes.
+        std::vector<uint8_t> tga(18, 0);
+        tga[2]  = 2;             // uncompressed true-color
+        tga[12] = 2; tga[13] = 0; // width = 2
+        tga[14] = 2; tga[15] = 0; // height = 2
+        tga[16] = 24;             // bpp
+        for (int i = 0; i < 2 * 2 * 3; i++) tga.push_back(0x40); // pixel data
+
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, 2, 2, 2, 2, 1);
+        appendInt32(buf, /*imageType=*/17); // TARGA
+        appendInt32(buf, /*mipmap_count=*/1);
+        appendMipmapV2(buf, /*mip_w=*/2, /*mip_h=*/2, tga);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_exact_budget", std::move(buf));
+
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/16); // == 2*2*4 stbi_out
+        auto             img = parser.Parse("stbi_exact_budget");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].mipmaps[0].size == 2 * 2 * 4);
+    }
+
+    TEST_CASE("An MP4-placeholder mip that exactly fills the remaining budget is accepted") {
+        // Same boundary again, on the third branch: the black placeholder
+        // buffer is Rgba8ByteSize(4, 4) = 64 bytes, and the budget is set to
+        // exactly that.
+        auto buf = makeTexHeader(1, 1, 2, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, 1); // mipmap_count
+        appendInt32(buf, 4); // mip width
+        appendInt32(buf, 4); // mip height
+        appendInt32(buf, 0); // LZ4_compressed = false
+        appendInt32(buf, 0); // decompressed_size
+        appendInt32(buf, 12); // src_size = 12 (>8, triggers MP4 detection)
+        const uint8_t fake[12] = {
+            0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'
+        };
+        for (uint8_t b : fake) buf.push_back(b);
+
+        VFS vfs;
+        mountTex(vfs, "mp4_exact_budget", std::move(buf));
+
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/64); // == Rgba8ByteSize(4, 4)
+        auto             img = parser.Parse("mp4_exact_budget");
+        REQUIRE(img != nullptr);
+        CHECK(img->header.isVideoTexture);
+        REQUIRE(img->slots[0].mipmaps.size() == 1);
+        CHECK(img->slots[0].mipmaps[0].size == 64);
+    }
+
+    TEST_CASE("The second of two embedded-image mips that together exceed the budget is rejected") {
+        // Two 2x2 TGAs, each stbi_out = 2*2*4 = 16 bytes: individually under
+        // a 20-byte budget, but their sum (32) is not. The rejection has to
+        // come from the second mip's charge landing on top of the first's
+        // running total, not from either mip judged alone.
+        std::vector<uint8_t> tga(18, 0);
+        tga[2]  = 2;
+        tga[12] = 2; tga[13] = 0;
+        tga[14] = 2; tga[15] = 0;
+        tga[16] = 24;
+        for (int i = 0; i < 2 * 2 * 3; i++) tga.push_back(0x40);
+
+        auto buf = makeTexHeader(1, 1, 3, 0, 0, 2, 2, 2, 2, 1);
+        appendInt32(buf, /*imageType=*/17); // TARGA
+        appendInt32(buf, /*mipmap_count=*/2);
+        appendMipmapV2(buf, /*mip_w=*/2, /*mip_h=*/2, tga);
+        appendMipmapV2(buf, /*mip_w=*/2, /*mip_h=*/2, tga);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_two_mip_over_budget", std::move(buf));
+
+        g_lastLogMessage.clear();
+        wallpaper_log_test::setSink(&captureLastLogMessage);
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/20);
+        auto             img = parser.Parse("stbi_two_mip_over_budget");
+        wallpaper_log_test::setSink(nullptr);
+
+        CHECK(img == nullptr);
+        CHECK(g_lastLogMessage.find("mip[1]") != std::string::npos);
+        CHECK(g_lastLogMessage.find("exceeds cumulative cap") != std::string::npos);
+    }
+
+} // TEST_SUITE
+
+// ===========================================================================
+// ParseHeader header cache — second call for the same name must not re-open
+// the file.  Open-count assertions are the ground truth; value-equality
+// assertions prove the cached return is bit-identical to what a fresh parse
+// would produce.
+// ===========================================================================
+
+TEST_SUITE("WPTexImageParser.ParseHeaderCache") {
+
+    TEST_CASE("Second ParseHeader call does not re-open the file") {
+        // Build the VFS manually so we keep a raw pointer to the MockFs for
+        // open-count queries after ownership has been transferred to the VFS.
+        VFS   vfs;
+        auto  fsOwned = std::make_unique<MockFs>();
+        auto* mock    = fsOwned.get();
+        mock->AddFile("/materials/cache_rgba8.tex", makeSimpleRGBA8Tex(8, 8));
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+
+        auto h1 = parser.ParseHeader("cache_rgba8");
+        auto h2 = parser.ParseHeader("cache_rgba8");
+
+        // The file is at "/materials/cache_rgba8.tex" inside the MockFs.
+        // After the cache lands the second ParseHeader must NOT call Open again.
+        CHECK(mock->openCount("/materials/cache_rgba8.tex") == 1);
+
+        // Both calls return bit-identical headers.
+        CHECK(h1.width     == h2.width);
+        CHECK(h1.height    == h2.height);
+        CHECK(h1.mapWidth  == h2.mapWidth);
+        CHECK(h1.mapHeight == h2.mapHeight);
+        CHECK(h1.isSprite  == h2.isSprite);
+        CHECK(h1.format    == h2.format);
+        CHECK(h1.count     == h2.count);
+    }
+
+    TEST_CASE("m_registered fast-path serves ParseHeader without any file open") {
+        // RegisterImage pre-populates m_registered; ParseHeader's very first
+        // check hits it — neither the header cache nor the VFS is consulted.
+        VFS   vfs;
+        auto  fsOwned = std::make_unique<MockFs>();
+        auto* mock    = fsOwned.get();
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+
+        auto img           = std::make_shared<Image>();
+        img->key           = "prebuilt";
+        img->header.width  = 32;
+        img->header.height = 16;
+        img->header.format = TextureFormat::RGBA8;
+        img->header.count  = 1;
+        parser.RegisterImage("prebuilt", img);
+
+        auto h = parser.ParseHeader("prebuilt");
+        CHECK(mock->openCount("/materials/prebuilt.tex") == 0);
+        CHECK(h.width  == 32);
+        CHECK(h.height == 16);
+    }
+
+    TEST_CASE("Missing file is not cached — headerCacheSize stays zero") {
+        // A name whose file does not exist triggers the nullptr-open early-return
+        // path in ParseHeader.  That sentinel header must NOT be written into
+        // m_headerCache — so repeated calls must not poison the cache.
+        VFS   vfs;
+        auto  fsOwned = std::make_unique<MockFs>();
+        auto* mock    = fsOwned.get();
+        // No file added — Contains() returns false, so VFS short-circuits
+        // before even calling MockFs::Open on the missing path.
+        vfs.Mount("/assets", std::move(fsOwned));
+        (void)mock; // retained for potential future counter extensions
+
+        WPTexImageParser parser(&vfs);
+
+        // "missing" is not an alias name, so the alias-fallback guard
+        // (IsAliasTexture) won't intercept — the VFS miss falls through to the
+        // nullptr-open early-return path (before the write-back).
+        auto h1 = parser.ParseHeader("missing");
+        auto h2 = parser.ParseHeader("missing");
+
+        // headerCacheSize() must be zero — the failed-open path is not cached.
+        CHECK(parser.headerCacheSize() == 0);
+        // Both returned the same default-initialized header.
+        CHECK(h1.width  == h2.width);
+        CHECK(h1.height == h2.height);
+    }
+
+    TEST_CASE("Sprite header cached correctly — frame data identical on second call") {
+        // Sprite textures have per-frame scan loops in ParseHeader.  Caching
+        // must preserve the full SpriteAnimation, not just scalar fields.
+        uint32_t             spriteFlag = (1u << 2);
+        std::vector<uint8_t> buf =
+            makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 16, 16, 1);
+        appendInt32(buf, 1);                          // mipmap_count
+        std::vector<uint8_t> pixels(16 * 16 * 4, 0);
+        appendMipmapV2(buf, 16, 16, pixels);
+        appendTexVersion(buf, 2); // texs
+        appendInt32(buf, 2);      // framecount = 2
+        for (int i = 0; i < 2; i++) {
+            appendInt32(buf, 0);     // imageId = 0
+            appendFloat(buf, 0.1f);  // frametime
+            appendFloat(buf, 0.0f);  // x
+            appendFloat(buf, 0.0f);  // y
+            appendFloat(buf, 16.0f); // xAxis[0]
+            appendFloat(buf, 0.0f);  // xAxis[1]
+            appendFloat(buf, 0.0f);  // yAxis[0]
+            appendFloat(buf, 16.0f); // yAxis[1]
+        }
+
+        VFS   vfs;
+        auto  fsOwned = std::make_unique<MockFs>();
+        auto* mock    = fsOwned.get();
+        mock->AddFile("/materials/sprite_cached.tex", std::move(buf));
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+
+        auto h1 = parser.ParseHeader("sprite_cached");
+        auto h2 = parser.ParseHeader("sprite_cached");
+
+        CHECK(mock->openCount("/materials/sprite_cached.tex") == 1);
+        CHECK(h1.isSprite == true);
+        CHECK(h2.isSprite == true);
+        CHECK(h1.spriteAnim.numFrames() == h2.spriteAnim.numFrames());
+        // Frame 0 identical across both calls.
+        const auto& f1 = h1.spriteAnim.GetCurFrame();
+        const auto& f2 = h2.spriteAnim.GetCurFrame();
+        CHECK(f1.imageId == f2.imageId);
+        CHECK(f1.frametime == doctest::Approx(f2.frametime));
+    }
+
+} // WPTexImageParser.ParseHeaderCache
+
+// ===========================================================================
+// Prefetch: Parse() calls issued through PrefetchTextures must actually run
+// concurrently, not queue up behind each other on one thread.  A cache alone
+// ("second call for the same name is free") doesn't touch this -- a scene's
+// texture set going into compileRenderGraph is almost entirely distinct
+// names, so the render-thread stall this covers is a scheduling problem,
+// not a memoization one.
+// ===========================================================================
+
+TEST_SUITE("WPTexImageParser.PrefetchConcurrency") {
+    TEST_CASE("Distinct textures decode in wall time close to one delay, not N of them") {
+        constexpr int                       kTexCount = 4;
+        constexpr std::chrono::milliseconds kDelay { 30 };
+
+        VFS                      vfs;
+        auto                     fsOwned = std::make_unique<MockFs>();
+        auto*                    mock    = fsOwned.get();
+        std::vector<std::string> names;
+        for (int i = 0; i < kTexCount; i++) {
+            std::string name = "prefetch_" + std::to_string(i);
+            mock->AddFile("/materials/" + name + ".tex", makeSimpleRGBA8Tex(4, 4));
+            names.push_back(name);
+        }
+        mock->SetOpenDelay(kDelay);
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+
+        const auto start = std::chrono::steady_clock::now();
+        PrefetchTextures(parser, names, /*worker_count=*/(unsigned)kTexCount);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        // Serial would cost kTexCount * kDelay (120ms). Four workers for
+        // four names should land close to one kDelay (30ms); give it
+        // headroom for thread start-up jitter but stay well under "two
+        // textures' worth" -- a patch that dispatches Parse() one at a
+        // time on the calling thread blows straight through this.
+        CHECK(elapsed < kDelay * 2);
+
+        for (auto& name : names) {
+            CHECK(mock->openCount("/materials/" + name + ".tex") == 1);
+        }
+
+        // The actual production payoff: prepare()'s later serial Parse()
+        // calls must hit the cache PrefetchTextures already filled, not
+        // reopen the file. A call to Parse() that still costs an Open()
+        // here means the prefetch and the follow-up read from different
+        // state, and the render thread would decode every texture a
+        // second time regardless of how fast the prefetch ran.
+        parser.Parse(names[0]);
+        CHECK(mock->openCount("/materials/" + names[0] + ".tex") == 1);
+    }
+
+    TEST_CASE("worker_count of 1 decodes serially, not spread across threads") {
+        constexpr int                       kTexCount = 3;
+        constexpr std::chrono::milliseconds kDelay { 30 };
+
+        VFS                      vfs;
+        auto                     fsOwned = std::make_unique<MockFs>();
+        auto*                    mock    = fsOwned.get();
+        std::vector<std::string> names;
+        for (int i = 0; i < kTexCount; i++) {
+            std::string name = "prefetch_solo_" + std::to_string(i);
+            mock->AddFile("/materials/" + name + ".tex", makeSimpleRGBA8Tex(4, 4));
+            names.push_back(name);
+        }
+        mock->SetOpenDelay(kDelay);
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+
+        const auto start = std::chrono::steady_clock::now();
+        PrefetchTextures(parser, names, /*worker_count=*/1);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        // Proves the concurrency above is actually controlled by
+        // worker_count, not a scheduling accident: worker_count=1 must
+        // fall back to the calling thread doing all the work itself, so
+        // 3 names at 30ms each costs close to 90ms -- well past the
+        // "under two delays" bar the concurrent case clears above.
+        CHECK(elapsed >= kDelay * (kTexCount - 1));
+
+        for (auto& name : names) {
+            CHECK(mock->openCount("/materials/" + name + ".tex") == 1);
+        }
+
+        // Same handoff guarantee as the concurrent case above, checked here
+        // too since worker_count=1 takes a different code path inside
+        // PrefetchTextures (no helper threads spawned at all).
+        parser.Parse(names[0]);
+        CHECK(mock->openCount("/materials/" + names[0] + ".tex") == 1);
+    }
+
+    TEST_CASE("one texture throwing does not take the batch (or the process) down") {
+        // Parse() throws on hostile .tex content -- slots.resize / mipmaps.resize
+        // are sized from untrusted header counts and the sprite-frame lookups use
+        // .at().  Escaping the worker lambda means std::terminate on a detached
+        // decode thread, i.e. plasmashell dies with the wallpaper; escaping on the
+        // calling thread's own share leaves the helper threads joinable, which
+        // terminates just the same.  Neither is acceptable for one bad file in a
+        // scene's texture set.
+        VFS                      vfs;
+        auto                     fsOwned = std::make_unique<MockFs>();
+        auto*                    mock    = fsOwned.get();
+        std::vector<std::string> names { "prefetch_ok_a", "prefetch_throws", "prefetch_ok_b" };
+        for (const auto& name : names) {
+            mock->AddFile("/materials/" + name + ".tex", makeSimpleRGBA8Tex(4, 4));
+        }
+        mock->SetThrowOn("/materials/prefetch_throws.tex");
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+        // The thrower sits in the middle so the names after it prove the claim
+        // loop kept handing out work.
+        PrefetchTextures(parser, names, /*worker_count=*/(unsigned)names.size());
+
+        CHECK(mock->openCount("/materials/prefetch_ok_a.tex") == 1);
+        CHECK(mock->openCount("/materials/prefetch_ok_b.tex") == 1);
+        // Decoded, not merely opened: a follow-up Parse() is served from the
+        // cache the prefetch filled, so it costs no second Open().
+        CHECK(parser.Parse("prefetch_ok_a") != nullptr);
+        CHECK(parser.Parse("prefetch_ok_b") != nullptr);
+        CHECK(mock->openCount("/materials/prefetch_ok_a.tex") == 1);
+        CHECK(mock->openCount("/materials/prefetch_ok_b.tex") == 1);
+
+        // The failed texture must be absent from the cache -- a half-built
+        // Image cached under its name would be handed to every later reader.
+        // Observable as a second Open(): a cached entry would short-circuit
+        // before the file is touched.
+        mock->ClearThrows();
+        CHECK(parser.Parse("prefetch_throws") != nullptr);
+        CHECK(mock->openCount("/materials/prefetch_throws.tex") == 2);
+    }
+
+    TEST_CASE("worker_count=3 over 6 names peaks at exactly 3 concurrent Open calls") {
+        // The wall-time checks above prove "faster than serial"; they don't
+        // pin the actual thread count PrefetchTextures spawns (worker_count-1
+        // helper threads plus the caller's own share).  An off-by-one on
+        // either the reserve() or the spawn loop's bound over- or
+        // under-subscribes the pool without moving wall time enough to
+        // notice at these small counts, so read the pool size back directly
+        // through the mock's peak-concurrency counter instead.
+        constexpr int                       kTexCount    = 6;
+        constexpr unsigned                  kWorkerCount = 3;
+        constexpr std::chrono::milliseconds kDelay { 30 };
+
+        VFS                      vfs;
+        auto                     fsOwned = std::make_unique<MockFs>();
+        auto*                    mock    = fsOwned.get();
+        std::vector<std::string> names;
+        for (int i = 0; i < kTexCount; i++) {
+            std::string name = "prefetch_peak_" + std::to_string(i);
+            mock->AddFile("/materials/" + name + ".tex", makeSimpleRGBA8Tex(4, 4));
+            names.push_back(name);
+        }
+        mock->SetOpenDelay(kDelay);
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+        PrefetchTextures(parser, names, kWorkerCount);
+
+        CHECK(mock->peakConcurrentOpens() == (int)kWorkerCount);
+        for (auto& name : names) {
+            CHECK(mock->openCount("/materials/" + name + ".tex") == 1);
+        }
+    }
+
+    TEST_CASE("worker_count larger than the name list still decodes every name exactly "
+              "once") {
+        // worker_count is clamped to names.size() internally; this pins the
+        // clamp from the caller's side -- a batch smaller than the pool must
+        // not spawn idle threads that double-claim or skip a name.
+        constexpr int      kTexCount    = 2;
+        constexpr unsigned kWorkerCount = 8;
+
+        VFS                      vfs;
+        auto                     fsOwned = std::make_unique<MockFs>();
+        auto*                    mock    = fsOwned.get();
+        std::vector<std::string> names;
+        for (int i = 0; i < kTexCount; i++) {
+            std::string name = "prefetch_small_batch_" + std::to_string(i);
+            mock->AddFile("/materials/" + name + ".tex", makeSimpleRGBA8Tex(4, 4));
+            names.push_back(name);
+        }
+        vfs.Mount("/assets", std::move(fsOwned));
+
+        WPTexImageParser parser(&vfs);
+        PrefetchTextures(parser, names, kWorkerCount);
+
+        CHECK(mock->peakConcurrentOpens() <= kTexCount);
+        for (auto& name : names) {
+            CHECK(mock->openCount("/materials/" + name + ".tex") == 1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz crash regression replay.
+//
+// Iterates tests/fixtures/fuzz_regressions/WPTexImageParser/*.bin and feeds
+// each file through the same entry points fuzz_WPTexImageParser drives.
+// ---------------------------------------------------------------------------
+
+#include "test_data_root.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+
+TEST_SUITE("regression: minimised fuzz crashes") {
+    TEST_CASE("regression: minimised fuzz crashes round-trip cleanly") {
+        namespace fs2 = std::filesystem;
+        const fs2::path dir = wallpaper::test::test_data_root()
+                              / "fuzz_regressions" / "WPTexImageParser";
+        if (! fs2::exists(dir)) return;
+        for (auto& entry : fs2::directory_iterator(dir)) {
+            if (entry.path().extension() != ".bin") continue;
+            SUBCASE(entry.path().filename().string().c_str()) {
+                std::ifstream in(entry.path(), std::ios::binary);
+                std::vector<uint8_t> buf(std::istreambuf_iterator<char>(in), {});
+                VFS  vfs;
+                auto mockFs = std::make_unique<MockFs>();
+                mockFs->AddFile("/materials/fuzz.tex", std::move(buf));
+                vfs.Mount("/assets", std::move(mockFs));
+                // Same calls as the harness: a variant selector that always
+                // holds, then ParseHeader on a fresh parser.
+                WPTexImageParser parser(&vfs);
+                parser.SetVariantSelector([](const std::string&, const std::string&) {
+                    return true;
+                });
+                CHECK_NOTHROW((void)parser.Parse("fuzz"));
+                WPTexImageParser header_parser(&vfs);
+                CHECK_NOTHROW((void)header_parser.ParseHeader("fuzz"));
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Hostile / malformed .tex input
+//
+// A .tex is untrusted: it arrives inside a Steam Workshop package. Every case
+// here is a byte pattern a downloaded (or partially-downloaded) wallpaper can
+// carry, and the parser must reject it rather than hand the renderer a mip it
+// will dereference.
+// ===========================================================================
+
+TEST_SUITE("WPTexImageParser hostile input") {
+    // A PNG with a well-formed IHDR (1x1, 8-bit truecolour) and a deliberately
+    // corrupt IDAT payload. stbi_info_from_memory parses only IHDR, so it reports
+    // 1x1x3 and clears the parser's pre-validation gate; stbi_load_from_memory
+    // then fails inflating the garbage zlib stream and returns NULL. This is what
+    // a partially-downloaded or bit-rotted workshop texture looks like.
+    //
+    // A truncated TGA does NOT work here: stb pads missing scanline bytes with
+    // zeros and reports success, so it never exercises the NULL path.
+    // stb does not verify chunk CRCs, so the CRC fields are left zero.
+    static const uint8_t kCorruptIdatPng[] = {
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
+        0x00, 0x00, 0x00, 0x0D, 'I',  'H',  'D',  'R',  // len=13, IHDR
+        0x00, 0x00, 0x00, 0x01,                         // width  = 1
+        0x00, 0x00, 0x00, 0x01,                         // height = 1
+        0x08,                                           // bit depth = 8
+        0x02,                                           // colour type = 2 (RGB)
+        0x00, 0x00, 0x00,                               // compression/filter/interlace
+        0x00, 0x00, 0x00, 0x00,                         // CRC (unchecked)
+        0x00, 0x00, 0x00, 0x04, 'I',  'D',  'A',  'T',  // len=4, IDAT
+        0xFF, 0xFF, 0xFF, 0xFF,                         // invalid zlib stream
+        0x00, 0x00, 0x00, 0x00,                         // CRC (unchecked)
+        0x00, 0x00, 0x00, 0x00, 'I',  'E',  'N',  'D',  // len=0, IEND
+        0x00, 0x00, 0x00, 0x00,                         // CRC (unchecked)
+    };
+
+    TEST_CASE("stbi decode failure rejects the texture instead of storing a null mip") {
+        auto buf = makeTexHeader(1, 1, 3, /*tex_fmt=*/0, /*flags=*/0, 1, 1, 1, 1, /*count=*/1);
+        appendInt32(buf, (int32_t)ImageType::PNG); // -> stbi container path
+        appendInt32(buf, 1);                       // mipmap_count
+        std::vector<uint8_t> corrupt(kCorruptIdatPng, kCorruptIdatPng + sizeof(kCorruptIdatPng));
+        appendMipmapV2(buf, 1, 1, corrupt);
+
+        VFS vfs;
+        mountTex(vfs, "stbi_corrupt", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             img = parser.Parse("stbi_corrupt");
+
+        // Before the fix stbi_load_from_memory's NULL return was discarded: the
+        // mip got a null data pointer and a size computed from uninitialised
+        // w/h, which the Vulkan staging memcpy later dereferenced.
+        CHECK(img == nullptr);
+    }
+
+    TEST_CASE("sprite slot with zero mipmaps disables sprite instead of indexing an empty slot") {
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 2, 0, spriteFlag, 16, 16, 16, 16, /*count=*/1);
+
+        // Image 0 declares NO mipmaps, so the loop that fills imageDatas[0]
+        // never runs and slot 0 stays an empty vector.
+        appendInt32(buf, 0); // mipmap_count = 0
+
+        appendTexVersion(buf, 2); // texs version
+        appendInt32(buf, 1);      // framecount = 1
+
+        // imageId 0 is a valid OUTER index, so the existing range check passes;
+        // the read that follows indexes the empty inner vector.
+        appendInt32(buf, 0);     // imageId = 0
+        appendFloat(buf, 0.1f);  // frametime
+        appendFloat(buf, 0.0f);  // x
+        appendFloat(buf, 0.0f);  // y
+        appendFloat(buf, 16.0f); // xAxis[0]
+        appendFloat(buf, 0.0f);  // xAxis[1]
+        appendFloat(buf, 0.0f);  // yAxis[0]
+        appendFloat(buf, 16.0f); // yAxis[1]
+
+        VFS vfs;
+        mountTex(vfs, "sprite_zero_mip", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_zero_mip");
+
+        CHECK(header.isSprite == false);
+    }
+}
+
+// ===========================================================================
+// Cumulative texture budget: injectable via the constructor, defaulted via
+// DefaultMaxTexBytes() (WEKDE_MAX_TEX_BYTES env override, falling back to
+// the WEK_MAX_TEX_BYTES compile-time default).
+// ===========================================================================
+namespace
+{
+// Puts WEKDE_MAX_TEX_BYTES back the way it was found once the test scope
+// ends -- DefaultMaxTexBytes() reads the env fresh on every call, so there's
+// no cached state to worry about beyond the variable itself.
+struct MaxTexBytesEnvGuard {
+    bool        hadValue;
+    std::string oldValue;
+    MaxTexBytesEnvGuard() {
+        const char* v = std::getenv("WEKDE_MAX_TEX_BYTES");
+        hadValue      = v != nullptr;
+        if (hadValue) oldValue = v;
+    }
+    ~MaxTexBytesEnvGuard() {
+        if (hadValue) setenv("WEKDE_MAX_TEX_BYTES", oldValue.c_str(), 1);
+        else unsetenv("WEKDE_MAX_TEX_BYTES");
+    }
+};
+} // namespace
+
+TEST_SUITE("WPTexImageParser texture budget") {
+
+    TEST_CASE("small budget passed to the constructor is honoured") {
+        // 3 raw mips of 4 bytes each (12 bytes retained) fit comfortably
+        // under the 2 GiB compile-time default but must be rejected once the
+        // constructor is given an 8-byte budget instead.
+        auto buf = makeTexHeader(1, 1, 1, 0, 0, 4, 4, 4, 4, 1);
+        appendInt32(buf, /*mipmap_count=*/3);
+        for (int i = 0; i < 3; i++) {
+            std::vector<uint8_t> pixels(4, 0xAB);
+            appendMipmapV1(buf, 4, 4, pixels);
+        }
+        VFS vfs;
+        mountTex(vfs, "small_budget", std::move(buf));
+
+        WPTexImageParser parser(&vfs, /*maxTotalBytes=*/8);
+        CHECK(parser.Parse("small_budget") == nullptr);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes returns the compile-time default when unset") {
+        MaxTexBytesEnvGuard guard;
+        unsetenv("WEKDE_MAX_TEX_BYTES");
+        CHECK(DefaultMaxTexBytes() == 2ll * 1024 * 1024 * 1024);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes returns a valid env override") {
+        MaxTexBytesEnvGuard guard;
+        setenv("WEKDE_MAX_TEX_BYTES", "12345", 1);
+        CHECK(DefaultMaxTexBytes() == 12345);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes falls back to the compile default on an invalid value") {
+        MaxTexBytesEnvGuard guard;
+        setenv("WEKDE_MAX_TEX_BYTES", "not-a-number", 1);
+        CHECK(DefaultMaxTexBytes() == 2ll * 1024 * 1024 * 1024);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes falls back to the compile default on zero") {
+        // A budget of 0 would make every mip an instant reject -- the parser
+        // would just blank every wallpaper.  Treat it as unset instead.
+        MaxTexBytesEnvGuard guard;
+        setenv("WEKDE_MAX_TEX_BYTES", "0", 1);
+        CHECK(DefaultMaxTexBytes() == 2ll * 1024 * 1024 * 1024);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes falls back to the compile default on a negative value") {
+        MaxTexBytesEnvGuard guard;
+        setenv("WEKDE_MAX_TEX_BYTES", "-5", 1);
+        CHECK(DefaultMaxTexBytes() == 2ll * 1024 * 1024 * 1024);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes falls back to the compile default on int64 overflow") {
+        // strtoll sets errno=ERANGE and clamps to LLONG_MAX for a value this
+        // far past int64 range -- must not silently accept the clamped value.
+        MaxTexBytesEnvGuard guard;
+        setenv("WEKDE_MAX_TEX_BYTES", "99999999999999999999", 1);
+        CHECK(DefaultMaxTexBytes() == 2ll * 1024 * 1024 * 1024);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes falls back to the compile default on trailing junk") {
+        // strtoll happily parses the leading "123" and leaves `end` pointing
+        // at "abc" -- the *end != '\0' check is what catches this.
+        MaxTexBytesEnvGuard guard;
+        setenv("WEKDE_MAX_TEX_BYTES", "123abc", 1);
+        CHECK(DefaultMaxTexBytes() == 2ll * 1024 * 1024 * 1024);
+    }
+
+    TEST_CASE("DefaultMaxTexBytes accepts a plain valid value") {
+        MaxTexBytesEnvGuard guard;
+        setenv("WEKDE_MAX_TEX_BYTES", "4096", 1);
+        CHECK(DefaultMaxTexBytes() == 4096);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conditional texture variants (TEXB0004 with a non-zero variant count).
+//
+// Layout: after imageType the header carries a variant count and that many
+// records {i32 1, i32 index, i32 0, NUL-terminated JSON condition}. Every mip
+// is then followed by {i32 1, i32 n} and n patches {i32 1, i32 index, i32 x,
+// i32 y, i32 w, i32 h, i32 13, i32 size} + LZ4 bytes that replace the
+// rectangle (x, y, w, h) of the base mip when that variant is selected.
+// ---------------------------------------------------------------------------
+namespace
+{
+
+struct VariantPatch {
+    int32_t index;
+    int32_t x, y, w, h;
+    uint8_t fill;
+    int32_t lead { 1 };
+    int32_t kind { 13 };
+};
+
+std::vector<uint8_t> lz4(const std::vector<uint8_t>& raw) {
+    std::vector<char> out((size_t)LZ4_compressBound((int)raw.size()));
+    int               n = LZ4_compress_default(
+        reinterpret_cast<const char*>(raw.data()), out.data(), (int)raw.size(), (int)out.size());
+    return { out.begin(), out.begin() + n };
+}
+
+int32_t bc2Bytes(int32_t w, int32_t h) { return ((w + 3) / 4) * ((h + 3) / 4) * 16; }
+
+// BC2 8x8 texture, two mips (8x8, 4x4), base bytes 0x11. `conds` are the
+// header records; `patchesPerMip[m]` the patches written after mip m.
+// `mip0PatchCount` overrides the patch count written after mip 0.
+std::vector<uint8_t> makeVariantTex(const std::vector<std::pair<int32_t, std::string>>& conds,
+                                    const std::vector<std::vector<VariantPatch>>& patchesPerMip,
+                                    int32_t mip0PatchCount = -1) {
+    auto buf = makeTexHeader(1, 1, 4, /*BC2*/ 6, 0, 8, 8, 8, 8, 1);
+    appendInt32(buf, -1); // imageType UNKNOWN
+    appendInt32(buf, (int32_t)conds.size());
+    for (auto& [idx, json] : conds) {
+        appendInt32(buf, 1);
+        appendInt32(buf, idx);
+        appendInt32(buf, 0);
+        append(buf, json.c_str(), json.size() + 1);
+    }
+    appendInt32(buf, 2); // mipmap count
+    for (int32_t m = 0; m < 2; m++) {
+        int32_t              dim = 8 >> m;
+        std::vector<uint8_t> base((size_t)bc2Bytes(dim, dim), 0x11);
+        appendMipmapV2(buf, dim, dim, base, /*compress=*/true);
+        const auto& patches = patchesPerMip[(size_t)m];
+        appendInt32(buf, 1);
+        appendInt32(buf, m == 0 && mip0PatchCount >= 0 ? mip0PatchCount : (int32_t)patches.size());
+        for (auto& p : patches) {
+            auto data = lz4(std::vector<uint8_t>((size_t)bc2Bytes(p.w, p.h), p.fill));
+            appendInt32(buf, p.lead);
+            appendInt32(buf, p.index);
+            appendInt32(buf, p.x);
+            appendInt32(buf, p.y);
+            appendInt32(buf, p.w);
+            appendInt32(buf, p.h);
+            appendInt32(buf, p.kind);
+            appendInt32(buf, (int32_t)data.size());
+            append(buf, data.data(), data.size());
+        }
+    }
+    return buf;
+}
+
+const std::vector<std::pair<int32_t, std::string>> kFaceConds {
+    { 1, R"({"condition":{"condition":"Ariane","name":"facestyles"}})" },
+    { 2, R"({"condition":{"condition":"Bloodied","name":"facestyles"}})" },
+};
+
+// Variant 1 replaces the whole image; variant 2 only the right half.
+const std::vector<std::vector<VariantPatch>> kFacePatches {
+    { { 1, 0, 0, 8, 8, 0x22 }, { 2, 4, 0, 4, 8, 0x33 } },
+    { { 1, 0, 0, 4, 4, 0x22 }, { 2, 0, 0, 4, 4, 0x33 } },
+};
+
+texvariant::Selector selectFace(std::string value) {
+    return [value](const std::string& prop, const std::string& v) {
+        return prop == "facestyles" && v == value;
+    };
+}
+
+// Byte at block (bx, by) of an 8x8 BC2 mip (2 blocks per row).
+uint8_t blockByte(const Image& img, size_t mip, int bx, int by) {
+    return img.slots[0].mipmaps[mip].data.get()[(by * 2 + bx) * 16];
+}
+
+} // namespace
+
+TEST_SUITE("WPTexImageParser variants") {
+    TEST_CASE("Without a matching condition the base image loads") {
+        VFS vfs;
+        mountTex(vfs, "face", makeVariantTex(kFaceConds, kFacePatches));
+        WPTexImageParser parser(&vfs);
+        parser.SetVariantSelector(selectFace("Elster"));
+        auto img = parser.Parse("face");
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots[0].mipmaps.size() == 2);
+        CHECK(img->slots[0].mipmaps[0].size == 64);
+        CHECK(blockByte(*img, 0, 0, 0) == 0x11);
+        CHECK(blockByte(*img, 0, 1, 1) == 0x11);
+        CHECK(img->slots[0].mipmaps[1].data.get()[0] == 0x11);
+    }
+
+    TEST_CASE("Header records the variant conditions") {
+        VFS vfs;
+        mountTex(vfs, "face", makeVariantTex(kFaceConds, kFacePatches));
+        WPTexImageParser parser(&vfs);
+        auto             h = parser.ParseHeader("face");
+        REQUIRE(h.variants.size() == 2);
+        CHECK(h.variants[0].index == 1);
+        CHECK(h.variants[0].property == "facestyles");
+        CHECK(h.variants[0].value == "Ariane");
+        CHECK(h.variants[1].value == "Bloodied");
+        // The mip table after the records was read, not the JSON bytes.
+        CHECK(h.mipmap_pow2);
+        CHECK_FALSE(h.mipmap_larger);
+    }
+
+    TEST_CASE("A full-image variant replaces every mip") {
+        VFS vfs;
+        mountTex(vfs, "face", makeVariantTex(kFaceConds, kFacePatches));
+        WPTexImageParser parser(&vfs);
+        parser.SetVariantSelector(selectFace("Ariane"));
+        auto img = parser.Parse("face");
+        REQUIRE(img != nullptr);
+        CHECK(blockByte(*img, 0, 0, 0) == 0x22);
+        CHECK(blockByte(*img, 0, 1, 1) == 0x22);
+        CHECK(img->slots[0].mipmaps[1].data.get()[0] == 0x22);
+    }
+
+    TEST_CASE("A patch variant replaces only its rectangle") {
+        VFS vfs;
+        mountTex(vfs, "face", makeVariantTex(kFaceConds, kFacePatches));
+        WPTexImageParser parser(&vfs);
+        parser.SetVariantSelector(selectFace("Bloodied"));
+        auto img = parser.Parse("face");
+        REQUIRE(img != nullptr);
+        CHECK(blockByte(*img, 0, 0, 0) == 0x11);
+        CHECK(blockByte(*img, 0, 0, 1) == 0x11);
+        CHECK(blockByte(*img, 0, 1, 0) == 0x33);
+        CHECK(blockByte(*img, 0, 1, 1) == 0x33);
+        CHECK(img->slots[0].mipmaps[1].data.get()[0] == 0x33);
+    }
+
+    TEST_CASE("A patch with an unknown kind keeps the base image") {
+        auto patches       = kFacePatches;
+        patches[0][0].kind = 7;
+        VFS vfs;
+        mountTex(vfs, "face", makeVariantTex(kFaceConds, patches));
+        WPTexImageParser parser(&vfs);
+        parser.SetVariantSelector(selectFace("Ariane"));
+        auto img = parser.Parse("face");
+        REQUIRE(img != nullptr);
+        CHECK(blockByte(*img, 0, 0, 0) == 0x11);
+        // The next mip's patch is well-formed and still applies.
+        CHECK(img->slots[0].mipmaps[1].data.get()[0] == 0x22);
+    }
+
+    TEST_CASE("A patch outside its mip keeps the base image") {
+        auto patches    = kFacePatches;
+        patches[0][1].x = 8;
+        VFS vfs;
+        mountTex(vfs, "face", makeVariantTex(kFaceConds, patches));
+        WPTexImageParser parser(&vfs);
+        parser.SetVariantSelector(selectFace("Bloodied"));
+        auto img = parser.Parse("face");
+        REQUIRE(img != nullptr);
+        CHECK(blockByte(*img, 0, 1, 0) == 0x11);
+    }
+
+    TEST_CASE("A patch count larger than the stream is rejected") {
+        // Under the plausibility cap, so the stream-size check is what rejects it.
+        auto buf = makeVariantTex(kFaceConds, { {}, {} }, /*mip0PatchCount=*/60);
+        VFS  vfs;
+        mountTex(vfs, "face", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("face") == nullptr);
+    }
+
+    TEST_CASE("A variant count larger than the stream is rejected") {
+        auto buf = makeTexHeader(1, 1, 4, 6, 0, 8, 8, 8, 8, 1);
+        appendInt32(buf, -1);
+        appendInt32(buf, 60); // under the cap; the stream holds no records
+        VFS vfs;
+        mountTex(vfs, "face", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK(parser.Parse("face") == nullptr);
+    }
+    TEST_CASE("A patch size larger than the stream is rejected") {
+        auto buf = makeVariantTex(kFaceConds, { { { 1, 0, 0, 8, 8, 0x22 } }, {} });
+        // The selected patch's size field is the int right before its LZ4
+        // bytes; find it from the end of mip 0's single patch header.
+        // Patch header: {1, 1, 0, 0, 8, 8, 13, size}.
+        const int32_t hdr[7] = { 1, 1, 0, 0, 8, 8, 13 };
+        auto          it     = std::search(buf.begin(),
+                                           buf.end(),
+                                           reinterpret_cast<const uint8_t*>(hdr),
+                                           reinterpret_cast<const uint8_t*>(hdr) + sizeof(hdr));
+        REQUIRE(it != buf.end());
+        int32_t huge = 0x7fffffff;
+        std::memcpy(&*(it + sizeof(hdr)), &huge, 4);
+        VFS vfs;
+        mountTex(vfs, "face", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        parser.SetVariantSelector(selectFace("Ariane"));
+        CHECK(parser.Parse("face") == nullptr);
+    }
+
+    TEST_CASE("A sprite with variants still reads its frame table") {
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 4, 0, spriteFlag, 4, 4, 4, 4, 1);
+        appendInt32(buf, -1); // imageType UNKNOWN
+        appendInt32(buf, 1);  // one variant
+        appendInt32(buf, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 0);
+        std::string json = R"({"condition":{"condition":"Isa","name":"facestyles"}})";
+        append(buf, json.c_str(), json.size() + 1);
+        appendInt32(buf, 1); // mipmap count
+        std::vector<uint8_t> pixels(4 * 4 * 4, 0x11);
+        appendMipmapV2(buf, 4, 4, pixels);
+        auto patch = lz4(std::vector<uint8_t>(4 * 4 * 4, 0x22));
+        appendInt32(buf, 1); // trailer lead
+        appendInt32(buf, 1); // one patch
+        for (int32_t v : { 1, 1, 0, 0, 4, 4, 13 }) appendInt32(buf, v);
+        appendInt32(buf, (int32_t)patch.size());
+        append(buf, patch.data(), patch.size());
+        appendTexVersion(buf, 2); // texs
+        appendInt32(buf, 1);      // framecount
+        appendInt32(buf, 0);      // imageId
+        for (float f : { 0.5f, 0.0f, 0.0f, 4.0f, 0.0f, 0.0f, 4.0f }) appendFloat(buf, f);
+
+        VFS vfs;
+        mountTex(vfs, "sprite_variant", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_variant");
+        CHECK(header.isSprite);
+        REQUIRE(header.spriteAnim.numFrames() == 1);
+        CHECK(header.spriteAnim.GetCurFrame().frametime == doctest::Approx(0.5f));
+    }
+    TEST_CASE("Every patch the selected variant has in a mip is applied") {
+        // Two rectangles for variant 2 in mip 0: left column and right column.
+        auto patches = kFacePatches;
+        patches[0]   = { { 2, 0, 0, 4, 8, 0x44 }, { 2, 4, 0, 4, 8, 0x33 } };
+        VFS vfs;
+        mountTex(vfs, "face", makeVariantTex(kFaceConds, patches));
+        WPTexImageParser parser(&vfs);
+        parser.SetVariantSelector(selectFace("Bloodied"));
+        auto img = parser.Parse("face");
+        REQUIRE(img != nullptr);
+        CHECK(blockByte(*img, 0, 0, 0) == 0x44);
+        CHECK(blockByte(*img, 0, 1, 1) == 0x33);
+    }
+
+    TEST_CASE("A sprite whose trailer overruns the stream is no longer a sprite") {
+        uint32_t spriteFlag = (1u << 2);
+        auto     buf        = makeTexHeader(1, 1, 4, 0, spriteFlag, 4, 4, 4, 4, 1);
+        appendInt32(buf, -1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 1);
+        appendInt32(buf, 0);
+        std::string json = R"({"condition":{"condition":"Isa","name":"facestyles"}})";
+        append(buf, json.c_str(), json.size() + 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(4 * 4 * 4, 0x11);
+        appendMipmapV2(buf, 4, 4, pixels);
+        appendInt32(buf, 1);
+        appendInt32(buf, 30); // patch count the stream cannot hold
+        VFS vfs;
+        mountTex(vfs, "sprite_short", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        auto             header = parser.ParseHeader("sprite_short");
+        CHECK_FALSE(header.isSprite);
+    }
+
+    // ParseHeader's sprite walk takes its image, mip and frame counts from
+    // the file; each must be bounded by the stream, or a short file loops
+    // reading zeros for billions of iterations (fuzz timeout).
+    TEST_CASE("ParseHeader rejects a sprite image count beyond the stream") {
+        auto buf = makeTexHeader(1, 1, 2, 0, (1u << 2), 4, 4, 4, 4, 0x7ffffff0);
+        VFS  vfs;
+        mountTex(vfs, "sprite_count", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK_FALSE(parser.ParseHeader("sprite_count").isSprite);
+    }
+
+    TEST_CASE("ParseHeader rejects a sprite mip count beyond the stream") {
+        auto buf = makeTexHeader(1, 1, 2, 0, (1u << 2), 4, 4, 4, 4, 1);
+        appendInt32(buf, 0x7ffffff0); // mipmap count
+        VFS vfs;
+        mountTex(vfs, "sprite_mips", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK_FALSE(parser.ParseHeader("sprite_mips").isSprite);
+    }
+
+    TEST_CASE("ParseHeader rejects a sprite frame count beyond the stream") {
+        auto buf = makeTexHeader(1, 1, 2, 0, (1u << 2), 4, 4, 4, 4, 1);
+        appendInt32(buf, 1);
+        std::vector<uint8_t> pixels(4 * 4 * 4, 0);
+        appendMipmapV2(buf, 4, 4, pixels);
+        appendTexVersion(buf, 2);
+        appendInt32(buf, 0x7ffffff0); // framecount
+        VFS vfs;
+        mountTex(vfs, "sprite_frames", std::move(buf));
+        WPTexImageParser parser(&vfs);
+        CHECK_FALSE(parser.ParseHeader("sprite_frames").isSprite);
+    }
+}

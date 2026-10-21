@@ -1,0 +1,183 @@
+#pragma once
+#include <string_view>
+#include <cstdint>
+#include "Core/Literals.hpp"
+#include "Core/StringHelper.hpp"
+#include "Utils/String.h"
+
+namespace wallpaper
+{
+
+// `ext` is a string literal glued on by literal concatenation, not a bare
+// token stringified with #ext: Qt 6.12's moc segfaults on a string literal
+// followed by a stringified empty argument ("a" #ext with ext empty), and
+// every moc'd file that includes this header failed the build.
+#define BASE_GLTEX_NAMES(ext)                                                                      \
+    "g_Texture0" ext, "g_Texture1" ext, "g_Texture2" ext, "g_Texture3" ext, "g_Texture4" ext,      \
+        "g_Texture5" ext, "g_Texture6" ext, "g_Texture7" ext, "g_Texture8" ext, "g_Texture9" ext,  \
+        "g_Texture10" ext, "g_Texture11" ext, "g_Texture12" ext
+
+constexpr std::array WE_GLTEX_NAMES { BASE_GLTEX_NAMES("") };
+constexpr std::array WE_GLTEX_RESOLUTION_NAMES { BASE_GLTEX_NAMES("Resolution") };
+constexpr std::array WE_GLTEX_ROTATION_NAMES { BASE_GLTEX_NAMES("Rotation") };
+constexpr std::array WE_GLTEX_TRANSLATION_NAMES { BASE_GLTEX_NAMES("Translation") };
+constexpr std::array WE_GLTEX_MIPMAPINFO_NAMES { BASE_GLTEX_NAMES("MipMapInfo") };
+#undef BASE_GLTEX_NAMES
+
+constexpr std::string_view WE_SPEC_PREFIX { "_rt_" };
+constexpr std::string_view WE_IMAGE_LAYER_COMPOSITE_PREFIX { "_rt_imageLayerComposite_" };
+// True when `tex`, bound to an effect's input slot (g_Texture0) on layer
+// `layer_id`, names that layer's own composite and so means "the previous
+// effect's output". WE's editor writes these names into effect passes (the
+// workshop CRT scan-line effect almost always has one); read as a link to the
+// layer's finished output they make the chain read itself, which cycles the
+// render graph. `_b` is left alone when the layer has a static source texture,
+// where it routes to that texture instead (Real-Time Earth 3557068717).
+inline bool IsOwnCompositeChainInput(std::string_view tex, int32_t layer_id,
+                                     bool has_static_source) {
+    const auto prefix = WE_IMAGE_LAYER_COMPOSITE_PREFIX;
+    if (tex.substr(0, prefix.size()) != prefix) return false;
+    std::string_view rest    = tex.substr(prefix.size());
+    usize            ndigits = 0;
+    while (ndigits < rest.size() && rest[ndigits] >= '0' && rest[ndigits] <= '9') ndigits++;
+    if (ndigits == 0 || ndigits > 9) return false;
+    int32_t id = 0;
+    for (usize i = 0; i < ndigits; i++) id = id * 10 + (rest[i] - '0');
+    if (id != layer_id) return false;
+    std::string_view suffix = rest.substr(ndigits);
+    if (suffix.empty() || suffix == "_a") return true;
+    if (suffix == "_b") return ! has_static_source;
+    return false;
+}
+
+constexpr std::string_view WE_HALF_COMPO_BUFFER_PREFIX { "_rt_HalfCompoBuffer" };
+constexpr std::string_view WE_QUARTER_COMPO_BUFFER_PREFIX { "_rt_QuarterCompoBuffer" };
+constexpr std::string_view WE_FULL_COMPO_BUFFER_PREFIX { "_rt_FullCompoBuffer" };
+constexpr std::string_view WE_MIP_MAPPED_FRAME_BUFFER { "_rt_MipMappedFrameBuffer" };
+
+constexpr std::string_view WE_SHADOW_ATLAS { "_rt_shadowAtlas" };
+// Scene depth as a sampled texture.  CustomShaderPass::prepare() binds the
+// main depth attachment behind a NEAREST/CLAMP no-compare sampler on a device
+// that advertises sampled-image support for VK_FORMAT_D32_SFLOAT; where it
+// does not, the slot gets the 1x1 fallback texture and the shader reads no
+// real depth.  Consumers: volumetric ray-march, future SSAO/DOF.
+constexpr std::string_view WE_SCENE_DEPTH { "_rt_sceneDepth" };
+constexpr std::string_view WE_REFLECTION { "_rt_Reflection" };
+constexpr std::string_view WE_REFLECTION_BLUR { "_rt_Reflection_blur" };
+// Volumetric scattering render-target identifiers.  WE_VOLUMETRICS_BACK is the
+// per-light back-face entry/exit depth buffer; WE_VOLUMETRICS_LIGHT_BUFFER and
+// its `_b` ping-pong counterpart accumulate per-pixel scatter contributions
+// before the blur/combine stages.  Consumers: the per-light volumetric chain
+// emitted by BuildVolumetricNodes.
+constexpr std::string_view WE_VOLUMETRICS_BACK { "_rt_volumetricsBack" };
+constexpr std::string_view WE_VOLUMETRICS_LIGHT_BUFFER { "_rt_volumetricsLightBuffer" };
+constexpr std::string_view WE_VOLUMETRICS_LIGHT_BUFFER_B { "_rt_volumetricsLightBufferB" };
+// Scene-occluder closest-z, sampled by the volumetric ray-march as an
+// integration ceiling.  Semantically identical to WE_SCENE_DEPTH — both
+// resolve to the main depth attachment under the d32-sampleable path.
+constexpr std::string_view WE_VOLUMETRICS_SINGLE { "_rt_volumetricsSingle" };
+constexpr std::string_view WE_BUFFER_PREFIX { "_rt_buffer" };
+
+constexpr std::string_view WE_BLOOM_PREFIX { "_rt_Bloom_" };
+constexpr std::string_view WE_BLOOM_SCENE { "_rt_Bloom_Scene" }; // mip0 (full-res copy of scene)
+// COD-style PBR bloom mip chain — fed by hdr_downsample.frag.  Mip N is at
+// scale 1/(2^N).  Bright-pass extracts mip0→mip1; cascade downsample 1→2→3→4;
+// cascade upsample (additive blend) 4→3→2→1; final compose mip0+mip1.
+constexpr std::string_view WE_BLOOM_MIP1 { "_rt_Bloom_Mip1" };
+constexpr std::string_view WE_BLOOM_MIP2 { "_rt_Bloom_Mip2" };
+constexpr std::string_view WE_BLOOM_MIP3 { "_rt_Bloom_Mip3" };
+constexpr std::string_view WE_BLOOM_MIP4 { "_rt_Bloom_Mip4" };
+// Legacy aliases retained until the rest of the codebase migrates off them.
+constexpr std::string_view WE_BLOOM_QUARTER { "_rt_Bloom_Quarter" };
+constexpr std::string_view WE_BLOOM_EIGHTH { "_rt_Bloom_Eighth" };
+constexpr std::string_view WE_BLOOM_RESULT { "_rt_Bloom_Result" };
+
+constexpr std::string_view WE_EFFECT_PPONG_PREFIX { "_rt_effect_pingpong_" };
+constexpr std::string_view WE_EFFECT_PPONG_PREFIX_A { "_rt_effect_pingpong_a_" };
+constexpr std::string_view WE_EFFECT_PPONG_PREFIX_B { "_rt_effect_pingpong_b_" };
+
+constexpr std::string_view WE_IN_POSITION { "a_Position" };
+constexpr std::string_view WE_IN_TEXCOORD { "a_TexCoord" };
+constexpr std::string_view WE_IN_NORMAL { "a_Normal" };
+constexpr std::string_view WE_IN_TANGENT4 { "a_Tangent4" };
+constexpr std::string_view WE_IN_BLENDINDICES { "a_BlendIndices" };
+constexpr std::string_view WE_IN_BLENDWEIGHTS { "a_BlendWeights" };
+
+// particle
+
+constexpr std::string_view WE_IN_POSITIONVEC4 { "a_PositionVec4" };
+constexpr std::string_view WE_IN_COLOR { "a_Color" };
+constexpr std::string_view WE_IN_TEXCOORDVEC4 { "a_TexCoordVec4" };
+constexpr std::string_view WE_IN_TEXCOORDVEC4C1 { "a_TexCoordVec4C1" };
+constexpr std::string_view WE_IN_TEXCOORDVEC4C2 { "a_TexCoordVec4C2" };
+constexpr std::string_view WE_IN_TEXCOORDVEC4C3 { "a_TexCoordVec4C3" };
+constexpr std::string_view WE_IN_TEXCOORDVEC3C2 { "a_TexCoordVec3C2" };
+constexpr std::string_view WE_IN_TEXCOORDC2 { "a_TexCoordC2" };
+constexpr std::string_view WE_IN_TEXCOORDC3 { "a_TexCoordC3" };
+constexpr std::string_view WE_IN_TEXCOORDC4 { "a_TexCoordC4" };
+constexpr std::string_view WE_CB_THICK_FORMAT { "THICKFORMAT" };
+constexpr std::string_view WE_PRENDER_ROPE { "PRENDER_ROPE" };
+constexpr std::string_view WE_PRENDER_SPRITETRAIL { "PRENDER_SPRITETRAIL" };
+constexpr std::string_view WE_CB_GEOMETRY_SHADER { "GS_POINTS" };
+
+constexpr std::string_view G_M { "g_ModelMatrix" };
+constexpr std::string_view G_VP { "g_ViewProjectionMatrix" };
+constexpr std::string_view G_MVP { "g_ModelViewProjectionMatrix" };
+constexpr std::string_view G_AM { "g_AltModelMatrix" };
+constexpr std::string_view G_MI { "g_ModelMatrixInverse" };
+constexpr std::string_view G_NM { "g_NormalModelMatrix" };
+constexpr std::string_view G_MVPI { "g_ModelViewProjectionMatrixInverse" };
+constexpr std::string_view G_ETVP { "g_EffectTextureProjectionMatrix" };
+constexpr std::string_view G_ETVPI { "g_EffectTextureProjectionMatrixInverse" };
+constexpr std::string_view G_LIGHTAMBIENTCOLOR { "g_LightAmbientColor" };
+constexpr std::string_view G_LIGHTSKYLIGHTCOLOR { "g_LightSkylightColor" };
+constexpr std::string_view G_LP { "g_LightsPosition" };
+constexpr std::string_view G_LCP { "g_LightsColorPremultiplied" };
+constexpr std::string_view G_LCR { "g_LightsColorRadius" };
+
+constexpr std::string_view G_TIME { "g_Time" };
+constexpr std::string_view G_DAYTIME { "g_DayTime" };
+constexpr std::string_view G_POINTERPOSITION { "g_PointerPosition" };
+constexpr std::string_view G_TEXELSIZE { "g_TexelSize" };
+constexpr std::string_view G_TEXELSIZEHALF { "g_TexelSizeHalf" };
+constexpr std::string_view G_BONES { "g_Bones" };
+constexpr std::string_view G_SCREEN { "g_Screen" };
+constexpr std::string_view G_PARALLAXPOSITION { "g_ParallaxPosition" };
+constexpr std::string_view G_EYEPOSITION { "g_EyePosition" };
+
+// Audio spectrum uniforms (std140 float arrays with vec4 stride)
+constexpr std::string_view G_AUDIOSPECTRUM16LEFT { "g_AudioSpectrum16Left" };
+constexpr std::string_view G_AUDIOSPECTRUM16RIGHT { "g_AudioSpectrum16Right" };
+constexpr std::string_view G_AUDIOSPECTRUM32LEFT { "g_AudioSpectrum32Left" };
+constexpr std::string_view G_AUDIOSPECTRUM32RIGHT { "g_AudioSpectrum32Right" };
+constexpr std::string_view G_AUDIOSPECTRUM64LEFT { "g_AudioSpectrum64Left" };
+constexpr std::string_view G_AUDIOSPECTRUM64RIGHT { "g_AudioSpectrum64Right" };
+
+constexpr std::string_view SpecTex_Default { "_rt_default" };
+constexpr std::string_view SpecTex_Link { "_rt_link_" };
+
+// WE's "Now Playing" texture slots: a material's usertextures entry names one
+// of these (type "system") to ask for the current/previous track's album art
+// instead of the pass's authored static texture. Plain '$'-prefixed keys, not
+// '_rt_' render targets, so IsSpecTex must not match them.
+constexpr std::string_view WE_MEDIA_THUMBNAIL { "$mediaThumbnail" };
+constexpr std::string_view WE_MEDIA_PREVIOUS_THUMBNAIL { "$mediaPreviousThumbnail" };
+
+inline bool IsSpecTex(const std::string_view name) { return sstart_with(name, WE_SPEC_PREFIX); }
+inline bool IsSpecLinkTex(const std::string_view name) { return sstart_with(name, SpecTex_Link); }
+inline uint32_t ParseLinkTex(const std::string_view name) {
+    std::string sid { name };
+    sid = sid.substr(9);
+    uint32_t result { 0 };
+    STRTONUM(sid, result);
+    return result;
+}
+inline std::string GenLinkTex(idx id) { return std::string(SpecTex_Link) + std::to_string(id); }
+
+// Per-node offscreen render target for invisible dependency nodes
+constexpr std::string_view WE_OFFSCREEN_RT_PREFIX { "_rt_offscreen_" };
+inline std::string         GenOffscreenRT(i32 id) {
+    return std::string(WE_OFFSCREEN_RT_PREFIX) + std::to_string(id);
+}
+
+} // namespace wallpaper

@@ -1,0 +1,387 @@
+#pragma once
+#include <array>
+#include <memory>
+#include <optional>
+#include <string_view>
+#include <string>
+#include <vector>
+#include <functional>
+#include "Type.hpp"
+#include "WPVolumeAnimation.h"
+#include "Swapchain/ExSwapchain.hpp"
+#include "Scene/include/Scene/Scene.h"
+#include "Scene/include/Scene/SceneLoadFailure.hpp"
+
+namespace wallpaper::audio
+{
+class AudioAnalyzer;
+}
+
+namespace wallpaper
+{
+
+using FirstFrameCallback = std::function<void()>;
+// Bundled per-load summary of video-texture decoder failures.  Fires once per
+// SET_SCENE when at least one videoTexture's open() returned false for BOTH
+// HW and SW decoders.  The string is a multi-line human-readable summary
+// suitable for QML display.
+using VideoDecodeFailedCallback = std::function<void(const std::string& summary)>;
+// SceneLoadFailedCallback + the reason strings live in Scene/SceneLoadFailure.hpp,
+// which the three bail-out sites in loadScene() also include.
+
+struct TextScriptInfo {
+    int32_t     id;
+    std::string script;
+    std::string scriptProperties; // JSON string
+    std::string initialValue;
+};
+
+struct ColorScriptInfo {
+    int32_t              id;
+    std::string          script;
+    std::string          scriptProperties;
+    std::array<float, 3> initialColor;
+};
+
+// Wire-transfer mirror of SceneShaderValueScript for the cross-thread
+// SceneWallpaper::getShaderValueScripts() handoff.  Game of Life
+// (3453251764) Canvas drives ~50 per-frame uniform writes through these.
+struct ShaderValueScriptInfo {
+    int32_t            id { -1 };
+    int32_t            effectIdx { 0 };
+    std::string        uniformName;
+    std::string        script;
+    std::string        scriptProperties;
+    std::vector<float> initialValue;
+    int                argShape { 1 };
+};
+
+struct PropertyScriptInfo {
+    // Where the script is attached.  Object-attached scripts bind thisObject
+    // to thisLayer; AnimationLayer-attached scripts bind thisObject to the
+    // specific rig layer (Lucy puppet offset scripts rely on this).
+    enum class Attachment : uint8_t
+    {
+        Object         = 0,
+        AnimationLayer = 1,
+        Effect         = 2, // effects[N].visible = {"script":...} on an image/text layer
+    };
+
+    int32_t              id;
+    std::string          property; // "visible", "origin", "scale", "angles", "alpha"
+    std::string          script;
+    std::string          scriptProperties; // JSON string
+    std::string          layerName;        // name of the parent object for thisLayer.name
+    bool                 initialVisible { true };
+    std::array<float, 3> initialVec3 { 0, 0, 0 };
+    float                initialFloat { 1.0f };
+    Attachment           attachment { Attachment::Object };
+    int32_t              animationLayerIndex { -1 };
+    int32_t              effectIndex { -1 }; // Attachment::Effect -> compacted effect index
+};
+
+struct VolumeAnimInfo {
+    std::string                                name;
+    std::string                                mode { "loop" };
+    float                                      fps { 30.0f };
+    float                                      length { 0 };
+    std::vector<wallpaper::VolumeAnimKeyframe> keyframes;
+};
+struct SoundVolumeScriptInfo {
+    int32_t        index;
+    std::string    script;
+    std::string    scriptProperties;
+    std::string    layerName;
+    float          initialVolume { 1.0f };
+    bool           hasAnimation { false };
+    VolumeAnimInfo animation;
+};
+
+struct SoundLayerControlInfo {
+    std::string name;
+    float       initialVolume { 1.0f };
+    bool        startsilent { false };
+};
+
+// Puppet animation keyframe event fired by the render thread and drained by
+// the QML/script thread. Routed to the owning object's SceneScript handler
+// (animationEvent(event, value)).
+struct AnimationEventInfo {
+    int32_t     nodeId { -1 };
+    int32_t     frame { 0 };
+    std::string name;
+};
+
+constexpr std::string_view PROPERTY_SOURCE                       = "source";
+constexpr std::string_view PROPERTY_ASSETS                       = "assets";
+constexpr std::string_view PROPERTY_FPS                          = "fps";
+constexpr std::string_view PROPERTY_FILLMODE                     = "fillmode";
+constexpr std::string_view PROPERTY_SPEED                        = "speed";
+constexpr std::string_view PROPERTY_GRAPHIVZ                     = "graphivz";
+constexpr std::string_view PROPERTY_VOLUME                       = "volume";
+constexpr std::string_view PROPERTY_MUTED                        = "muted";
+constexpr std::string_view PROPERTY_CACHE_PATH                   = "cache_path";
+constexpr std::string_view PROPERTY_FIRST_FRAME_CALLBACK         = "first_frame_callback";
+constexpr std::string_view PROPERTY_VIDEO_DECODE_FAILED_CALLBACK = "video_decode_failed_callback";
+constexpr std::string_view PROPERTY_SCENE_LOAD_FAILED_CALLBACK   = "scene_load_failed_callback";
+constexpr std::string_view PROPERTY_USER_PROPS                   = "user_props";
+constexpr std::string_view PROPERTY_HDR_OUTPUT                   = "hdr_output";
+constexpr std::string_view PROPERTY_HDR_CONTENT                  = "hdr_content";
+constexpr std::string_view PROPERTY_SYSTEM_AUDIO_CAPTURE         = "system_audio_capture";
+constexpr std::string_view PROPERTY_SCREENSHOT_PATH              = "screenshot_path";
+constexpr std::string_view PROPERTY_POSTPROCESSING_OVERRIDE      = "postprocessing_override";
+constexpr std::string_view PROPERTY_MSAA_MODE                   = "msaa_mode";
+// Swapchain present-mode policy (Auto / Fifo / FifoRelaxed / Mailbox / Immediate).
+// Encoded as int matching the PresentModePolicy enum in Vulkan/Swapchain.hpp.
+// Default 0 = Auto, preserving today's FIFO behaviour for matched Fps/refresh.
+constexpr std::string_view PROPERTY_PRESENT_MODE = "present_mode";
+// Display refresh rate in millihertz (59.94Hz -> 59940), sourced from
+// Window.screen.refreshRate.  Feeds the frame timer's snap-to-refresh grid
+// and, on surface builds (standalone viewer), the swapchain Auto policy.
+// 0 = unknown (plasmoid not mapped yet) — the timer falls back to the exact
+// fps period.
+constexpr std::string_view PROPERTY_OUTPUT_REFRESH_MHZ = "output_refresh_mhz";
+
+#include "Core/NoCopyMove.hpp"
+class MainHandler;
+struct RenderInitInfo;
+
+class SceneWallpaper : NoCopy {
+public:
+    SceneWallpaper();
+    ~SceneWallpaper();
+    bool init();
+    bool inited() const;
+
+    void initVulkan(const RenderInitInfo&);
+
+    void play();
+    void pause();
+
+    // Cooperative-cancellation of an in-flight parse / load.  Sets an atomic
+    // flag the parse thread checks at hot-path checkpoints (texture decompress,
+    // shader compile, per-layer iteration) so a screen-removal mid-load doesn't
+    // burn CPU/GPU finishing a parse whose surface is gone.  Idempotent and
+    // safe to call when no load is in flight; the flag is reset at the top of
+    // every new CMD_LOAD_SCENE handler so subsequent loads aren't bricked.
+    void abortLoad();
+    // For tests only: observe the current abort flag.
+    bool isAborted() const;
+
+    void mouseInput(double x, double y);
+    void updateText(int32_t id, const std::string& text);
+    // GUI-thread-resolved "Now Playing" system-texture reupload (already
+    // resized/crossfade-decided by the caller) -- enqueues onto the render
+    // thread the same way updateColor/updateText do.
+    void updateSystemTexture(const std::string& key, std::shared_ptr<Image> image);
+    // Dynamic pointsize override: scripts call `thisLayer.pointsize = 20`
+    // when fitting long track titles.  Next text update will rasterize at
+    // the new pointsize.  <=0 means "keep whatever was authored".
+    void updateTextPointsize(int32_t id, float pointsize);
+    // Debug per-pass RT dump: writes every CustomShaderPass output image
+    // after the next frame completes.  See VulkanRender::setPassDumpDir.
+    void                                     requestPassDump(const std::string& dir);
+    bool                                     passDumpDone() const;
+    void                                     updateColor(int32_t id, float r, float g, float b);
+    std::vector<TextScriptInfo>              getTextScripts() const;
+    std::vector<ColorScriptInfo>             getColorScripts() const;
+    std::vector<ShaderValueScriptInfo>       getShaderValueScripts() const;
+    std::vector<PropertyScriptInfo>          getPropertyScripts() const;
+    std::unordered_map<std::string, int32_t> getNodeNameToIdMap() const;
+    // The registered size/sample/placeholder for a "Now Playing" system
+    // texture key ($mediaThumbnail / $mediaPreviousThumbnail), or nullopt
+    // when this scene never declared one. GUI-thread-safe read of the
+    // parse-thread-populated registry, same pattern as getNodeNameToIdMap.
+    std::optional<MediaTextureSlot> getMediaTextureSize(const std::string& textureKey) const;
+    std::string                     getLayerInitialStatesJson() const;
+    std::array<int32_t, 2>          getOrthoSize() const;
+    // Camera-parallax config (enable / amount / mouse-influence) + camera
+    // position in scene units.  Exposed so cursor hit-testing can mirror the
+    // MVP parallax offset WPShaderValueUpdater applies to rendered quads.
+    struct ParallaxInfo {
+        bool  enable { false };
+        float amount { 0.5f };
+        float mouseInfluence { 0.1f };
+        float camX { 0.0f };
+        float camY { 0.0f };
+    };
+    ParallaxInfo getParallaxInfo() const;
+    // push the SceneScript audio-consumer term into the FFT gate
+    // (engine._audioRegs non-empty).  Called from the QML/SceneObject side.
+    void setHasScriptAudio(bool v);
+    void updateNodeTransform(int32_t id, const std::string& property, float x, float y, float z);
+    void updateNodeVisible(int32_t id, bool visible);
+    void updateNodeAlpha(int32_t id, float alpha);
+
+    // Scripted particle instance-override dispatch.  Currently only `rate` is
+    // implemented; the script returns a multiplier that scales emission speed
+    // on top of the static instanceoverride.rate value captured at parse time.
+    // No-op on IDs that don't own a particle subsystem.
+    void updateParticleRate(int32_t id, float rate);
+
+    // Batched per-tick layer update — one lock for the entire dispatch pass.
+    // Flags: 1=origin 2=scale 4=angles 8=visible 16=alpha (matches JS
+    // DIRTY_STRIDE F_* constants).  Unset fields are ignored.
+    struct LayerBatchUpdate {
+        int32_t  id;
+        uint32_t flags;
+        float    origin[3];
+        float    scale[3];
+        float    angles[3];
+        float    alpha;
+        uint8_t  visible;
+    };
+    void applyLayerBatch(const std::vector<LayerBatchUpdate>& batch);
+
+    void updateEffectVisible(int32_t nodeId, int32_t effectIndex, bool visible);
+    // IMaterial.setValue from SceneScript — enqueues for the render thread,
+    // applied to mesh.Material()->customShader.constValues with dirty flag.
+    void updateMaterialValue(int32_t nodeId, std::string name, std::vector<float> floats);
+
+    // Per-effect material write (effect chain index, not main material).
+    // Render thread resolves nodeId → SceneImageEffectLayer → m_effects[effectIdx]
+    // → first effect-node material; writes constValues + sets constValuesDirty.
+    void updateEffectMaterialValue(int32_t nodeId, int32_t effectIdx, std::string name,
+                                   std::vector<float> floats);
+
+    // SceneScript thisLayer.getTextureAnimation().setFrame(N) bridge.
+    // Records a per-node sprite-frame pin in Scene::nodeSpriteFrame; the
+    // per-frame uniform updater applies it to every sprite belonging to
+    // any pass that renders the node, suppressing the texture's authored
+    // auto-advance.  Pass `wantsManual=false` to release the pin and
+    // restore time-driven playback.  Solves Game of Life (3453251764)
+    // tinted button sheets cycling through their idle/hover/selected
+    // frames at the texture's authored rate.
+    void setLayerSpriteFrame(int32_t nodeId, bool wantsManual, int32_t frameIdx);
+
+    // SceneScript thisLayer.{horizontalalign,verticalalign,alignment,font} bridge.
+    // Each string is "" to leave that field unchanged.  Font name is resolved to
+    // bytes on the render thread (VFS access lives there).  Forces a re-rasterize
+    // of the layer's text texture with the current text when any field changes.
+    void updateTextStyle(int32_t nodeId, std::string halign, std::string valign,
+                         std::string fontName);
+
+    // SceneScript thisLayer.getTransformMatrix() bridge.  Returns the layer's
+    // world transform as a 16-float column-major matrix, snapshotted at the
+    // end of the most recent drawFrame.  Identity for unknown ids.
+    std::array<float, 16> getLayerWorldMatrix(int32_t nodeId) const;
+
+    // SceneScript thisLayer.getBoneIndex(name) bridge.  Resolves the named
+    // MDAT attachment in the layer's puppet (or this layer's parent's puppet,
+    // matching WE rigging semantics) and returns its bone_index, or 0 when
+    // not found (matches WE's "0 = origin" sentinel that authoring scripts
+    // treat as a missing attachment).
+    int32_t getLayerBoneIndex(int32_t nodeId, const std::string& boneName) const;
+
+    // SceneScript thisLayer.getTextureAnimation() read-back bridge.  Returns
+    // the per-node sprite snapshot (numFrames / currentFrame / duration /
+    // isManualPin) published each render tick by WPShaderValueUpdater.  All
+    // zero / not-pinned when the node has no sprite or hasn't been drawn yet.
+    // Lets the JS proxy expose live frameCount / duration / getFrame() /
+    // isPlaying() instead of the previous hardcoded placeholders (firework
+    // scripts like Rella 3363252053 depend on `frame === ani.frameCount - 1`
+    // ticking through real frames to pace their random-delay pause loop).
+    Scene::NodeSpriteSnapshot getLayerSpriteSnapshot(int32_t nodeId) const;
+
+    // Layer-hierarchy bridge — thisLayer.setParent() JS path enqueues
+    // a (childId, parentId) pair into Scene::m_pending_parent_changes,
+    // which is drained at the start of RenderHandler::CMD_DRAW.  parentId
+    // == -1 means "reattach to scene root".
+    void queueParentChange(int32_t childId, int32_t parentId);
+
+    // SceneScript thisScene.sortLayer(layer, index) bridge.  Enqueues a
+    // (childId, targetIndex) pair into Scene::m_pending_child_sorts, drained
+    // alongside the parent-change queue at the start of CMD_DRAW.
+    // targetIndex clamps to [0, parent->children.size()-1].
+    void queueChildSort(int32_t childId, int32_t targetIndex);
+
+    std::vector<SoundVolumeScriptInfo> getSoundVolumeScripts() const;
+    void                               updateSoundVolume(int32_t index, float volume);
+    std::string                        getUserPropertiesJson() const;
+    // Render-thread scene clock (seconds since scene load). Same clock as visuals:
+    // advances only when drawFrame() runs, so audio animations stay locked to render
+    // cadence instead of wall-clock.
+    double getSceneTime() const;
+
+    // Real render-thread FPS measured wall-clock by FpsCounter (rolling 500ms
+    // window).  0 until the first frame has been drawn.  This is what
+    // `engine.fps` exposes to SceneScripts.
+    double getFps() const;
+    // Monotonic frame counter incremented at the end of every successful
+    // drawFrame.  Lets the main thread tell whether a render frame has elapsed
+    // since the last script tick, so text scripts using `Date.now()` math can
+    // be invoked once per render frame (matching WE's per-frame text eval).
+    uint64_t getFrameIdx() const;
+
+    // Video texture control API for SceneScript thisLayer.getVideoTexture().
+    // All operations take the nodeId of the layer owning the video texture.
+    // Calls on unknown IDs are safe no-ops / return 0.
+    double videoGetCurrentTime(int32_t nodeId) const;
+    double videoGetDuration(int32_t nodeId) const;
+    bool   videoIsPlaying(int32_t nodeId) const;
+    void   videoPlay(int32_t nodeId);
+    void   videoPause(int32_t nodeId);
+    void   videoStop(int32_t nodeId);
+    void   videoSetCurrentTime(int32_t nodeId, double t);
+    void   videoSetRate(int32_t nodeId, double rate);
+
+    // Sound layer control API for SceneScript play/stop/pause
+    std::vector<SoundLayerControlInfo> getSoundLayerControls() const;
+    void                               soundLayerPlay(int32_t index);
+    void                               soundLayerStop(int32_t index);
+    void                               soundLayerPause(int32_t index);
+    bool                               soundLayerIsPlaying(int32_t index) const;
+    void                               soundLayerSetVolume(int32_t index, float volume);
+
+    // Drain puppet-animation keyframe events that fired since the last call.
+    // Polled by SceneBackend each script evaluation tick.
+    std::vector<AnimationEventInfo> drainAnimationEvents();
+
+    // Named property-animation control (layer.getAnimation(name).play()/etc).
+    void propertyAnimPlay(int32_t nodeId, const std::string& name);
+    void propertyAnimPause(int32_t nodeId, const std::string& name);
+    void propertyAnimStop(int32_t nodeId, const std::string& name);
+    bool propertyAnimIsPlaying(int32_t nodeId, const std::string& name) const;
+
+    // Scene property control (bloom, clear color, camera, lighting)
+    void updateClearColor(float r, float g, float b);
+    void updateBloomStrength(float strength);
+    void updateBloomThreshold(float threshold);
+    void updateCameraFov(float fov);
+    void updateCameraLookAt(float ex, float ey, float ez, float cx, float cy, float cz, float ux,
+                            float uy, float uz);
+    void updateAmbientColor(float r, float g, float b);
+    void updateSkylightColor(float r, float g, float b);
+    void updateLightColor(int32_t index, float r, float g, float b);
+    void updateLightRadius(int32_t index, float radius);
+    void updateLightIntensity(int32_t index, float intensity);
+    void updateLightPosition(int32_t index, float x, float y, float z);
+    std::string getSceneInitialStateJson() const;
+
+    void setPropertyBool(std::string_view, bool);
+    void setPropertyInt32(std::string_view, int32_t);
+    void setPropertyFloat(std::string_view, float);
+    void setPropertyString(std::string_view, std::string);
+    void setPropertyObject(std::string_view, std::shared_ptr<void>);
+
+    ExSwapchain*                          exSwapchain() const;
+    std::shared_ptr<audio::AudioAnalyzer> audioAnalyzer() const;
+
+    // Screenshot capture: request a PPM dump of the next presented swapchain
+    // image.  screenshotDone() flips true once the file is written.
+    void requestScreenshot(const std::string& path);
+    bool screenshotDone() const;
+    // Frame-indexed capture: fire exactly when the render thread's monotonic
+    // frame counter reaches `frame` (race-free, deterministic with the
+    // --deterministic render mode).  Used by the render oracle for
+    // byte-identical warm==cold comparison.
+    void requestScreenshotAtFrame(const std::string& path, uint64_t frame);
+
+    // Debug: hide any scene object whose name contains any comma-separated
+    // needle.  Must be set before scene load.  Empty disables.
+    void setHidePattern(const std::string& pat);
+
+private:
+    std::shared_ptr<MainHandler> m_main_handler;
+};
+} // namespace wallpaper

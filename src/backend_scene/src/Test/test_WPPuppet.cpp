@@ -1,0 +1,1628 @@
+#include <doctest.h>
+
+#include "WPPuppet.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <string>
+
+using namespace wallpaper;
+
+namespace
+{
+// Helper: create a simple Animation with known parameters
+WPPuppet::Animation makeAnimation(WPPuppet::PlayMode mode, int length, double fps) {
+    WPPuppet::Animation anim;
+    anim.id     = 0;
+    anim.fps    = fps;
+    anim.length = length;
+    anim.mode   = mode;
+    anim.name   = "test";
+    // prepared() equivalent
+    anim.frame_time = 1.0 / fps;
+    anim.max_time   = (double)length / fps;
+    return anim;
+}
+} // namespace
+
+// ===========================================================================
+// Animation::getInterpolationInfo — Loop mode
+// ===========================================================================
+
+TEST_SUITE("WPPuppet_Loop") {
+    TEST_CASE("Loop mode frame 0 at t=0") {
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Loop, 10, 30.0);
+        double t    = 0.0;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 1);
+        CHECK(info.t == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("Loop mode mid frame interpolation") {
+        auto anim = makeAnimation(WPPuppet::PlayMode::Loop, 10, 10.0);
+        // frame_time = 0.1, so t=0.15 should be midway between frame 1 and 2
+        double t    = 0.15;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 1);
+        CHECK(info.frame_b == 2);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("Loop mode wraps at end") {
+        auto anim = makeAnimation(WPPuppet::PlayMode::Loop, 10, 10.0);
+        // max_time = 1.0, so t=1.05 should wrap to 0.05 = frame 0 with t=0.5
+        double t    = 1.05;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 1);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("Loop mode last frame wraps to first") {
+        auto anim = makeAnimation(WPPuppet::PlayMode::Loop, 10, 10.0);
+        // t = 0.95 should be frame 9, next = frame 0 (wraps)
+        double t    = 0.95;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 9);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("Loop mode negative time (reverse playback) wraps into range") {
+        // An animation layer with a negative rate drives cur_time below zero.
+        // C++ fmod keeps the dividend's sign, so without wrapping it back into
+        // [0, max_time) the `(uint)_rate` cast is undefined behaviour and the
+        // animation samples garbage frames — extrapolating bone pose AND scale
+        // past the keyframes (a puppet leg contorting / mis-scaling).  -0.05
+        // must behave like 0.95 (frame 9, midway), and cur_time must be
+        // rewritten into range.
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Loop, 10, 10.0);
+        double t    = -0.05;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 9);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.5));
+        CHECK(t == doctest::Approx(0.95));
+    }
+
+    TEST_CASE("Loop mode large negative time wraps through multiple periods") {
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Loop, 10, 10.0);
+        double t    = -1.05; // more than one period below zero
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 9);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+} // TEST_SUITE
+
+// ===========================================================================
+// Animation::getInterpolationInfo — Single mode
+// ===========================================================================
+
+TEST_SUITE("WPPuppet_Single") {
+    TEST_CASE("Single mode clamps at end") {
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Single, 10, 10.0);
+        double t    = 2.0; // way past max_time (1.0)
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 9);
+        CHECK(info.frame_b == 9);
+        CHECK(info.t == doctest::Approx(0.0));
+        CHECK(t == doctest::Approx(1.0)); // cur_time clamped to max_time
+    }
+
+    TEST_CASE("Single mode before end plays normally") {
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Single, 10, 10.0);
+        double t    = 0.35;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 3);
+        CHECK(info.frame_b == 4);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("Single mode at exactly max_time") {
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Single, 10, 10.0);
+        double t    = 1.0;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 9);
+        CHECK(info.frame_b == 9);
+        CHECK(info.t == doctest::Approx(0.0));
+    }
+
+} // TEST_SUITE
+
+// ===========================================================================
+// Animation::getInterpolationInfo — Mirror mode
+// ===========================================================================
+
+TEST_SUITE("WPPuppet_Mirror") {
+    TEST_CASE("Mirror mode forward half") {
+        auto anim = makeAnimation(WPPuppet::PlayMode::Mirror, 10, 10.0);
+        // Forward pass: t=0.25 should be frame 2→3 with t=0.5
+        double t    = 0.25;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 2);
+        CHECK(info.frame_b == 3);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("Mirror mode backward half") {
+        auto anim = makeAnimation(WPPuppet::PlayMode::Mirror, 10, 10.0);
+        // Backward pass: t=1.5 means 15 frames into doubled length (20 frames)
+        // frame 15 in doubled: _get_frame(15) = (10-1) - (15-10) = 9-5 = 4
+        // frame 16: _get_frame(16) = (10-1) - (16-10) = 9-6 = 3
+        double t    = 1.55;
+        auto   info = anim.getInterpolationInfo(&t);
+        // 15.5 frames into doubled: frame_a=15, frame_b=16, t=0.5
+        // _get_frame(15) = 4, _get_frame(16) = 3
+        CHECK(info.frame_a == 4);
+        CHECK(info.frame_b == 3);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("Mirror mode at exact mirror point") {
+        // Kills ge_to_gt on line 167: _get_frame(f) uses f >= length
+        auto anim = makeAnimation(WPPuppet::PlayMode::Mirror, 10, 10.0);
+        // At the exact mirror point: frame 10 in doubled length
+        // _get_frame(10) = (10-1) - (10-10) = 9 (last frame)
+        double t    = 1.0; // 10 frames into doubled (20-frame) cycle
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 9);
+    }
+
+    TEST_CASE("Mirror mode at start is same as loop") {
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Mirror, 10, 10.0);
+        double t    = 0.05;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 1);
+        CHECK(info.t == doctest::Approx(0.5));
+    }
+
+} // TEST_SUITE("WPPuppet_Mirror")
+
+namespace
+{
+std::shared_ptr<WPPuppet> makePuppet(int bone_count, int anim_id, double fps, int length,
+                                     WPPuppet::PlayMode mode = WPPuppet::PlayMode::Loop) {
+    auto puppet = std::make_shared<WPPuppet>();
+    for (int i = 0; i < bone_count; i++) {
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.parent    = (i == 0) ? 0xFFFFFFFFu : 0u;
+        puppet->bones.push_back(bone);
+    }
+    WPPuppet::Animation anim;
+    anim.id     = anim_id;
+    anim.fps    = fps;
+    anim.length = length;
+    anim.mode   = mode;
+    anim.name   = "test";
+    for (int b = 0; b < bone_count; b++) {
+        WPPuppet::Animation::BoneFrames bf;
+        for (int f = 0; f < length; f++) {
+            WPPuppet::BoneFrame frame;
+            frame.position = Eigen::Vector3f((float)f, 0.0f, 0.0f);
+            frame.angle    = Eigen::Vector3f::Zero();
+            frame.scale    = Eigen::Vector3f::Ones();
+            bf.frames.push_back(frame);
+        }
+        anim.bframes_array.push_back(bf);
+    }
+    puppet->anims.push_back(anim);
+    return puppet;
+}
+} // namespace
+
+// ===========================================================================
+// WPPuppet::prepared() — frame timing and bone transforms
+// ===========================================================================
+
+TEST_SUITE("WPPuppet_Prepared") {
+    TEST_CASE("frame_time and max_time computed correctly") {
+        auto puppet = makePuppet(1, 1, 10.0, 5);
+        puppet->prepared();
+        CHECK(puppet->anims[0].frame_time == doctest::Approx(0.1));
+        CHECK(puppet->anims[0].max_time == doctest::Approx(0.5));
+    }
+
+    TEST_CASE("frame_time with fps=30 and length=60") {
+        auto puppet = makePuppet(1, 1, 30.0, 60);
+        puppet->prepared();
+        CHECK(puppet->anims[0].frame_time == doctest::Approx(1.0 / 30.0));
+        CHECK(puppet->anims[0].max_time == doctest::Approx(2.0));
+    }
+
+    TEST_CASE("offset_trans is inverse of combined transform") {
+        auto puppet = makePuppet(2, 1, 10.0, 2);
+        puppet->bones[0].transform.pretranslate(Eigen::Vector3f(1.0f, 0.0f, 0.0f));
+        puppet->prepared();
+        auto product = puppet->bones[0].transform * puppet->bones[0].offset_trans;
+        CHECK(product.matrix().isApprox(Eigen::Affine3f::Identity().matrix(), 1e-5f));
+    }
+
+    TEST_CASE("child bone offset_trans includes parent chain") {
+        auto puppet = makePuppet(2, 1, 10.0, 2);
+        puppet->bones[0].transform.pretranslate(Eigen::Vector3f(2.0f, 0.0f, 0.0f));
+        puppet->bones[1].transform.pretranslate(Eigen::Vector3f(0.0f, 3.0f, 0.0f));
+        puppet->prepared();
+        auto combined = puppet->bones[0].transform * puppet->bones[1].transform;
+        auto product  = combined * puppet->bones[1].offset_trans;
+        CHECK(product.matrix().isApprox(Eigen::Affine3f::Identity().matrix(), 1e-5f));
+    }
+
+    TEST_CASE("quaternions computed from euler angles") {
+        auto puppet = makePuppet(1, 1, 10.0, 2);
+        puppet->anims[0].bframes_array[0].frames[1].angle =
+            Eigen::Vector3f(0, 0, (float)M_PI / 2.0f);
+        puppet->prepared();
+        auto q0 = puppet->anims[0].bframes_array[0].frames[0].quaternion;
+        CHECK(q0.w() == doctest::Approx(1.0).epsilon(1e-6));
+        auto q1 = puppet->anims[0].bframes_array[0].frames[1].quaternion;
+        CHECK(std::abs(q1.z()) > 0.3);
+    }
+
+    TEST_CASE("noParent check") {
+        WPPuppet::Bone bone;
+        bone.parent = 0xFFFFFFFFu;
+        CHECK(bone.noParent() == true);
+        bone.parent = 0;
+        CHECK(bone.noParent() == false);
+    }
+
+    TEST_CASE("world_transform on root bone equals its own transform") {
+        auto puppet = makePuppet(2, 1, 10.0, 2);
+        puppet->bones[0].transform.pretranslate(Eigen::Vector3f(7.0f, 0.0f, 0.0f));
+        puppet->prepared();
+        // Root bone has no parent → world_transform == transform
+        CHECK(puppet->bones[0].world_transform.matrix().isApprox(
+            puppet->bones[0].transform.matrix(), 1e-5f));
+    }
+
+    TEST_CASE("world_transform on child bone accumulates the parent chain") {
+        auto puppet = makePuppet(2, 1, 10.0, 2);
+        puppet->bones[0].transform.pretranslate(Eigen::Vector3f(2.0f, 0.0f, 0.0f));
+        puppet->bones[1].transform.pretranslate(Eigen::Vector3f(0.0f, 3.0f, 0.0f));
+        puppet->prepared();
+        // bones[1].world_transform should equal bones[0].transform * bones[1].transform.
+        // For pure translations that's a (2, 3, 0) translation.
+        auto t = puppet->bones[1].world_transform.translation();
+        CHECK(t.x() == doctest::Approx(2.0f));
+        CHECK(t.y() == doctest::Approx(3.0f));
+        CHECK(t.z() == doctest::Approx(0.0f));
+    }
+
+    TEST_CASE("world_transform and offset_trans are inverses") {
+        // The two prepared() outputs should form an identity round-trip.
+        // This pins down the contract our scene-loading code relies on
+        // when it picks one or the other.
+        auto puppet = makePuppet(3, 1, 10.0, 2);
+        puppet->bones[0].transform.pretranslate(Eigen::Vector3f(1.5f, 0.0f, 0.0f));
+        puppet->bones[1].transform.pretranslate(Eigen::Vector3f(0.0f, 2.5f, 0.0f));
+        // bone[2] parent default is bone 1 from makePuppet's chain — the
+        // helper builds parent = i-1.
+        puppet->bones[2].transform.pretranslate(Eigen::Vector3f(0.5f, -1.0f, 0.0f));
+        puppet->prepared();
+        for (uint i = 0; i < puppet->bones.size(); i++) {
+            auto product = puppet->bones[i].world_transform * puppet->bones[i].offset_trans;
+            CHECK_MESSAGE(
+                product.matrix().isApprox(Eigen::Affine3f::Identity().matrix(), 1e-5f),
+                "world_transform × offset_trans should be identity for bone " << i);
+        }
+    }
+
+    TEST_CASE("an fps of zero still yields finite frame timings") {
+        // fps divides into both derived times, so 0 turns them into inf and
+        // poisons every playback time computed from them.
+        auto puppet = makePuppet(1, 1, 0.0, 5);
+        puppet->prepared();
+        CHECK(std::isfinite(puppet->anims[0].frame_time));
+        CHECK(std::isfinite(puppet->anims[0].max_time));
+    }
+
+    TEST_CASE("a negative or NaN fps still yields finite frame timings") {
+        for (double fps : { -30.0, std::numeric_limits<double>::quiet_NaN() }) {
+            auto puppet = makePuppet(1, 1, fps, 5);
+            puppet->prepared();
+            CHECK(std::isfinite(puppet->anims[0].frame_time));
+            CHECK(std::isfinite(puppet->anims[0].max_time));
+        }
+    }
+
+    TEST_CASE("an animation with unusable fps holds frame 0 in every play mode") {
+        for (auto mode :
+             { WPPuppet::PlayMode::Loop, WPPuppet::PlayMode::Mirror, WPPuppet::PlayMode::Single }) {
+            for (double fps : { 0.0, -30.0, std::numeric_limits<double>::quiet_NaN() }) {
+                auto puppet = makePuppet(1, 1, fps, 5, mode);
+                puppet->prepared();
+                double t    = 0.3;
+                auto   info = puppet->anims[0].getInterpolationInfo(&t);
+                CHECK(info.frame_a == 0);
+                CHECK(info.frame_b == 0);
+                CHECK(info.t == doctest::Approx(0.0));
+            }
+        }
+    }
+
+    TEST_CASE("an unrecognised play mode still yields a defined frame") {
+        // getInterpolationInfo dispatches on three known modes; anything else
+        // must not fall through and hand back whatever was on the stack.
+        auto puppet = makePuppet(1, 1, 10.0, 5);
+        puppet->prepared();
+        // Run a real mode first so the call reuses a stack frame already
+        // holding a non-zero result.
+        double warm = 0.3;
+        auto   seen = puppet->anims[0].getInterpolationInfo(&warm);
+        REQUIRE(seen.frame_a != 0);
+
+        puppet->anims[0].mode = static_cast<WPPuppet::PlayMode>(99);
+        double t              = 0.3;
+        auto   info           = puppet->anims[0].getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.0));
+    }
+
+    // A puppet whose art is packed into an atlas stores two poses per bone:
+    // `transform` is where the piece sits in the atlas (bind), `rest_transform`
+    // where the assembled character wants it.  prepared() must invert the
+    // bind chain for skinning and compose the rest chain for everything that
+    // asks where a bone *is* (attachments, diagnostics).
+    TEST_CASE("rest pose separate from bind: world follows rest, offset inverts bind") {
+        auto puppet = makePuppet(2, 1, 10.0, 2);
+        puppet->bones[0].transform.pretranslate(Eigen::Vector3f(100.0f, 0.0f, 0.0f));
+        puppet->bones[1].transform.pretranslate(Eigen::Vector3f(0.0f, 50.0f, 0.0f));
+        Eigen::Affine3f rest0 = Eigen::Affine3f::Identity();
+        rest0.pretranslate(Eigen::Vector3f(-7.0f, 3.0f, 0.0f));
+        Eigen::Affine3f rest1 = Eigen::Affine3f::Identity();
+        rest1.pretranslate(Eigen::Vector3f(2.0f, -4.0f, 0.0f));
+        puppet->bones[0].rest_transform = rest0;
+        puppet->bones[1].rest_transform = rest1;
+        puppet->prepared();
+
+        auto w1 = puppet->bones[1].world_transform.translation();
+        CHECK(w1.x() == doctest::Approx(-5.0f));
+        CHECK(w1.y() == doctest::Approx(-1.0f));
+
+        auto bind1   = puppet->bones[0].transform * puppet->bones[1].transform;
+        auto product = bind1 * puppet->bones[1].offset_trans;
+        CHECK(product.matrix().isApprox(Eigen::Affine3f::Identity().matrix(), 1e-5f));
+        CHECK(puppet->bones[1].offset_trans.translation().x() == doctest::Approx(-100.0f));
+        CHECK(puppet->bones[1].offset_trans.translation().y() == doctest::Approx(-50.0f));
+    }
+
+    TEST_CASE("without a stored rest pose the bind pose doubles as rest") {
+        auto puppet = makePuppet(2, 1, 10.0, 2);
+        puppet->bones[0].transform.pretranslate(Eigen::Vector3f(2.0f, 0.0f, 0.0f));
+        puppet->bones[1].transform.pretranslate(Eigen::Vector3f(0.0f, 3.0f, 0.0f));
+        CHECK_FALSE(puppet->bones[1].rest_transform.has_value());
+        CHECK(puppet->bones[1].restLocal().matrix().isApprox(puppet->bones[1].transform.matrix()));
+        puppet->prepared();
+        auto t = puppet->bones[1].world_transform.translation();
+        CHECK(t.x() == doctest::Approx(2.0f));
+        CHECK(t.y() == doctest::Approx(3.0f));
+    }
+
+} // TEST_SUITE("WPPuppet_Prepared")
+
+// ===========================================================================
+// WPPuppet::Attachment — fields and lookup
+// ===========================================================================
+
+TEST_SUITE("WPPuppet_Attachment") {
+    TEST_CASE("Attachment defaults") {
+        WPPuppet::Attachment att;
+        CHECK(att.name.empty());
+        CHECK(att.bone_index == 0u);
+        CHECK(att.transform.matrix().isApprox(Eigen::Affine3f::Identity().matrix(), 1e-5f));
+    }
+
+    TEST_CASE("findAttachment by name returns matching record") {
+        WPPuppet puppet;
+        puppet.attachments.push_back({});
+        puppet.attachments.back().name       = "Attachment";
+        puppet.attachments.back().bone_index = 0;
+        puppet.attachments.push_back({});
+        puppet.attachments.back().name       = "head";
+        puppet.attachments.back().bone_index = 2;
+
+        const auto* a = puppet.findAttachment("head");
+        REQUIRE(a != nullptr);
+        CHECK(a->bone_index == 2u);
+
+        const auto* missing = puppet.findAttachment("not-real");
+        CHECK(missing == nullptr);
+    }
+}
+
+// ===========================================================================
+// WPPuppetLayer::prepared() — blend calculation
+// ===========================================================================
+
+TEST_SUITE("WPPuppetLayer_Prepared") {
+    TEST_CASE("single visible layer matched by ID") {
+        auto puppet = makePuppet(1, 100, 10.0, 2);
+        puppet->prepared();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0].id      = 100;
+        alayers[0].blend   = 1.0;
+        alayers[0].visible = true;
+        alayers[0].rate    = 1.0;
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames.size() == 1);
+    }
+
+    TEST_CASE("invisible layer not matched") {
+        auto puppet = makePuppet(1, 100, 10.0, 2);
+        puppet->prepared();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0].id      = 100;
+        alayers[0].blend   = 1.0;
+        alayers[0].visible = false;
+        alayers[0].rate    = 1.0;
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames.size() == 1);
+    }
+
+    TEST_CASE("mismatched animation ID not matched") {
+        auto puppet = makePuppet(1, 100, 10.0, 2);
+        puppet->prepared();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0].id      = 999;
+        alayers[0].blend   = 1.0;
+        alayers[0].visible = true;
+        alayers[0].rate    = 1.0;
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames.size() == 1);
+    }
+
+    TEST_CASE("two visible layers both matched produce a frame") {
+        auto puppet = makePuppet(1, 100, 10.0, 2);
+        auto anim2  = puppet->anims[0];
+        anim2.id    = 200;
+        puppet->anims.push_back(anim2);
+        puppet->prepared();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(2);
+        alayers[0] = { 100, 1.0, 0.8, true, 0.0 };
+        alayers[1] = { 200, 1.0, 0.8, true, 0.0 };
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames.size() == 1);
+    }
+
+    TEST_CASE("single partial-weight layer produces a frame") {
+        auto puppet = makePuppet(1, 100, 10.0, 2);
+        puppet->prepared();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 100, 1.0, 0.5, true, 0.0 };
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames.size() == 1);
+    }
+
+} // TEST_SUITE("WPPuppetLayer_Prepared")
+
+// ===========================================================================
+// WPPuppet::genFrame() — output verification
+// ===========================================================================
+
+TEST_SUITE("WPPuppet_GenFrame") {
+    namespace
+    {
+    // Helper: puppet with 1 bone at offset (5,0,0) — non-identity bone transform.
+    // The offset makes the first loop's iteration observable: without it, the
+    // bone matrix is identity and offset_trans * identity = offset_trans regardless.
+    std::shared_ptr<WPPuppet> makePuppetWithOffset() {
+        auto           puppet = std::make_shared<WPPuppet>();
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.transform.pretranslate(Eigen::Vector3f(5, 0, 0));
+        bone.parent = 0xFFFFFFFFu;
+        puppet->bones.push_back(bone);
+
+        WPPuppet::Animation anim;
+        anim.id     = 1;
+        anim.fps    = 10.0;
+        anim.length = 2;
+        anim.mode   = WPPuppet::PlayMode::Loop;
+        anim.name   = "offset";
+        WPPuppet::Animation::BoneFrames bf;
+        for (int f = 0; f < 2; f++) {
+            WPPuppet::BoneFrame frame;
+            frame.position = Eigen::Vector3f(f * 10.0f, 0, 0);
+            frame.angle    = Eigen::Vector3f::Zero();
+            frame.scale    = Eigen::Vector3f::Ones();
+            bf.frames.push_back(frame);
+        }
+        anim.bframes_array.push_back(bf);
+        puppet->anims.push_back(anim);
+        puppet->prepared();
+        return puppet;
+    }
+
+    // Helper: build puppet with 1 bone, 3 frames at pos (0,0,0), (10,0,0), (20,0,0)
+    std::shared_ptr<WPPuppet> makeSimplePuppet3Frame() {
+        auto           puppet = std::make_shared<WPPuppet>();
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.parent    = 0xFFFFFFFFu;
+        puppet->bones.push_back(bone);
+
+        WPPuppet::Animation anim;
+        anim.id     = 1;
+        anim.fps    = 10.0;
+        anim.length = 3;
+        anim.mode   = WPPuppet::PlayMode::Loop;
+        anim.name   = "test";
+        WPPuppet::Animation::BoneFrames bf;
+        for (int f = 0; f < 3; f++) {
+            WPPuppet::BoneFrame frame;
+            frame.position = Eigen::Vector3f(f * 10.0f, 0, 0);
+            frame.angle    = Eigen::Vector3f::Zero();
+            frame.scale    = Eigen::Vector3f::Ones();
+            bf.frames.push_back(frame);
+        }
+        anim.bframes_array.push_back(bf);
+        puppet->anims.push_back(anim);
+        puppet->prepared();
+        return puppet;
+    }
+    // Helper: puppet with 1 bone, 2 frames. Frame 0 has 30° Z rotation (NON-identity base
+    // quaternion, critical for killing slerp blend mutants). Frame 1 has 90° Z rotation.
+    std::shared_ptr<WPPuppet> makeRotatedPuppet() {
+        auto           puppet = std::make_shared<WPPuppet>();
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.parent    = 0xFFFFFFFFu;
+        puppet->bones.push_back(bone);
+
+        WPPuppet::Animation anim;
+        anim.id     = 1;
+        anim.fps    = 10.0;
+        anim.length = 2;
+        anim.mode   = WPPuppet::PlayMode::Loop;
+        anim.name   = "rotate";
+        WPPuppet::Animation::BoneFrames bf;
+        {
+            WPPuppet::BoneFrame f0;
+            f0.position = Eigen::Vector3f::Zero();
+            f0.angle    = Eigen::Vector3f(0, 0, 30.0f); // 30° Z — non-identity base!
+            f0.scale    = Eigen::Vector3f::Ones();
+            bf.frames.push_back(f0);
+        }
+        {
+            WPPuppet::BoneFrame f1;
+            f1.position = Eigen::Vector3f::Zero();
+            f1.angle    = Eigen::Vector3f(0, 0, 90.0f); // 90° Z
+            f1.scale    = Eigen::Vector3f::Ones();
+            bf.frames.push_back(f1);
+        }
+        anim.bframes_array.push_back(bf);
+        puppet->anims.push_back(anim);
+        puppet->prepared();
+        return puppet;
+    }
+
+    } // namespace
+
+    TEST_CASE("genFrame exact position at t=0") {
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames[0].translation().x() == doctest::Approx(0.0f));
+    }
+
+    TEST_CASE("genFrame exact position after 0.05s (half frame)") {
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        layer.genFrame(0.0);
+        auto frames = layer.genFrame(0.05);
+        CHECK(frames[0].translation().x() == doctest::Approx(5.0f));
+    }
+
+    TEST_CASE("genFrame at frame 1-2 transition verifies one_t calculation") {
+        // At the frame 1→2 midpoint the interpolated absolute position is
+        //   frame[1]*one_t + frame[2]*t = 10*0.5 + 20*0.5 = 15.
+        // A one_t = (1 - t) → (1 + t) mutant would give 10*1.5 + 20*0.5 = 25.
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // Advance to t=0.15 cumulative (frame_a=1, frame_b=2, info.t=0.5)
+        layer.genFrame(0.0);
+        layer.genFrame(0.1);                // now at t=0.1 → frame 1
+        auto frames = layer.genFrame(0.05); // now at t=0.15 → midpoint of frame 1→2
+        CHECK(frames[0].translation().x() == doctest::Approx(15.0f));
+    }
+
+    TEST_CASE("genFrame with blend=0.5 reduces position") {
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 0.5, true, 0.0 };
+        layer.prepared(alayers);
+        layer.genFrame(0.0);
+        auto frames = layer.genFrame(0.05);
+        // With blend=0.5, position should be halved compared to blend=1.0
+        CHECK(frames[0].translation().x() == doctest::Approx(2.5f));
+    }
+
+    TEST_CASE("two full-weight non-additive layers: top layer wins") {
+        auto           puppet = std::make_shared<WPPuppet>();
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.parent    = 0xFFFFFFFFu;
+        puppet->bones.push_back(bone);
+
+        // Anim 1 (bottom): static at the bind pose.
+        WPPuppet::Animation anim1;
+        anim1.id     = 1;
+        anim1.fps    = 10.0;
+        anim1.length = 2;
+        anim1.mode   = WPPuppet::PlayMode::Loop;
+        anim1.name   = "a1";
+        WPPuppet::Animation::BoneFrames bf1;
+        for (int f = 0; f < 2; f++) {
+            WPPuppet::BoneFrame frame;
+            frame.position = Eigen::Vector3f::Zero();
+            frame.angle    = Eigen::Vector3f::Zero();
+            frame.scale    = Eigen::Vector3f::Ones();
+            bf1.frames.push_back(frame);
+        }
+        anim1.bframes_array.push_back(bf1);
+
+        // Anim 2 (top): static but displaced to y=5 (a "swung out" pose).
+        auto anim2 = anim1;
+        anim2.id   = 2;
+        anim2.name = "a2";
+        for (auto& f : anim2.bframes_array[0].frames) f.position.y() = 5.0f;
+
+        puppet->anims = { anim1, anim2 };
+        puppet->prepared();
+
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(2);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 }; // bottom, non-additive
+        alayers[1] = { 2, 1.0, 1.0, true, 0.0 }; // top, non-additive
+        layer.prepared(alayers);
+
+        // Two non-additive layers at weight 1.0: the top layer (anim2) blends
+        // fully over the bottom, so the bone takes anim2's pose (y=5).  It does
+        // NOT average to 2.5 (the old normalization, which detached the hair on
+        // Weathering With You) nor stay at the bind/bottom pose (y=0).
+        auto rest = layer.genFrame(0.0);
+        CHECK(rest[0].translation().y() == doctest::Approx(5.0f));
+    }
+
+    TEST_CASE("genFrame with rotation verifies quaternion slerp blend") {
+        // A single non-additive layer at weight 1.0 takes the animation's
+        // interpolated rotation directly (blend-over from the identity bind
+        // rotation).
+        auto           puppet = std::make_shared<WPPuppet>();
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.parent    = 0xFFFFFFFFu;
+        puppet->bones.push_back(bone);
+
+        WPPuppet::Animation anim;
+        anim.id     = 1;
+        anim.fps    = 10.0;
+        anim.length = 2;
+        anim.mode   = WPPuppet::PlayMode::Loop;
+        anim.name   = "rot";
+        WPPuppet::BoneFrame f0, f1;
+        f0.position = Eigen::Vector3f::Zero();
+        f0.angle    = Eigen::Vector3f::Zero();
+        f0.scale    = Eigen::Vector3f::Ones();
+        f1.position = Eigen::Vector3f::Zero();
+        f1.angle    = Eigen::Vector3f(0, 0, (float)M_PI / 2.0f);
+        f1.scale    = Eigen::Vector3f::Ones();
+        WPPuppet::Animation::BoneFrames bf;
+        bf.frames = { f0, f1 };
+        anim.bframes_array.push_back(bf);
+        puppet->anims.push_back(anim);
+        puppet->prepared();
+
+        // With blend=1.0, frame 0 has no rotation, frame 1 has 90deg Z
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+
+        // At t=0 (frame 0): should be near identity rotation
+        auto            frames0 = layer.genFrame(0.0);
+        Eigen::Matrix3f rot0    = frames0[0].linear();
+        CHECK(rot0(0, 0) == doctest::Approx(1.0f).epsilon(0.1f));
+
+        // At t=0.05 (midpoint): rotation should be ~45 degrees
+        auto            frames1 = layer.genFrame(0.05);
+        Eigen::Matrix3f rot1    = frames1[0].linear();
+        // cos(45deg) ≈ 0.707
+        CHECK(rot1(0, 0) == doctest::Approx(std::cos(M_PI / 4.0)).epsilon(0.15f));
+    }
+
+    TEST_CASE("genFrame position increases monotonically") {
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+
+        float prev_x = -1.0f;
+        for (int i = 0; i < 10; i++) {
+            auto  frames = layer.genFrame(0.01);
+            float x      = frames[0].translation().x();
+            CHECK(x >= prev_x);
+            prev_x = x;
+        }
+    }
+
+    TEST_CASE("genFrame with partial blend reduces effect") {
+        // With blend=0.5, position contribution should be half of blend=1.0
+        // This kills mutants: 1.0 - blend → 1.0 + blend
+        auto puppet = makeSimplePuppet3Frame();
+
+        // Full blend (1.0)
+        WPPuppetLayer                              layer1(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> al1(1);
+        al1[0] = { 1, 1.0, 1.0, true, 0.0 }; // rate=1, blend=1
+        layer1.prepared(al1);
+        auto frames1 = layer1.genFrame(0.0);
+        layer1.genFrame(0.1); // advance time
+        float full_x = layer1.genFrame(0.0).data()->translation().x();
+
+        // Partial blend (0.5)
+        WPPuppetLayer                              layer2(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> al2(1);
+        al2[0] = { 1, 1.0, 0.5, true, 0.0 }; // rate=1, blend=0.5
+        layer2.prepared(al2);
+        layer2.genFrame(0.0);
+        layer2.genFrame(0.1);
+        float half_x = layer2.genFrame(0.0).data()->translation().x();
+
+        // Partial blend should produce smaller position offset
+        CHECK(std::abs(half_x) < std::abs(full_x) + 0.01f);
+    }
+
+    TEST_CASE("genFrame with zero blend produces minimal change") {
+        // A weight-0 layer contributes nothing, so the bone stays at the bind
+        // pose regardless of how far the animation has advanced.
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 0.0, true, 0.0 }; // blend=0 → animation has no effect
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        layer.genFrame(0.1);
+        auto frames2 = layer.genFrame(0.0);
+        // With blend=0, position should not change from frame advance
+        float x0 = frames.data()->translation().x();
+        float x1 = frames2.data()->translation().x();
+        CHECK(x0 == doctest::Approx(x1).epsilon(0.01f));
+    }
+
+    TEST_CASE("genFrame hidden layer has no effect") {
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, false, 0.0 }; // visible=false
+        layer.prepared(alayers);
+        auto  frames = layer.genFrame(0.0);
+        float x0     = frames.data()->translation().x();
+        layer.genFrame(0.1);
+        float x1 = layer.genFrame(0.0).data()->translation().x();
+        CHECK(x0 == doctest::Approx(x1).epsilon(0.01f));
+    }
+
+    TEST_CASE("genFrame rotation with non-identity base quaternion and partial blend") {
+        // A partial-weight non-additive layer blends the bone's rotation only
+        // part-way from bind toward the animation pose, so a half-weight layer
+        // produces a smaller rotation than a full-weight one.
+        auto puppet = makeRotatedPuppet();
+
+        // Full blend (1.0): advance to midpoint between frame 0 (30°) and frame 1 (90°)
+        WPPuppetLayer                              full_layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> al_full(1);
+        al_full[0] = { 1, 1.0, 1.0, true, 0.0 };
+        full_layer.prepared(al_full);
+        full_layer.genFrame(0.05); // advance to t=0.5 between frames
+        auto            full_result = full_layer.genFrame(0.0);
+        Eigen::Matrix3f full_rot    = full_result[0].rotation();
+        float           full_angle  = std::atan2(full_rot(1, 0), full_rot(0, 0));
+
+        // Half blend (0.5): same time advancement, but reduced blend
+        WPPuppetLayer                              half_layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> al_half(1);
+        al_half[0] = { 1, 1.0, 0.5, true, 0.0 };
+        half_layer.prepared(al_half);
+        half_layer.genFrame(0.05);
+        auto            half_result = half_layer.genFrame(0.0);
+        Eigen::Matrix3f half_rot    = half_result[0].rotation();
+        float           half_angle  = std::atan2(half_rot(1, 0), half_rot(0, 0));
+
+        // Half blend should produce a different (smaller) rotation than full blend
+        // since slerp(0.5, ident) attenuates vs slerp(1.0, ident) = no change
+        CHECK(std::abs(half_angle) != doctest::Approx(std::abs(full_angle)).epsilon(0.01f));
+        CHECK(std::abs(full_angle) > 0.1f); // should have meaningful rotation
+    }
+
+    TEST_CASE("genFrame with non-identity bone — animation changes result") {
+        // With animated position, the final bone matrix should differ at different times.
+        // If the first loop is skipped (i++ → i-- mutant), the animation isn't applied
+        // and the result doesn't change between frames.
+        auto                                       puppet = makePuppetWithOffset();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        auto  f0 = layer.genFrame(0.0);
+        float x0 = f0[0](0, 3); // matrix element (0,3) = tx
+        auto  f1 = layer.genFrame(0.05);
+        float x1 = f1[0](0, 3);
+        // After advancing, the bone matrix should have changed
+        CHECK(x0 != doctest::Approx(x1).epsilon(0.001f));
+    }
+
+    TEST_CASE("genFrame single full-weight layer interpolates position") {
+        // A single non-additive layer at weight 1.0 takes the animation's
+        // interpolated absolute position; at the half-frame it is midway
+        // between frame 0 (x=0) and frame 1 (x=10), i.e. x=5.
+        auto                                       puppet = makeSimplePuppet3Frame();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 1, 1.0, 1.0, true, 0.0 }; // total_blend = 1.0 exactly
+        layer.prepared(alayers);
+
+        auto frames = layer.genFrame(0.0);
+        layer.genFrame(0.05);
+        auto  frames2 = layer.genFrame(0.0);
+        float x       = frames2[0].translation().x();
+        CHECK(x == doctest::Approx(5.0f)); // halfway between 0 and 10
+    }
+
+    namespace
+    {
+    // Two-animation puppet (bind = identity, single bone) where each animation
+    // is static at its own frame-0 position so the base/delta split is easy to
+    // reason about.  anim `id` holds the bone at (baseX,0,0) on frame 0 and
+    // (tipX,0,0) on frame 1.
+    std::shared_ptr<WPPuppet> makeTwoAnimPuppet(int idA, float baseAX, float tipAX, int idB,
+                                                float baseBX, float tipBX) {
+        auto           puppet = std::make_shared<WPPuppet>();
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.parent    = 0xFFFFFFFFu;
+        puppet->bones.push_back(bone);
+
+        const std::array<std::array<float, 3>, 2> defs { { { (float)idA, baseAX, tipAX },
+                                                           { (float)idB, baseBX, tipBX } } };
+        for (const auto& d : defs) {
+            WPPuppet::Animation anim;
+            anim.id     = (int)d[0];
+            anim.fps    = 10.0;
+            anim.length = 2;
+            anim.mode   = WPPuppet::PlayMode::Loop;
+            anim.name   = "test";
+            WPPuppet::Animation::BoneFrames bf;
+            for (int f = 0; f < 2; f++) {
+                WPPuppet::BoneFrame fr;
+                fr.position = Eigen::Vector3f(f == 0 ? d[1] : d[2], 0, 0);
+                fr.angle    = Eigen::Vector3f::Zero();
+                fr.scale    = Eigen::Vector3f::Ones();
+                bf.frames.push_back(fr);
+            }
+            anim.bframes_array.push_back(bf);
+            puppet->anims.push_back(anim);
+        }
+        puppet->prepared();
+        return puppet;
+    }
+    } // namespace
+
+    // Regression for the Weathering With You (2558523891) detached-hair bug.
+    // Two non-additive layers at weight 1.0: anim 100 sits at bind, anim 200's
+    // frame-0 is displaced +100 in X (its "swung-out hair" base).  As the top
+    // layer it wins, so the bone takes x≈100 — NOT the 50 average that stranded
+    // the hair half-way off the head, and NOT the bind/bottom pose (x≈0).
+    TEST_CASE("displaced-base top non-additive layer wins (hair fix)") {
+        auto          puppet = makeTwoAnimPuppet(100, 0, 0, 200, 100, 100);
+        WPPuppetLayer layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(2);
+        alayers[0] = { 100, 1.0, 1.0, true, 0.0 }; // bottom
+        alayers[1] = { 200, 1.0, 1.0, true, 0.0 }; // top, displaced base
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames[0].translation().x() == doctest::Approx(100.0f));
+    }
+
+    // An additive layer adds its frame-relative delta on top of the running
+    // (non-additive) pose, instead of blending over it.  Bottom non-additive
+    // layer holds the bone at x=50; the additive top layer animates 0→30, so
+    // at frame 0 the bone is at the base (50) and at frame 1 it is base+delta
+    // (50+30=80).  This is the #412 "all layers play" case done correctly.
+    TEST_CASE("additive layer adds its delta onto the non-additive base") {
+        auto          puppet = makeTwoAnimPuppet(100, 50, 50, 200, 0, 30);
+        WPPuppetLayer layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(2);
+        alayers[0]          = { 100, 1.0, 1.0, true, 0.0 }; // bottom, non-additive base
+        alayers[1]          = { 200, 1.0, 1.0, true, 0.0 }; // top, additive
+        alayers[1].additive = true;
+        layer.prepared(alayers);
+        auto rest = layer.genFrame(0.0);
+        CHECK(rest[0].translation().x() == doctest::Approx(50.0f));
+        auto frames = layer.genFrame(0.1); // advance to frame 1 (cur_time=0.1)
+        CHECK(frames[0].translation().x() == doctest::Approx(80.0f));
+    }
+
+    // ------------------------------------------------------------------
+    // Atlas-packed puppets: bind pose (where the mesh piece is stored) and
+    // rest pose (where it belongs on the character) differ per bone.  The
+    // uploaded skin matrix must carry a vertex from its bind position to
+    // its rest position, and animation frames — authored in rest space —
+    // play on top of that.
+    // ------------------------------------------------------------------
+    namespace
+    {
+    constexpr float kAtlasX = 1000.0f; // where the piece is parked in the atlas
+    constexpr float kRestX  = 20.0f;   // where the character wants it
+    constexpr float kRestY  = -30.0f;
+
+    // One root bone whose bind pose is far off in the atlas and whose rest
+    // pose is near the origin.  Every frame of the single animation sits at
+    // the rest pose, except frame 1 which is shifted by +10 in x.
+    std::shared_ptr<WPPuppet> makeAtlasPuppet() {
+        auto           puppet = std::make_shared<WPPuppet>();
+        WPPuppet::Bone bone;
+        bone.transform = Eigen::Affine3f::Identity();
+        bone.transform.pretranslate(Eigen::Vector3f(kAtlasX, 0.0f, 0.0f));
+        Eigen::Affine3f rest = Eigen::Affine3f::Identity();
+        rest.pretranslate(Eigen::Vector3f(kRestX, kRestY, 0.0f));
+        bone.rest_transform = rest;
+        bone.parent         = 0xFFFFFFFFu;
+        puppet->bones.push_back(bone);
+
+        WPPuppet::Animation anim;
+        anim.id     = 7;
+        anim.fps    = 10.0;
+        anim.length = 2;
+        anim.mode   = WPPuppet::PlayMode::Loop;
+        anim.name   = "sway";
+        WPPuppet::Animation::BoneFrames bf;
+        for (int f = 0; f < 2; f++) {
+            WPPuppet::BoneFrame frame;
+            frame.position = Eigen::Vector3f(kRestX + (f == 1 ? 10.0f : 0.0f), kRestY, 0.0f);
+            frame.angle    = Eigen::Vector3f::Zero();
+            frame.scale    = Eigen::Vector3f::Ones();
+            bf.frames.push_back(frame);
+        }
+        anim.bframes_array.push_back(bf);
+        puppet->anims.push_back(anim);
+        puppet->prepared();
+        return puppet;
+    }
+
+    // A vertex stored at the bone's bind origin, pushed through the skin matrix.
+    Eigen::Vector3f skinAtlasOrigin(std::span<const Eigen::Affine3f> frames) {
+        return frames[0] * Eigen::Vector3f(kAtlasX, 0.0f, 0.0f);
+    }
+    } // namespace
+
+    TEST_CASE("a bone parked elsewhere in the atlas skins its vertices onto the rest pose") {
+        auto                                       puppet = makeAtlasPuppet();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> none;
+        layer.prepared(none);
+        auto p = skinAtlasOrigin(layer.genFrame(0.0));
+        CHECK(p.x() == doctest::Approx(kRestX));
+        CHECK(p.y() == doctest::Approx(kRestY));
+    }
+
+    TEST_CASE("an additive layer at frame 0 leaves the bone at the rest pose") {
+        auto                                       puppet = makeAtlasPuppet();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0]          = { 7, 1.0, 1.0, true, 0.0 };
+        alayers[0].additive = true;
+        layer.prepared(alayers);
+        auto p = skinAtlasOrigin(layer.genFrame(0.0));
+        CHECK(p.x() == doctest::Approx(kRestX));
+        CHECK(p.y() == doctest::Approx(kRestY));
+    }
+
+    TEST_CASE("animation frames play on top of the rest pose, not the bind pose") {
+        auto                                       puppet = makeAtlasPuppet();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 7, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        auto p0 = skinAtlasOrigin(layer.genFrame(0.0));
+        CHECK(p0.x() == doctest::Approx(kRestX));
+        auto p1 = skinAtlasOrigin(layer.genFrame(0.1)); // frame 1: rest + 10 in x
+        CHECK(p1.x() == doctest::Approx(kRestX + 10.0f));
+        CHECK(p1.y() == doctest::Approx(kRestY));
+    }
+
+} // TEST_SUITE("WPPuppet_GenFrame")
+
+// ===========================================================================
+// Keyframe event dispatch (Phase 1+2 of the animationEvent pipeline)
+// ===========================================================================
+
+namespace
+{
+// Make a puppet carrying a single 1-bone animation plus a list of keyframe
+// events.  Enough to drive WPPuppetLayer::updateInterpolation and drain
+// fired events.
+std::shared_ptr<WPPuppet> makePuppetWithEvents(int length, double fps, WPPuppet::PlayMode mode,
+                                               std::vector<WPPuppet::Animation::Event> events,
+                                               int anim_id = 42) {
+    auto puppet             = makePuppet(1, anim_id, fps, length, mode);
+    puppet->anims[0].events = std::move(events);
+    puppet->prepared();
+    return puppet;
+}
+
+std::vector<std::string> drainNames(WPPuppetLayer& layer) {
+    auto                     events = layer.drainEvents();
+    std::vector<std::string> names;
+    for (auto& e : events) names.push_back(e.name);
+    return names;
+}
+} // namespace
+
+TEST_SUITE("WPPuppetLayer_Events") {
+    TEST_CASE("no events when animation has none") {
+        auto          puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, {});
+        WPPuppetLayer layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        layer.genFrame(0.5);
+        CHECK(drainNames(layer).empty());
+    }
+
+    TEST_CASE("loop mode fires event each cycle") {
+        // length=10 @ 10fps → 1s period; event at frame 5 (0.5s)
+        auto puppet =
+            makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "flashStart" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+
+        // tick forward past frame 5 → event fires once
+        layer.genFrame(0.6);
+        CHECK(drainNames(layer) == std::vector<std::string> { "flashStart" });
+
+        // tick to t=1.5s (one full cycle + past event) → event fires once more
+        layer.genFrame(0.9);
+        CHECK(drainNames(layer) == std::vector<std::string> { "flashStart" });
+    }
+
+    TEST_CASE("loop mode fires events in chronological order within one tick") {
+        auto puppet = makePuppetWithEvents(
+            10, 10.0, WPPuppet::PlayMode::Loop, { { 3, "flashStart" }, { 7, "flashStop" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+
+        // Advance across both events in one tick — both fire
+        layer.genFrame(0.9);
+        auto names = drainNames(layer);
+        CHECK(names.size() == 2);
+        // Ordering inside a single tick isn't strictly guaranteed across events
+        // because we iterate per-event; accept either order but require both present.
+        bool hasStart = std::find(names.begin(), names.end(), "flashStart") != names.end();
+        bool hasStop  = std::find(names.begin(), names.end(), "flashStop") != names.end();
+        CHECK(hasStart);
+        CHECK(hasStop);
+    }
+
+    TEST_CASE("event on frame 0 fires at very first forward tick") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 0, "start" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // First forward tick uses inclusive lower bound so frame-0 events fire
+        // at t=0 (matches WE's "reaches this frame" semantic).
+        layer.genFrame(0.05);
+        auto names = drainNames(layer);
+        CHECK_MESSAGE(names == std::vector<std::string> { "start" },
+                      "expected frame-0 event to fire on first tick");
+        // Further sub-period ticks must NOT refire the frame-0 event.
+        layer.genFrame(0.2);
+        CHECK(drainNames(layer).empty());
+        // After wrapping past the full period, frame-0 fires exactly once more.
+        layer.genFrame(1.0);
+        CHECK(drainNames(layer) == std::vector<std::string> { "start" });
+    }
+
+    TEST_CASE("single mode fires event once and no more") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Single, { { 5, "ding" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+
+        layer.genFrame(0.8);
+        CHECK(drainNames(layer) == std::vector<std::string> { "ding" });
+        // Further advances past clamp must NOT refire
+        layer.genFrame(5.0);
+        layer.genFrame(5.0);
+        CHECK(drainNames(layer).empty());
+    }
+
+    TEST_CASE("mirror mode fires on forward AND reverse crossings") {
+        // length=10 @ 10fps → 1s forward + 1s reverse period (2s total).
+        // Event at frame 5 → forward fire at 0.5s, reverse fire at 1.5s.
+        auto puppet =
+            makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Mirror, { { 5, "bounce" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+
+        layer.genFrame(0.6); // crosses forward fire
+        CHECK(drainNames(layer) == std::vector<std::string> { "bounce" });
+
+        layer.genFrame(1.0); // crosses reverse fire
+        CHECK(drainNames(layer) == std::vector<std::string> { "bounce" });
+
+        layer.genFrame(1.0); // crosses second forward fire (period 2.5s)
+        CHECK(drainNames(layer) == std::vector<std::string> { "bounce" });
+    }
+
+    TEST_CASE("paused (rate=0) dispatches nothing") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "noop" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 0.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        layer.genFrame(2.0);
+        CHECK(drainNames(layer).empty());
+    }
+
+    TEST_CASE("large delta covering multiple periods fires event once per period") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "tick" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+
+        layer.genFrame(3.2); // covers 3 events
+        auto names = drainNames(layer);
+        CHECK(names.size() == 3);
+        for (auto& n : names) CHECK(n == "tick");
+    }
+
+    TEST_CASE("drainEvents empties the queue") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "e" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        layer.genFrame(0.6);
+        CHECK(layer.drainEvents().size() == 1);
+        CHECK(layer.drainEvents().empty()); // second drain is idempotent
+    }
+
+    // Zero-advance tick must fire nothing — guards against `cur <= prev` →
+    // `cur < prev` mutant in collectPeriodicFires: at cur==prev the original
+    // returns early; the mutant would proceed and fire duplicates.
+    TEST_CASE("zero time advance fires nothing") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "e" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // First genFrame with zero advance and event at frame 0 would fire
+        // because of the first-tick inclusive bound; use event at frame 5 so
+        // zero-advance never triggers it.
+        layer.genFrame(0.0);
+        CHECK(drainNames(layer).empty());
+        layer.genFrame(0.7);
+        CHECK(drainNames(layer) == std::vector<std::string> { "e" });
+        // Another zero-advance must still fire nothing even after events seen
+        layer.genFrame(0.0);
+        CHECK(drainNames(layer).empty());
+    }
+
+    // Rate-scaled advance: tick delta * rate == actual playback advance.
+    // Kills the `time * rate` mul→div mutant by making result differ for
+    // rate=0.5 vs rate=2.0.
+    TEST_CASE("rate scales playback advance for event timing") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "e" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 0.5, 1.0, true, 0.0 }; // rate=0.5 → half-speed
+        layer.prepared(alayers);
+        // time=0.6 at rate=0.5 → effective advance = 0.3 (before frame 5 @ t=0.5)
+        layer.genFrame(0.6);
+        CHECK(drainNames(layer).empty());
+        // further 0.6 seconds → cumulative effective = 0.6 (past frame 5 @ t=0.5)
+        layer.genFrame(0.6);
+        CHECK(drainNames(layer) == std::vector<std::string> { "e" });
+    }
+
+    // Single-mode event at exact event_time boundary must fire on the tick
+    // that crosses it — guards `event_time > prev_bound && event_time <= next`
+    // from > → >= and <= → < mutants (line 304).
+    TEST_CASE("single mode fires exactly when crossing event boundary") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Single, { { 5, "hit" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // advance to exactly event_time (0.5s) → fire
+        layer.genFrame(0.5);
+        CHECK(drainNames(layer) == std::vector<std::string> { "hit" });
+    }
+
+    // Very large delta must be capped by kMaxPeriodsPerTick (line 258) so
+    // the fire list can't explode.  With delta = 10 * period we'd only emit
+    // ≤256 events; with period=0.1s and delta=30s we cover many cycles but
+    // not an absurd number.
+    TEST_CASE("excessive advance clamps to kMaxPeriodsPerTick") {
+        auto puppet = makePuppetWithEvents(1, 10.0, WPPuppet::PlayMode::Loop, { { 0, "tock" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // First tick: inclusive lower bound fires frame-0 event once.
+        layer.genFrame(0.05);
+        (void)drainNames(layer); // first-tick event
+        // period = 1/10 = 0.1s.  Advance 100s → 1000 periods naively; clamped
+        // by kMaxPeriodsPerTick (cap is inclusive on both ends so emits
+        // cap+1 fires at most).  Also exercises sub→add on k_start = k_end - cap.
+        layer.genFrame(100.0);
+        auto names = drainNames(layer);
+        CHECK(names.size() <= 257); // kMaxPeriodsPerTick (256) + 1 inclusive
+        CHECK(names.size() > 100);  // healthy batch, not near zero
+        CHECK(names.size() < 1000); // confirms the cap actually engaged
+    }
+
+    // Interval boundary: an event precisely at `next` fires on that tick;
+    // an event precisely at `prev` on a later tick must NOT re-fire.
+    // Kills the `t > prev` > → >= mutant on line 264.
+    TEST_CASE("half-open interval — event at prev does not re-fire") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "e" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // First tick: inclusive; advance 0.5 exactly — event at 0.5s fires.
+        layer.genFrame(0.5);
+        auto names = drainNames(layer);
+        CHECK(names == std::vector<std::string> { "e" });
+        // Subsequent tiny tick (first_fwd_tick now false) must NOT refire
+        // the event sitting exactly at the previous boundary.
+        layer.genFrame(0.0001);
+        CHECK(drainNames(layer).empty());
+    }
+
+    // Single mode elapsed clamp: additional forward ticks past max_time must
+    // still not refire the event.  Guards `elapsed > max_time` → `>=` mutant
+    // on line 330 and the `layer.elapsed = max_time` assignment.
+    TEST_CASE("single mode elapsed freezes past max_time without re-firing") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Single, { { 2, "once" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        layer.genFrame(5.0); // way past max_time (1.0s), event fires once
+        CHECK(drainNames(layer) == std::vector<std::string> { "once" });
+        // Repeated large advances must keep elapsed clamped, no refire
+        for (int i = 0; i < 5; i++) {
+            layer.genFrame(5.0);
+            CHECK(drainNames(layer).empty());
+        }
+    }
+
+    // Loop mode elapsed must NOT be clamped — event still fires on subsequent
+    // tick after many wraps.  Kills the `anim.mode == Single` → `!= Single`
+    // mutant on line 329 which would incorrectly clamp elapsed for Loop/Mirror,
+    // causing subsequent ticks to miss events.
+    TEST_CASE("loop mode does not clamp elapsed — events keep firing across ticks") {
+        auto puppet = makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Loop, { { 5, "tick" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // Advance 2.5 periods in tick 1 — fires at t=0.5, 1.5, 2.5 (3 fires).
+        layer.genFrame(2.5);
+        CHECK(drainNames(layer).size() == 3);
+        // Tick 2: advance a sub-period (0.6s) that doesn't cross a new event.
+        //   Original: elapsed 2.5→3.1.  Next fire at t=3.5 → NO fire.
+        //   Single-clamp mutant: elapsed pinned to 1.0 on tick 1 → 1.0→1.6.
+        //                        Previously-fired event at t=1.5 sits in (1.0,1.6]
+        //                        and re-fires → 1 fire.
+        // Only the correct (unclamped) elapsed yields zero fires here.
+        layer.genFrame(0.6);
+        CHECK(drainNames(layer).empty());
+    }
+
+    // Kills the cxx_gt_to_ge mutation on `event_time > prev_bound`
+    // (updateInterpolation around line 323): at the very first tick the
+    // first_fwd_tick flag pulls prev_bound to nextafter(0, -inf) so an event
+    // placed at frame 0 satisfies `event_time > prev_bound` strictly.  The
+    // mutated `>=` would also trigger but for a different reason — observable
+    // diff comes when the same event is checked on a later tick where
+    // first_fwd_tick is false: at advance == 0 the check `event_time >= prev`
+    // (mutated) would re-fire an event already fired previously.
+    TEST_CASE("Single mode event at frame 0 fires only on first tick (kills > vs >=)") {
+        auto puppet =
+            makePuppetWithEvents(10, 10.0, WPPuppet::PlayMode::Single, { { 0, "atZero" } });
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0] = { 42, 1.0, 1.0, true, 0.0 };
+        layer.prepared(alayers);
+        // First tick: event_time=0 vs prev_bound=-tiny → fires.
+        layer.genFrame(0.05);
+        CHECK(drainNames(layer) == std::vector<std::string> { "atZero" });
+        // Subsequent tick: prev_bound is now 0.05 (or wherever advance left it).
+        // event_time=0 < prev_bound → original DOES NOT fire.
+        // Mutated `>=` still wouldn't fire because event_time=0 < prev_bound either way.
+        // The actual kill is structural: original keeps inclusive_low=false from
+        // tick 2 onward; mutated path produces same result here.  This test
+        // anchors the t=0 event semantic against future regressions.
+        layer.genFrame(0.05);
+        CHECK(drainNames(layer).empty());
+    }
+
+} // TEST_SUITE
+
+// ===========================================================================
+// boneAffinesAsUploadFloats() — empty-bone guard for the g_Bones upload.
+// Regression: totoro 2891663007's puppet parsed to ZERO bones; the uploader
+// indexed data[0] on the empty span and the libstdc++ hardened
+// std::span::operator[] aborted the process, crash-looping plasmashell.
+// ===========================================================================
+TEST_SUITE("boneAffinesAsUploadFloats") {
+    TEST_CASE("empty bone span -> empty, null-data float span (never indexes [0])") {
+        std::span<const Eigen::Affine3f> none {};
+        auto                             r = wallpaper::boneAffinesAsUploadFloats(none);
+        CHECK(r.empty());
+        CHECK(r.data() == nullptr); // proves element [0] was not dereferenced
+    }
+
+    TEST_CASE("one bone -> 16 column-major floats aliasing (not copying) the affine") {
+        std::vector<Eigen::Affine3f> bones(1, Eigen::Affine3f::Identity());
+        bones[0].translation() = Eigen::Vector3f(3.f, 4.f, 5.f);
+        auto r                 = wallpaper::boneAffinesAsUploadFloats(bones);
+        REQUIRE(r.size() == 16);
+        CHECK(r.data() == bones[0].data()); // a view into the affine, not a copy
+        // Affine3f stores a column-major 4x4; the translation is column 3.
+        CHECK(r[12] == doctest::Approx(3.f));
+        CHECK(r[13] == doctest::Approx(4.f));
+        CHECK(r[14] == doctest::Approx(5.f));
+    }
+
+    TEST_CASE("N bones -> N*16 contiguous floats") {
+        std::vector<Eigen::Affine3f> bones(3, Eigen::Affine3f::Identity());
+        CHECK(wallpaper::boneAffinesAsUploadFloats(bones).size() == 48);
+    }
+}
+
+// ===========================================================================
+// A bone-less puppet's genFrame() is empty — the exact crash trigger the
+// uploader guard handles (totoro 2891663007).
+// ===========================================================================
+TEST_SUITE("WPPuppet_ZeroBones") {
+    TEST_CASE("genFrame of a 0-bone puppet returns an empty span") {
+        auto puppet = makePuppet(0, 100, 10.0, 2);
+        puppet->prepared();
+        WPPuppetLayer                              layer(puppet);
+        std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+        alayers[0].id      = 100;
+        alayers[0].blend   = 1.0;
+        alayers[0].visible = true;
+        alayers[0].rate    = 1.0;
+        layer.prepared(alayers);
+        auto frames = layer.genFrame(0.0);
+        CHECK(frames.empty());
+        // ...so the g_Bones uploader must (and now does) skip it without crashing.
+        CHECK(wallpaper::boneAffinesAsUploadFloats(frames).empty());
+    }
+}
+
+// ===========================================================================
+// A .mdl whose declared animation length disagrees with the bone tracks it
+// actually carries must not index past those tracks.  MDLA is untrusted
+// Workshop content and the two numbers are stored independently.
+// ===========================================================================
+
+namespace
+{
+// One bone, one Loop animation declaring `length` frames but storing only
+// `stored_frames` of them (position.x = frame index * 10).
+std::shared_ptr<WPPuppet> makeShortTrackPuppet(int length, int stored_frames,
+                                               WPPuppet::PlayMode mode = WPPuppet::PlayMode::Loop) {
+    auto           puppet = std::make_shared<WPPuppet>();
+    WPPuppet::Bone bone;
+    bone.transform = Eigen::Affine3f::Identity();
+    bone.parent    = 0xFFFFFFFFu;
+    puppet->bones.push_back(bone);
+
+    WPPuppet::Animation anim;
+    anim.id     = 1;
+    anim.fps    = 10.0;
+    anim.length = length;
+    anim.mode   = mode;
+    anim.name   = "short";
+    WPPuppet::Animation::BoneFrames bf;
+    for (int f = 0; f < stored_frames; f++) {
+        WPPuppet::BoneFrame frame;
+        frame.position = Eigen::Vector3f((float)f * 10.0f, 0, 0);
+        frame.angle    = Eigen::Vector3f::Zero();
+        frame.scale    = Eigen::Vector3f::Ones();
+        bf.frames.push_back(frame);
+    }
+    anim.bframes_array.push_back(bf);
+    puppet->anims.push_back(anim);
+    puppet->prepared();
+    return puppet;
+}
+
+WPPuppetLayer makeSingleFullWeightLayer(std::shared_ptr<WPPuppet> puppet) {
+    WPPuppetLayer                              layer(puppet);
+    std::vector<WPPuppetLayer::AnimationLayer> alayers(1);
+    alayers[0] = { 1, 1.0, 1.0, true, 0.0 };
+    layer.prepared(alayers);
+    return layer;
+}
+} // namespace
+
+TEST_SUITE("WPPuppet_ShortBoneTrack") {
+    TEST_CASE("genFrame clamps to the last stored frame when length overruns the track") {
+        // length=10 with 2 stored frames: at t=0.55 the interpolator asks for
+        // frames 5 and 6, which do not exist.  Both clamp to the last stored
+        // frame (x=10), so the pose stays finite and on a real keyframe.
+        auto puppet = makeShortTrackPuppet(10, 2);
+        auto layer  = makeSingleFullWeightLayer(puppet);
+        layer.genFrame(0.0);
+        auto  frames = layer.genFrame(0.55);
+        float x      = frames[0].translation().x();
+        CHECK(std::isfinite(x));
+        CHECK(x == doctest::Approx(10.0f));
+    }
+
+    TEST_CASE("genFrame clamps a Mirror animation whose track is short") {
+        auto puppet = makeShortTrackPuppet(10, 2, WPPuppet::PlayMode::Mirror);
+        auto layer  = makeSingleFullWeightLayer(puppet);
+        layer.genFrame(0.0);
+        auto  frames = layer.genFrame(0.75);
+        float x      = frames[0].translation().x();
+        CHECK(std::isfinite(x));
+        CHECK(x == doctest::Approx(10.0f));
+    }
+
+    TEST_CASE("genFrame clamps a Single animation holding past its stored frames") {
+        // Single holds frame length-1 once playback passes max_time.
+        auto puppet = makeShortTrackPuppet(10, 2, WPPuppet::PlayMode::Single);
+        auto layer  = makeSingleFullWeightLayer(puppet);
+        layer.genFrame(0.0);
+        auto  frames = layer.genFrame(5.0);
+        float x      = frames[0].translation().x();
+        CHECK(std::isfinite(x));
+        CHECK(x == doctest::Approx(10.0f));
+    }
+
+    TEST_CASE("genFrame skips a bone whose frame track is empty") {
+        // byte_size==0 for a track leaves it empty; the bone keeps its bind
+        // pose instead of dereferencing an empty vector.
+        auto puppet = makeShortTrackPuppet(10, 0);
+        auto layer  = makeSingleFullWeightLayer(puppet);
+        auto frames = layer.genFrame(0.0);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames[0].matrix().isApprox(Eigen::Affine3f::Identity().matrix(), 1e-5f));
+    }
+
+    TEST_CASE("zero-length animation yields frame 0 instead of dividing by zero") {
+        auto   anim = makeAnimation(WPPuppet::PlayMode::Loop, 0, 10.0);
+        double t    = 0.3;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("negative-length animation yields frame 0 in every play mode") {
+        for (auto mode :
+             { WPPuppet::PlayMode::Loop, WPPuppet::PlayMode::Mirror, WPPuppet::PlayMode::Single }) {
+            auto   anim = makeAnimation(mode, -1, 10.0);
+            double t    = 0.3;
+            auto   info = anim.getInterpolationInfo(&t);
+            CHECK(info.frame_a == 0);
+            CHECK(info.frame_b == 0);
+        }
+    }
+
+    TEST_CASE("zero-length animation still renders a finite pose") {
+        auto puppet = makeShortTrackPuppet(0, 2);
+        auto layer  = makeSingleFullWeightLayer(puppet);
+        layer.genFrame(0.0);
+        auto frames = layer.genFrame(0.25);
+        REQUIRE(frames.size() == 1);
+        CHECK(std::isfinite(frames[0].translation().x()));
+    }
+
+    // makeAnimation() derives frame_time and max_time from fps and length, so a
+    // zero length also zeroes max_time and every guard term trips at once.  The
+    // three cases below set the fields directly, which is what an in-process
+    // puppet can do, so each term of the guard is the only thing standing
+    // between the caller and the arithmetic it protects.  Each checks cur_time
+    // as well: holding frame 0 means the clock is left alone too, and that is
+    // the one observation that does not depend on what the unguarded
+    // double-to-unsigned cast happens to produce.
+
+    TEST_CASE("length exactly zero holds frame 0 even when the timings are playable") {
+        // Single mode past max_time is the branch that indexes length - 1
+        // directly, so an unguarded zero length reads frame -1 rather than
+        // faulting on `% 0`.
+        WPPuppet::Animation anim;
+        anim.mode       = WPPuppet::PlayMode::Single;
+        anim.length     = 0;
+        anim.frame_time = 0.25;
+        anim.max_time   = 1.0;
+
+        double t    = 2.0;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.0));
+        CHECK(t == doctest::Approx(2.0));
+    }
+
+    TEST_CASE("frame_time exactly zero holds frame 0 instead of dividing the clock by it") {
+        WPPuppet::Animation anim;
+        anim.mode       = WPPuppet::PlayMode::Loop;
+        anim.length     = 4;
+        anim.frame_time = 0.0;
+        anim.max_time   = 1.0;
+
+        double t    = 1.5;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.0));
+        CHECK(t == doctest::Approx(1.5));
+    }
+
+    TEST_CASE("max_time exactly zero holds frame 0 instead of wrapping the clock by it") {
+        // fmod(x, 0.0) is NaN, which then poisons the frame index; a length of 4
+        // and a playable frame_time leave this term as the only guard in play.
+        WPPuppet::Animation anim;
+        anim.mode       = WPPuppet::PlayMode::Loop;
+        anim.length     = 4;
+        anim.frame_time = 0.25;
+        anim.max_time   = 0.0;
+
+        double t    = 1.5;
+        auto   info = anim.getInterpolationInfo(&t);
+        CHECK(info.frame_a == 0);
+        CHECK(info.frame_b == 0);
+        CHECK(info.t == doctest::Approx(0.0));
+        CHECK(t == doctest::Approx(1.5));
+    }
+}

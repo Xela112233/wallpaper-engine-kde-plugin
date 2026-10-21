@@ -1,0 +1,149 @@
+#pragma once
+#include <vector>
+#include <list>
+#include <memory>
+#include <cstdint>
+#include <string>
+#include "Core/Literals.hpp"
+#include "Type.hpp"
+
+namespace wallpaper
+{
+
+class SceneNode;
+class SceneMesh;
+
+struct SceneImageEffectNode {
+    std::string                output; // render target
+    std::shared_ptr<SceneNode> sceneNode;
+};
+
+struct SceneImageEffect {
+    enum class CmdType
+    {
+        Copy,
+        Swap,
+    };
+    struct Command {
+        CmdType     cmd { CmdType::Copy };
+        std::string dst;
+        std::string src;
+        i32         afterpos { 0 }; // start at 1, 0 for begin at all
+    };
+    std::string                     name;             // effect name from scene.json
+    bool                            visible { true }; // runtime visibility toggle
+    std::vector<Command>            commands;
+    std::list<SceneImageEffectNode> nodes;
+
+    // Filled by SceneImageEffectLayer::ResolveEffect. Lets a hidden effect pass
+    // its input through: chain_writer is the node that copies (null when the
+    // effect writes only private FBOs or its writing node has no material),
+    // chain_input is the chain buffer it copies.
+    SceneNode*  chain_writer { nullptr };
+    std::string chain_input;
+};
+
+class SceneImageEffectLayer {
+public:
+    SceneImageEffectLayer(SceneNode* node, std::string_view pingpong_a,
+                          std::string_view pingpong_b);
+
+    void AddEffect(const std::shared_ptr<SceneImageEffect>& node) { m_effects.push_back(node); }
+    std::size_t EffectCount() const { return m_effects.size(); }
+    auto&       GetEffect(std::size_t index) { return m_effects.at(index); }
+
+    // Remove effects whose first node's shader has empty SPIR-V codes
+    // (the compile failed — typically workshop shaders that didn't survive
+    // HLSL→GLSL).  Returns the number removed.  Intended to be called once
+    // after the scene's shaders are compiled so ResolveEffect can pick the
+    // previous successfully-compiled effect as last_output instead of leaving
+    // a hole at the end of the chain.
+    std::size_t RemoveFailedEffects();
+    const auto& FirstTarget() const { return m_pingpong_a; }
+    const auto& SecondTarget() const { return m_pingpong_b; }
+    SceneMesh&  FinalMesh() const { return *m_final_mesh; }
+    SceneNode&  FinalNode() const { return *m_final_node; }
+    void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
+    // When true, ResolveEffect writes the final output to a per-node offscreen RT instead of
+    // SpecTex_Default, so invisible dependency nodes don't composite into the main scene.
+    void SetOffscreen(bool v) { m_is_offscreen = v; }
+    bool IsOffscreen() const { return m_is_offscreen; }
+
+    // When true, the last effect node inherits the parent pointer from the
+    // world node so its world transform includes the parent-group transform.
+    void SetInheritParent(bool v) { m_inherit_parent = v; }
+    bool InheritParent() const { return m_inherit_parent; }
+
+    // Set a proxy node carrying the parent's original (pre-reset) world
+    // transform.  When image nodes with effects have their transforms reset
+    // to identity for effect-chain rendering, children that inherit_parent
+    // can no longer chain through the (now-identity) parent world node.
+    // The proxy preserves the correct parent transform.
+    void SetParentProxy(std::shared_ptr<SceneNode> proxy) { m_parent_proxy = std::move(proxy); }
+
+    // When true (compose layer with config.passthrough), the effect chain
+    // starts from the current scene output (_rt_default) instead of the
+    // layer's own mesh.  The base mesh rendering is replaced by a copy.
+    void SetPassthrough(bool v) { m_passthrough = v; }
+    bool IsPassthrough() const { return m_passthrough; }
+
+    // True for ALL compose layers (image == "models/util/composelayer.json"),
+    // regardless of m_passthrough.  Compose layers' base pass runs the
+    // composelayer shader which samples _rt_FullFrameBuffer at the layer
+    // vertex's world-NDC position — so the worldNode's MVP must reflect the
+    // CURRENT scripted origin/scale/angles, not the parse-time values.  The
+    // SceneScript property dispatch consults this flag to decide whether to
+    // also update spImgNode in addition to resolvedOutput (Clair Obscur
+    // Expedition 33 3498984739 M2 ghost: scripted oscillating origin needs
+    // both worldNode (base capture position) AND resolvedOutput (final draw
+    // position) updated each tick).
+    void SetComposeLayer(bool v) { m_is_compose_layer = v; }
+    bool IsComposeLayer() const { return m_is_compose_layer; }
+
+    // Scene-level "copybackground" flag (default true).  Only meaningful when
+    // m_passthrough is also true — controls whether the implicit screen-copy
+    // (_rt_default → pingpong) actually fires before the effect chain runs.
+    // Wallpapers that author content directly into the compose pingpong via
+    // children scene-graph passes set copybackground=false to suppress the
+    // screen capture so the children's content isn't overwritten.
+    void SetCopyBackground(bool v) { m_copy_background = v; }
+    bool CopyBackground() const { return m_copy_background; }
+
+    // Camera override for the final composite output (non-offscreen).
+    // When set, the last effect node uses this camera instead of activeCamera.
+    // Used for flat image layers in perspective scenes that need ortho projection.
+    void        SetFinalCamera(std::string cam) { m_final_camera = std::move(cam); }
+    const auto& FinalCamera() const { return m_final_camera; }
+
+    void ResolveEffect(const SceneMesh& defualt_mesh, std::string_view effect_cam);
+
+    // After ResolveEffect, returns the scene node that renders the final
+    // composite to screen.  Property script transform updates should target
+    // this node (not the world node, which stays at identity for the base
+    // render into the ping-pong buffer).
+    SceneNode* ResolvedLastOutput() const { return m_resolved_last_output; }
+
+private:
+    SceneNode*  m_worldNode;
+    std::string m_pingpong_a;
+    std::string m_pingpong_b;
+
+    bool                       m_is_offscreen { false };
+    bool                       m_inherit_parent { false };
+    bool                       m_passthrough { false };
+    bool                       m_is_compose_layer { false };
+    bool                       m_copy_background { true };
+    std::string                m_final_camera; // Camera for final composite (empty → activeCamera)
+    std::unique_ptr<SceneMesh> m_final_mesh;
+    std::unique_ptr<SceneNode> m_final_node;
+    BlendMode                  m_final_blend;
+
+    std::vector<std::shared_ptr<SceneImageEffect>> m_effects;
+
+    // Proxy node with the parent's baked world transform (see SetParentProxy).
+    std::shared_ptr<SceneNode> m_parent_proxy;
+
+    // The actual scene node that renders the final composite (set by ResolveEffect).
+    SceneNode* m_resolved_last_output { nullptr };
+};
+} // namespace wallpaper

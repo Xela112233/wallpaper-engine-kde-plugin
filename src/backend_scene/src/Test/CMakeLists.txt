@@ -1,0 +1,836 @@
+enable_testing()
+
+# WPTextRenderer.cpp (pulled in for the WPSceneParser::Parse end-to-end test)
+# rasterizes glyphs via FreeType.  find_package here so the Freetype::Freetype
+# imported target is visible in this subdirectory scope (the one in
+# src/CMakeLists.txt is a sibling and doesn't propagate the imported target).
+find_package(Freetype REQUIRED)
+
+# libmpv for the VideoTextureDecoder lifecycle test.  The PkgConfig module is
+# enabled at the submodule root, so pkg_check_modules works here too — same
+# pattern as the sibling src/CMakeLists.txt.  The test binary stays runnable
+# without a real video file: the open() branches are gated on WEKDE_HAS_VIDEO;
+# the offline cases never touch libmpv at runtime (constructor + destructor +
+# triple-buffer indices), they just need the headers/symbols at link time.
+pkg_check_modules(MPV REQUIRED mpv)
+# EGL + GBM for the HWVideoTextureDecoder test.  These are SIBLINGS of src/
+# (which detects them in src/CMakeLists.txt) — that scope isn't visible here,
+# so re-probe.  When absent we skip the HW test sources; the SW test still
+# builds (it's the bulk of test_VideoTextureDecoder.cpp coverage).  Mirrors
+# the gate in src/CMakeLists.txt:91.
+pkg_check_modules(EGL egl)
+pkg_check_modules(GBM gbm)
+pkg_check_modules(GL gl)
+
+# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR: this file is only ever configured
+# as a descendant of the submodule's own project(wescene-renderer) (declared
+# once, at the submodule root), so PROJECT_SOURCE_DIR tracks the submodule
+# root correctly whether the submodule is configured standalone
+# (-S src/backend_scene, where the two happen to be equal) or pulled in from
+# the parent's root configure (-S ., -DBUILD_TESTS=ON) -- where
+# CMAKE_SOURCE_DIR is the PARENT repo root instead, and every path below
+# resolves to a nonexistent file.
+set(DOCTEST_INCLUDE_DIR
+    "${PROJECT_SOURCE_DIR}/third_party/nlohmann/tests/thirdparty/doctest")
+set(SRC_DIR "${PROJECT_SOURCE_DIR}/src")
+
+add_executable(backend_scene_tests
+    test_main.cpp
+    test_WPTexImageParser.cpp
+    test_SpecTexs.cpp
+    test_SpriteAnimation.cpp
+    test_helpers.cpp
+    test_WPShaderTransforms.cpp
+    test_WPShaderInclude.cpp
+    test_WPShaderTexCombos.cpp
+    test_ReadbackPixels.cpp
+    test_WPShaderPreamble_DepthGather.cpp
+    test_StringUtils.cpp
+    test_Algorism.cpp
+    test_WPUserProperties.cpp
+    test_ParticleModify.cpp
+    test_ParticleSystem.cpp
+    test_ParticleSubSystem_BurstDoneQueue.cpp
+    test_HiddenLayerSkip.cpp
+    test_ParticleTrail.cpp
+    test_ParticleIndexOverflow.cpp
+    test_SceneClockClamp.cpp
+    test_SceneLoadFailure.cpp
+    test_AudioRateMultiplier.cpp
+    test_WPPuppet.cpp
+    test_WPSceneAttachmentCompose.cpp
+    # Layer alpha / colour fan-out into image- and flat-shader uniforms.
+    test_SceneMaterialLayerWrite.cpp
+    test_WPTexImageHelpers.cpp
+    test_TexVariants.cpp
+    test_ColorBlendOverride.cpp
+    test_EffectUniformAnimation.cpp
+    test_WPTextLayer.cpp
+    test_WPTextRenderer.cpp
+    test_WPTextRendererGlyphCache.cpp
+    test_WPGlyphCoverageMessage.cpp
+    test_SceneCamera.cpp
+    test_SceneNode.cpp
+    test_UniformDirtyGate.cpp
+    test_CameraShakeGate.cpp
+    test_RenderExtent.cpp
+    test_FramebufferCache.cpp
+    test_StagingReuse.cpp
+    test_StagingBufferIncrease.cpp
+    test_TransformEpoch.cpp
+    test_SceneLight.cpp
+    test_SceneMesh.cpp
+    test_SceneShader.cpp
+    test_Scene.cpp
+    test_Scene_VolumetricsTick.cpp
+    test_SceneToRenderGraph_Volumetrics.cpp
+    test_SkyboxRenderGraph.cpp
+    test_SceneToRenderGraph_LinkResolution.cpp
+    test_SceneToRenderGraph_SelfWrite.cpp
+    test_SceneToRenderGraph_SelfWriteHazardScale.cpp
+    test_SceneToRenderGraph_ReflectionTextureRead.cpp
+    test_SceneToRenderGraph_TerminalPassthrough.cpp
+    test_SceneToRenderGraph_ScriptEffectVis.cpp
+    test_WPSceneInitJsonHierarchy.cpp
+    test_WPSceneGroupParse.cpp
+    test_SceneIndexArray.cpp
+    test_SceneVertexArray.cpp
+    test_WPJson.cpp
+    test_WPCommon_OrthoCameraSize.cpp
+    test_WPCommon_OrthoOverlayCamera.cpp
+    test_WPSoundHelpers.cpp
+    test_WPSoundParser.cpp
+    test_SoundStreamTable.cpp
+    test_SceneTickHelpers.cpp
+    test_FpsCounter.cpp
+    test_MsaaPolicy.cpp
+    test_Logging.cpp
+    test_ConsoleFlushDedup.cpp
+    test_DiagDumpEnv.cpp
+    test_RenderCallbackGuard.cpp
+    test_BackgroundReleaser.cpp
+    test_AudioAnalyzer.cpp
+    test_SoundManager.cpp
+    test_AudioCapture.cpp
+    test_AudioCapture_Rebind.cpp
+    test_MaDeviceShutdown.cpp
+    test_AudioBus.cpp
+    test_BinaryStream.cpp
+    test_VFS.cpp
+    test_WPPkgFs.cpp
+    ${SRC_DIR}/WPPkgFs.cpp
+    test_SoundStreamSeek.cpp
+    test_WPVolumeAnimation.cpp
+    test_WPPropertyAnimation.cpp
+    test_WPMdlParser.cpp
+    test_WPMdlParserFormats.cpp
+    test_SceneProfiler.cpp
+    test_PassCacheAlias.cpp
+    test_PassMerge.cpp
+    test_RtResidency.cpp
+    test_DedicatedRtMemory.cpp
+    test_MemoryStatsMath.cpp
+    test_BlendModeFactors.cpp
+    test_CustomShaderPassDesc.cpp
+    test_PassthroughShader.cpp
+    test_CardMesh.cpp
+    test_ShaderSourceScan.cpp
+    test_CustomShaderPass_DepthBinding.cpp
+    test_CustomShaderPass_ForceClearOutput.cpp
+    test_CustomShaderPass_ScratchReuse.cpp
+    test_CustomShaderPass_MutableTexture.cpp
+    test_DeviceCaps.cpp
+    test_DeviceMemoryBudget.cpp
+    test_DepthSamplerConfig.cpp
+    test_DepthUsageFlags.cpp
+    test_TextureCache_SamplerDedup.cpp
+    test_TextureCacheSamplerAxes.cpp
+    test_TextureCacheInitialContents.cpp
+    test_VvkCreateWrappers.cpp
+    test_TextureCache_LoadStaging.cpp
+    test_TextureCacheQueryLRU.cpp
+    test_TexFormatVk.cpp
+    test_SwapchainPolicy.cpp
+    test_SwapchainSetup.cpp
+    test_ExSwapchainFormat.cpp
+    test_present_mode.cpp
+    test_PipelineCacheIO.cpp
+    test_GraphicsPipelineReset.cpp
+    test_Shader.cpp
+    test_FenceWaitRetry.cpp
+    ${SRC_DIR}/VulkanRender/FenceWaitRetry.cpp
+    test_FrameFenceCycle.cpp
+    ${SRC_DIR}/VulkanRender/FrameFenceCycle.cpp
+    test_VulkanDebugCallbackGate.cpp
+    test_DeviceQueueSelection.cpp
+    test_SystemFontFallback.cpp
+    ${SRC_DIR}/SystemFontFallback.cpp
+    test_SceneImageEffectLayer.cpp
+    test_WPCreateLayerScan.cpp
+    ${SRC_DIR}/Scene/SceneImageEffectLayer.cpp
+    test_WPPropertyScriptExtract.cpp
+    test_WPParticleInstanceoverride.cpp
+    test_WPSceneFileResolver.cpp
+    test_WPMapSequenceParse.cpp
+    test_WPRopeCombos.cpp
+    test_RopeMedian.cpp
+    test_RopeScratchThreadLocal.cpp
+    test_WPParticleOperators.cpp
+    test_WPRemapValueOps.cpp
+    test_WPScenePostprocessing.cpp
+    test_WPImageObject.cpp
+    test_ParticleEmitter.cpp
+    test_Looper.cpp
+    test_Determinism.cpp
+    test_WPSoundObject.cpp
+    test_WPScene.cpp
+    test_WPMaterial.cpp
+    test_WPMediaSystemTexture.cpp
+    test_MediaTextureRegistry.cpp
+    test_MediaThumbnailCrossfade.cpp
+    ${PROJECT_SOURCE_DIR}/qml_helper/MediaThumbnailCrossfade.cpp
+    # Inline `{"user": ...}` shader-constant bindings (WPMaterial.cpp).
+    test_WPMaterialUserBinding.cpp
+    # Which user-property changes the live scene can absorb without a reload.
+    test_UserPropRuntimeUpdate.cpp
+    # Resolving, recording and applying shader-uniform bindings fed by user
+    # properties.
+    test_UserPropUniformBinding.cpp
+    # Reconciling a parse-time effect-visibility binding against a layer's
+    # final, post-RemoveFailedEffects state.
+    test_UserPropEffectVisResolve.cpp
+    # Same resolver shape, for effect-level visible.script bindings instead
+    # of visible.user ones.
+    test_ScriptEffectVisResolve.cpp
+    # Text scan of SceneScript sources for the layers whose effects a script
+    # can hide or show.
+    test_WPScriptEffectTargetScan.cpp
+    test_WPParticleObject.cpp
+    test_WPImageObjectExpanded.cpp
+    test_WPParticleParserMore.cpp
+    test_WPParticleParserGaps.cpp
+    test_WPParticleParserDeepKill.cpp
+    test_WPParticleParserResidual.cpp
+    test_WPParticleParserResidual2.cpp
+    test_WPParticleParser_SS8.cpp
+    test_WPParticleParserRemapInitial.cpp
+    test_WPSceneParse.cpp
+    test_WPSceneHidePattern.cpp
+    test_WPLightObject.cpp
+    test_WPLightKindParse.cpp
+    test_WPShaderValueUpdater_Volumetric.cpp
+    test_WPShaderValueUpdater_Uniforms.cpp
+    test_WPShaderValueUpdater_RtResolution.cpp
+    test_UniformLookupHash.cpp
+    test_UniformWriteSize.cpp
+    test_DependencyGraph.cpp
+    test_RenderGraph.cpp
+    test_WorldCacheGate.cpp
+    test_SpriteSnapshotGate.cpp
+    test_ImagePayload.cpp
+    test_AudioConsumerGate.cpp
+    test_TextStyleMerge.cpp
+    test_TextUploadCommit.cpp
+    test_PendingUpdateQueues.cpp
+    # Pending-update queue lifted out of RenderHandler.  backend_scene_tests
+    # compiles individual Scene .cpp files (it does not link the whole wpScene
+    # lib), so pull the queue's .cpp in directly for the unit test.
+    ${SRC_DIR}/Scene/PendingUpdateQueues.cpp
+    test_FramePacing.cpp
+    test_ThreadTimer.cpp
+    test_FrameTimer.cpp
+    # Pacing math lifted out of FrameTimer.  backend_scene_tests compiles the
+    # header's self-containment TU directly rather than linking all of wpTimer.
+    ${SRC_DIR}/Timer/FramePacing.cpp
+    test_WarmCacheTexSlots.cpp
+    test_VideoTextureDecoder.cpp
+    # VideoTextureDecoder.cpp: SW video texture decoder (libmpv triple-buffer).
+    # Pulled in directly (not via wescene-renderer) because the latter drags
+    # the entire Vulkan device chain. The TU's only non-stdlib dep is libmpv,
+    # added via MPV_LIBRARIES below.
+    ${SRC_DIR}/VideoTextureDecoder.cpp
+    # HWVideoTextureDecoder: only included when EGL+GBM+GL are available
+    # (same gate as src/CMakeLists.txt for the production lib).  Otherwise
+    # we skip the cpp + test_HWVideoTextureDecoder.cpp entirely on systems
+    # without EGL/GBM/GL dev libs.
+    $<$<AND:$<BOOL:${EGL_FOUND}>,$<BOOL:${GBM_FOUND}>,$<BOOL:${GL_FOUND}>>:test_HWVideoTextureDecoder.cpp>
+    $<$<AND:$<BOOL:${EGL_FOUND}>,$<BOOL:${GBM_FOUND}>,$<BOOL:${GL_FOUND}>>:${SRC_DIR}/HWVideoTextureDecoder.cpp>
+    # Compile specific source files to avoid pulling in Vulkan
+    ${SRC_DIR}/wpscene/WPScene.cpp
+    ${SRC_DIR}/wpscene/WPImageObject.cpp
+    ${SRC_DIR}/wpscene/WPAnimationJson.cpp
+    ${SRC_DIR}/WPTexImageParser.cpp
+    ${SRC_DIR}/WPMediaSystemTexture.cpp
+    ${SRC_DIR}/Type.cpp
+    ${SRC_DIR}/WPPuppet.cpp
+    ${SRC_DIR}/WPMdlParser.cpp
+    ${SRC_DIR}/CameraLayer.cpp
+    ${SRC_DIR}/WPJson.cpp
+    ${SRC_DIR}/WPParticleParser.cpp
+    ${SRC_DIR}/WPSoundParser.cpp
+    ${SRC_DIR}/wpscene/WPParticleObject.cpp
+    ${SRC_DIR}/wpscene/WPMaterial.cpp
+    ${SRC_DIR}/Scene/SceneCamera.cpp
+    ${SRC_DIR}/Scene/SceneNode.cpp
+    ${SRC_DIR}/Scene/SceneIndexArray.cpp
+    ${SRC_DIR}/Scene/SceneVertexArray.cpp
+    ${SRC_DIR}/Scene/SceneShader.cpp
+    ${SRC_DIR}/Scene/SceneLight.cpp
+    # End-to-end WPSceneParser::Parse() coverage (test_WPSceneParse.cpp) needs
+    # the parser TU plus its transitive non-Vulkan deps.  WPShaderParser.cpp
+    # transitively references glslang (host-CPU SPIR-V toolchain, NOT a Vulkan
+    # device) via Vulkan/ShaderComp.hpp — satisfied by linking wpVulkan below,
+    # mirroring fuzz_WPShaderParser.  No vkCreate*-class device symbol is
+    # pulled in (the fixture scene loads no materials/shaders).
+    ${SRC_DIR}/WPSceneParser.cpp
+    ${SRC_DIR}/VulkanRender/VolumetricChain.cpp
+    # Skybox background pass (Increment A) + its render-graph emission +
+    # integrated sceneToRenderGraph() for the topology tests.  Same headless
+    # contract as CustomShaderPass below: the Vulkan device-side prepare/execute
+    # is never called from tests (SkyboxPass::execute needs a real device), so
+    # only the compile-time header weight is pulled in — no GPU interaction.
+    # SceneToRenderGraph.cpp calls addPass<CopyPass>, so CopyPass.cpp comes too.
+    ${SRC_DIR}/VulkanRender/SkyboxPass.cpp
+    ${SRC_DIR}/VulkanRender/SceneToRenderGraph.cpp
+    ${SRC_DIR}/VulkanRender/CopyPass.cpp
+    # CustomShaderPass: ctor/dtor + Desc copy live here; required so the test
+    # target can instantiate CustomShaderPass through the RenderGraph::addPass
+    # template (the volumetric chain emitters do).  The Vulkan device-side code
+    # (prepare/execute/destory) is never called from tests, so no real GPU
+    # interaction occurs — the heavy headers are compile-only.
+    ${SRC_DIR}/VulkanRender/CustomShaderPass.cpp
+    ${SRC_DIR}/VulkanRender/PassthroughShader.cpp
+    # Tiny stubs for the per-pass RT dump globals (live in VulkanRender.cpp,
+    # which is too heavy to pull in to the headless test binary).  They are
+    # never read — CustomShaderPass::execute() is the sole consumer and tests
+    # never call it.
+    test_CustomShaderPass_stubs.cpp
+    ${SRC_DIR}/WPShaderParser.cpp
+    ${SRC_DIR}/WPShaderValueUpdater.cpp
+    ${SRC_DIR}/WPTextRenderer.cpp
+    ${SRC_DIR}/wpscene/WPLightObject.cpp
+    ${SRC_DIR}/wpscene/WPModelObject.cpp
+    ${SRC_DIR}/wpscene/WPTextObject.cpp
+    # Property-based invariants over WPSceneParser (RapidCheck + doctest).
+    test_WPSceneParse_Properties.cpp
+    # Golden-snapshot diff tests for WPShaderTransforms.h string rewrites.
+    test_WPShaderTransforms_Golden.cpp
+    # standalone_view/arg.hpp's user-properties JSON builder -- pure, no Qt.
+    test_ArgUserProps.cpp
+)
+
+target_include_directories(backend_scene_tests PRIVATE
+    ${SRC_DIR}
+    ${SRC_DIR}/Scene/include
+    ${SRC_DIR}/Scene/include/Scene
+    ${SRC_DIR}/Particle/include
+    ${SRC_DIR}/VulkanRender/include
+    # SceneToRenderGraph.cpp / SkyboxPass.cpp include their headers unqualified
+    # (e.g. "SceneToRenderGraph.hpp"); production adds this dir PRIVATE on the
+    # wpVulkanRender target, so mirror it here for the pulled-in sources.
+    ${SRC_DIR}/VulkanRender/include/VulkanRender
+    ${SRC_DIR}/VulkanRender
+    ${SRC_DIR}/Vulkan/include
+    # FramePacing.hpp is compiled as a direct TU (no wpTimer link needed for
+    # the pure-math suite), so expose its include dir here.
+    ${SRC_DIR}/Timer/include
+    # libmpv headers (mpv/client.h, mpv/render.h) — VideoTextureDecoder.cpp.
+    ${MPV_INCLUDE_DIRS}
+    # ConsoleFlushDedup.hpp (test_ConsoleFlushDedup.cpp) and RenderCallbackGuard.hpp
+    # (test_RenderCallbackGuard.cpp) are both QJSEngine-free, so they're exercised
+    # here rather than only through the Qt-gated scenescript_tests.
+    ${PROJECT_SOURCE_DIR}/qml_helper
+)
+# third_party is vendored; DOCTEST_INCLUDE_DIR is a subdirectory of it but
+# CMake tracks system-ness per include-directory entry, not by filesystem
+# ancestry, so it needs SYSTEM here too or doctest.h's own diagnostics (the
+# clang-only <ciso646> include, the __COUNTER__ extension) get reported
+# against this target at first-party severity.
+target_include_directories(backend_scene_tests SYSTEM PRIVATE
+    "${PROJECT_SOURCE_DIR}/third_party"
+    ${DOCTEST_INCLUDE_DIR})
+
+target_link_libraries(backend_scene_tests PRIVATE
+    wpUtils
+    # Looper owns the wallpaper worker thread; test_Looper.cpp pins its
+    # start/stop/destroy lifecycle, so the tests need the real library.
+    wpLooper
+    wpFs
+    wpAudio
+    wpParticle
+    # RenderGraph (DependencyGraph cycle detection / topo sort). Vulkan-free
+    # static lib — its .cpp files include only their own headers + Logging.
+    wpRGraph
+    # ThreadTimer is a real library now (absolute-deadline loop), not a header.
+    wpTimer
+    # wpVulkan supplies the glslang/SPIRV-Reflect symbols WPShaderParser.cpp
+    # references (CompileToSpv / Init/FinalGlslang).  It is the host-CPU shader
+    # toolchain, not a Vulkan device — the binary stays headless-safe.
+    wpVulkan
+    # WPTextRenderer.cpp rasterizes via FreeType.
+    Freetype::Freetype
+    # SystemFontFallback.cpp asks fontconfig for font paths.
+    ${FONTCONFIG_LIBRARIES}
+    ${LZ4_LIBRARIES}
+    Eigen3::Eigen
+    nlohmann_json
+    # libmpv — VideoTextureDecoder.cpp (test_VideoTextureDecoder.cpp).
+    ${MPV_LIBRARIES}
+    # EGL + GBM + GL — HWVideoTextureDecoder.cpp (test_HWVideoTextureDecoder.cpp).
+    # The test only exercises initEGL (return-false path under WEK_HW_DECODE_DRI_PATH),
+    # but HWVideoTextureDecoder.cpp references glGenTextures/glReadPixels/etc
+    # so the linker needs the GL lib at link time even if those code paths
+    # never execute.
+    $<$<BOOL:${EGL_FOUND}>:${EGL_LIBRARIES}>
+    $<$<BOOL:${GBM_FOUND}>:${GBM_LIBRARIES}>
+    $<$<BOOL:${GL_FOUND}>:${GL_LIBRARIES}>
+    # RapidCheck (vendored under third_party/rapidcheck/) -- consumed by
+    # test_WPSceneParse_Properties.cpp.  Wrapping rc::check inside a doctest
+    # CHECK gives us the SUBCASE-equivalent reporting without needing the
+    # rapidcheck/doctest.h extras header (which assumes a newer doctest than
+    # the one vendored under third_party/nlohmann/tests/thirdparty/doctest).
+    rapidcheck
+)
+
+# Pin the fixtures dir for the golden-snapshot harness so the test binary can
+# locate tests/fixtures/shaders/ regardless of cwd (preflight + ctest run
+# from different working directories).
+target_compile_definitions(backend_scene_tests PRIVATE
+    WEK_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures"
+)
+
+# HAVE_EGL_HWDEC matches the production gate (src/CMakeLists.txt:92); without
+# it the HWVideoTextureDecoder.hpp/.cpp pieces are referenced but no callers
+# in tests depend on the symbol — this define is informational here, but kept
+# parallel with production so a future test-side HW path activation is one-step.
+if(EGL_FOUND AND GBM_FOUND AND GL_FOUND)
+    target_compile_definitions(backend_scene_tests PRIVATE HAVE_EGL_HWDEC=1)
+endif()
+
+target_compile_options(backend_scene_tests PRIVATE ${warn_opts} ${WEK_DOCTEST_WERROR_EXEMPT_FLAGS})
+
+# Opt-in sanitizers (WEK_SANITIZE=address,undefined | thread). No-op when empty.
+wek_apply_sanitizers(backend_scene_tests)
+
+# Same option block every first-party library gets via
+# wek_apply_mull_instrumentation() (cmake/WekMullInstrument.cmake) -- kept as
+# one shared function so the test executable and the libraries it links can't
+# drift apart the way they used to, when only this target's own
+# target_compile_options carried the flag and the libraries it links did not.
+wek_apply_mull_instrumentation(backend_scene_tests)
+
+add_test(NAME backend_scene_tests COMMAND backend_scene_tests)
+# Backstop against a wedged run (e.g. a device-enumeration block that slips
+# the WEKDE_HAS_AUDIO_DEVICE env gate).  The non-blocking suite finishes in
+# seconds; 120s leaves headroom for a real audio-enabled local run.  NOTE:
+# this only protects ctest-driven runs — preflight.sh invokes the binary
+# BARE, so the env gate in the audio test cases is the load-bearing fix.
+set_tests_properties(backend_scene_tests PROPERTIES TIMEOUT 120)
+
+# Expose wp-pkg binary path to tests when BUILD_TOOLS is on.  The wp-pkg pack
+# format suite shells out to the real binary; when the tool isn't built (the
+# default, including CI) the suite skips at runtime instead of hardcoding a
+# user-specific absolute path.
+if(BUILD_TOOLS AND TARGET wp-pkg)
+    target_compile_definitions(backend_scene_tests PRIVATE
+        WP_PKG_TOOL_PATH="$<TARGET_FILE:wp-pkg>")
+    add_dependencies(backend_scene_tests wp-pkg)
+endif()
+
+# Qt-dependent tests (SceneScript timers, device detection).  Compiles the real
+# SceneBackend.cpp (the QML bridge) so test_SceneScriptDispatch can drive the
+# 30 Hz property/text/color dispatch against a recording IPropertyDispatchSink
+# with no SceneWallpaper / Vulkan device.  Needs Gui + Quick (SceneBackend uses
+# QQuickItem / QSGSimpleTextureNode) and glad (glExtra.cpp), plus the renderer
+# lib for the SceneWallpaper symbols — the ctor never opens Vulkan (deferred to
+# initVulkan), so the link set stays headless.
+find_package(Qt6 COMPONENTS Core Qml Gui Quick QUIET)
+if(Qt6_FOUND)
+    add_executable(scenescript_tests
+        test_main_qt.cpp
+        test_SceneScript.cpp
+        test_SceneScriptDispatch.cpp
+        test_PropertyScriptDispatchGate.cpp
+        test_SceneLocalStorageDisk.cpp
+        test_SceneGraphApi.cpp
+        # Not SceneScript-related, but this is the only test binary that links
+        # wescene-renderer (SceneWallpaper.cpp's library) headlessly, and the
+        # function under test lives there.
+        test_ActiveUserPropBindingNames.cpp
+        ${PROJECT_SOURCE_DIR}/qml_helper/SceneBackend.cpp
+        ${PROJECT_SOURCE_DIR}/qml_helper/MediaThumbnailCrossfade.cpp
+        ${PROJECT_SOURCE_DIR}/qml_helper/SceneScriptBridge.h
+        ${PROJECT_SOURCE_DIR}/qml_helper/SceneTimerBridge.h
+        ${PROJECT_SOURCE_DIR}/qml_helper/glExtra.cpp
+    )
+    set_target_properties(scenescript_tests PROPERTIES AUTOMOC ON)
+    target_include_directories(scenescript_tests PRIVATE
+        ${PROJECT_SOURCE_DIR}/qml_helper
+        ${PROJECT_SOURCE_DIR}/src/Audio/include
+        ${PROJECT_SOURCE_DIR}/src/Scene/include
+    )
+    # Same vendored-header treatment as backend_scene_tests above.
+    target_include_directories(scenescript_tests SYSTEM PRIVATE
+        ${PROJECT_SOURCE_DIR}/third_party
+        ${DOCTEST_INCLUDE_DIR}
+    )
+    # wek_warn_opts (Wall/Wextra, not the richer submodule warn_opts): this
+    # target compiles qml_helper/SceneBackend.cpp directly, and
+    # ${PROJECT_NAME}-qml already builds that same source under wek_warn_opts
+    # for the Qt/QJSEngine noise reason documented on wek_warn_opts above —
+    # holding the test target to a stricter set than the production target
+    # that builds the identical file would fail it on warnings production was
+    # deliberately spared from.
+    target_compile_options(scenescript_tests PRIVATE ${wek_warn_opts} ${WEK_DOCTEST_WERROR_EXEMPT_FLAGS})
+    target_link_libraries(scenescript_tests PRIVATE
+        Qt6::Core Qt6::Qml Qt6::Gui Qt6::Quick glad wescene-renderer wpTimer nlohmann_json)
+    wek_apply_sanitizers(scenescript_tests)
+    add_test(NAME scenescript_tests COMMAND scenescript_tests)
+    set_tests_properties(scenescript_tests PROPERTIES TIMEOUT 120)
+endif()
+
+# ── Thread-safety repro (run under -DWEK_SANITIZE=thread) ─────────────────────
+# Focused multithread exerciser for the B5 races.  Links wpScene (Scene +
+# SceneNode, NO Vulkan) so it drives the REAL parent-tree fix (B5b), plus a
+# generic atomic<shared_ptr> stand-in for the B5a pattern (SceneWallpaper.cpp
+# can't link without Vulkan).  Builds in any config; only meaningful under TSAN.
+# WEK_THREAD_REPRO_PROVE_RACE=ON swaps repro 1 to a deliberately racy plain
+# shared_ptr to demonstrate the harness bites (TSAN should then report a race).
+add_executable(backend_scene_thread_tests
+    test_thread_repro.cpp
+    # WPShaderParser.cpp + WPJson.cpp compiled directly (the glslang concurrency
+    # repro needs CompileToSpv/InitGlslang).  Mirrors the fuzz_WPShaderCompile
+    # link set instead of dragging the whole wescene-renderer lib in — wpVulkan
+    # supplies the glslang/SPIRV-Reflect symbols (host-CPU toolchain, no device).
+    ${SRC_DIR}/WPShaderParser.cpp
+    ${SRC_DIR}/WPJson.cpp
+)
+target_include_directories(backend_scene_thread_tests PRIVATE
+    ${SRC_DIR}
+    ${SRC_DIR}/Scene/include
+    ${SRC_DIR}/Scene/include/Scene
+)
+target_link_libraries(backend_scene_thread_tests PRIVATE
+    wpScene wpUtils wpFs wpVulkan wpTimer Eigen3::Eigen nlohmann_json Threads::Threads
+)
+option(WEK_THREAD_REPRO_PROVE_RACE
+       "Compile the thread repro with a deliberately racy plain shared_ptr \
+(demonstrates TSAN bites; leave OFF for the clean regression run)" OFF)
+if(WEK_THREAD_REPRO_PROVE_RACE)
+    target_compile_definitions(backend_scene_thread_tests PRIVATE
+        WEK_THREAD_REPRO_PROVE_RACE)
+endif()
+# Sibling prove-flag for the PendingUpdateQueues repro: swaps it to an
+# UNSYNCHRONISED map touched by both threads (no mutex) so TSAN must report a
+# race — proves that repro's access pattern actually bites.  Leave OFF for the
+# clean regression run.
+option(WEK_THREAD_REPRO_PROVE_RACE_QUEUE
+       "Compile the PendingUpdateQueues repro without its group mutexes \
+(demonstrates TSAN bites; leave OFF for the clean regression run)" OFF)
+if(WEK_THREAD_REPRO_PROVE_RACE_QUEUE)
+    target_compile_definitions(backend_scene_thread_tests PRIVATE
+        WEK_THREAD_REPRO_PROVE_RACE_QUEUE)
+endif()
+# Sibling prove-flag for the user-property uniform repro: the poster writes the
+# material directly, as the unqueued path did, so TSAN must report a race.
+option(WEK_THREAD_REPRO_PROVE_RACE_USERPROP
+       "Compile the user-property uniform repro with an unqueued material write \
+(demonstrates TSAN bites; leave OFF for the clean regression run)" OFF)
+if(WEK_THREAD_REPRO_PROVE_RACE_USERPROP)
+    target_compile_definitions(backend_scene_thread_tests PRIVATE
+        WEK_THREAD_REPRO_PROVE_RACE_USERPROP)
+endif()
+wek_apply_sanitizers(backend_scene_thread_tests)
+add_test(NAME backend_scene_thread_tests COMMAND backend_scene_thread_tests)
+set_tests_properties(backend_scene_thread_tests PROPERTIES TIMEOUT 300)
+
+# ── Microbenchmarks (nanobench) ──────────────────────────────────────────────
+# Separate executable from backend_scene_tests so nanobench's iteration loop
+# stays clear of doctest's case dispatcher.  Vendored single-header lives at
+# third_party/nanobench.h (MIT).  Not run by ctest -- invoked on demand by
+# scripts/preflight.sh --bench (or directly by a developer).  Output:
+# human-readable to stdout; CSV append to ${BENCH_HISTORY:-unset}.
+add_executable(backend_scene_benches
+    bench/bench_main.cpp
+    bench/bench_UniformLookupHash.cpp
+    bench/bench_RenderGraphTopo.cpp
+    bench/bench_WPShaderValueUpdater.cpp
+    # WPShaderValueUpdater.cpp pulls only stdlib + Eigen + Logging on the
+    # SetNodeData path; safe to compile in directly.  WPPuppet.cpp provides
+    # the ctor/dtor for WPPuppetLayer (embedded in WPShaderValueData).
+    ${SRC_DIR}/WPShaderValueUpdater.cpp
+    ${SRC_DIR}/WPPuppet.cpp
+    ${SRC_DIR}/Type.cpp
+)
+target_include_directories(backend_scene_benches PRIVATE
+    ${SRC_DIR}
+    ${SRC_DIR}/Scene/include
+    ${SRC_DIR}/Scene/include/Scene
+    ${SRC_DIR}/Particle/include
+)
+target_include_directories(backend_scene_benches SYSTEM PRIVATE
+    "${PROJECT_SOURCE_DIR}/third_party")
+target_link_libraries(backend_scene_benches PRIVATE
+    wpRGraph
+    wpUtils
+    wpFs
+    wpAudio
+    wpParticle
+    Eigen3::Eigen
+    nlohmann_json
+)
+# nanobench's BENCHMARK_DONT_OPTIMIZE_AWAY uses asm volatile; warn_opts +
+# -Wpedantic doesn't object but skip -Werror on the bench TU because the
+# header drags in a couple of conversion warnings on signed-vs-unsigned.
+wek_apply_sanitizers(backend_scene_benches)
+
+# Convenience target: regenerate golden GLSL fixtures.  Use after an
+# intentional change to WPShaderTransforms.h string rewrites.
+add_custom_target(shader-golden-regen
+    COMMAND ${CMAKE_COMMAND} -E env WEK_GOLDEN_REGEN=1
+            $<TARGET_FILE:backend_scene_tests>
+            --test-suite=WPShaderTransforms.golden
+    DEPENDS backend_scene_tests
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Regenerating GLSL goldens (WEK_GOLDEN_REGEN=1)"
+    VERBATIM
+)
+
+# ── Coverage report target ────────────────────────────────────────────────────
+if(COVERAGE)
+    find_program(LLVM_PROFDATA llvm-profdata REQUIRED)
+    find_program(LLVM_COV      llvm-cov      REQUIRED)
+
+    set(_cov_dir  ${CMAKE_BINARY_DIR}/coverage)
+    set(_cov_prof ${_cov_dir}/merged.profdata)
+    set(_cov_objs $<TARGET_FILE:backend_scene_tests>)
+    set(_cov_tests backend_scene_tests)
+    if(TARGET scenescript_tests)
+        list(APPEND _cov_objs -object=$<TARGET_FILE:scenescript_tests>)
+        list(APPEND _cov_tests scenescript_tests)
+    endif()
+
+    # Only report on first-party backend_scene source — strip third_party,
+    # Qt/system headers, the tests themselves, and generated moc files.
+    set(_cov_ignore
+        -ignore-filename-regex=\(^/usr/\|/Qt6/\|/third_party/\|/src/Test/\|/moc_\|_autogen/\)
+    )
+
+    add_custom_target(coverage
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${_cov_dir}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_cov_dir}
+        COMMAND ${CMAKE_COMMAND} -E env
+                LLVM_PROFILE_FILE=${_cov_dir}/%p.profraw
+                ${CMAKE_CTEST_COMMAND} --output-on-failure
+        COMMAND ${CMAKE_COMMAND} -E env bash -c
+                "${LLVM_PROFDATA} merge -sparse ${_cov_dir}/*.profraw -o ${_cov_prof}"
+        COMMAND ${LLVM_COV} report ${_cov_objs}
+                -instr-profile=${_cov_prof} ${_cov_ignore}
+        DEPENDS ${_cov_tests}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "Running backend_scene tests with coverage and generating report"
+        VERBATIM
+        USES_TERMINAL
+    )
+
+    add_custom_target(coverage-html
+        COMMAND ${LLVM_COV} show ${_cov_objs}
+                -instr-profile=${_cov_prof} ${_cov_ignore}
+                -format=html -output-dir=${_cov_dir}/html
+                -show-line-counts-or-regions
+        DEPENDS coverage
+        COMMENT "Generating HTML coverage report in ${_cov_dir}/html"
+        VERBATIM
+    )
+endif()
+
+# ── Fuzzers (libFuzzer) ──────────────────────────────────────────────────────
+# Coverage-guided fuzz harnesses around binary-format parsers. Off by default;
+# enable with -DBUILD_FUZZERS=ON (requires Clang). Each harness is a separate
+# executable so libFuzzer's main isn't linked into the regular test binary.
+if(BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "BUILD_FUZZERS requires Clang (found ${CMAKE_CXX_COMPILER_ID})")
+    endif()
+
+    set(_fuzz_san_opts -fsanitize=fuzzer,address,undefined
+                       -fno-omit-frame-pointer -g)
+
+    # EXCLUDE_FROM_ALL: fuzz binaries are slow to link (sanitizer runtimes) and
+    # most builds don't need them. Build via `cmake --build ... --target fuzzers`
+    # or by individual target name.
+    add_executable(fuzz_WPMdlParser EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPMdlParser.cpp
+        ${SRC_DIR}/WPMdlParser.cpp
+        ${SRC_DIR}/WPPuppet.cpp
+        ${SRC_DIR}/Type.cpp
+        ${SRC_DIR}/WPJson.cpp
+        ${SRC_DIR}/wpscene/WPMaterial.cpp
+        ${SRC_DIR}/wpscene/WPAnimationJson.cpp
+        ${SRC_DIR}/Scene/SceneShader.cpp
+        ${SRC_DIR}/Scene/SceneVertexArray.cpp
+        ${SRC_DIR}/Scene/SceneIndexArray.cpp
+    )
+    target_include_directories(fuzz_WPMdlParser PRIVATE
+        ${SRC_DIR}
+        ${SRC_DIR}/Scene/include
+        ${SRC_DIR}/Scene/include/Scene
+    )
+    target_link_libraries(fuzz_WPMdlParser PRIVATE
+        wpUtils wpFs Eigen3::Eigen nlohmann_json
+    )
+    target_compile_options(fuzz_WPMdlParser PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPMdlParser PRIVATE ${_fuzz_san_opts})
+
+    add_executable(fuzz_WPTexImageParser EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPTexImageParser.cpp
+        ${SRC_DIR}/WPTexImageParser.cpp
+        ${SRC_DIR}/Type.cpp
+    )
+    target_include_directories(fuzz_WPTexImageParser PRIVATE
+        ${SRC_DIR}
+        ${SRC_DIR}/Scene/include
+    )
+    # WPTexImageParser.cpp includes <stb_image.h>. The directory-scope
+    # include_directories(SYSTEM third_party) that used to satisfy this was
+    # removed in 3c55dea (target-scoped refactor); restore the path on this
+    # specific target. Mirrors the pattern backend_scene_tests uses.
+    target_include_directories(fuzz_WPTexImageParser SYSTEM PRIVATE
+        "${PROJECT_SOURCE_DIR}/third_party")
+    target_link_libraries(fuzz_WPTexImageParser PRIVATE
+        wpUtils wpFs ${LZ4_LIBRARIES} nlohmann_json
+    )
+    target_compile_options(fuzz_WPTexImageParser PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPTexImageParser PRIVATE ${_fuzz_san_opts})
+
+    add_executable(fuzz_WPPkgFs EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPPkgFs.cpp
+        ${SRC_DIR}/WPPkgFs.cpp
+    )
+    target_include_directories(fuzz_WPPkgFs PRIVATE ${SRC_DIR})
+    target_link_libraries(fuzz_WPPkgFs PRIVATE wpUtils wpFs)
+    target_compile_options(fuzz_WPPkgFs PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPPkgFs PRIVATE ${_fuzz_san_opts})
+
+    # WPShaderParser.cpp transitively references glslang via Vulkan/ShaderComp.hpp,
+    # even though only CompileToSpv actually uses it. Link wpVulkan to satisfy
+    # those symbols (heavier than the other harnesses but unavoidable without
+    # splitting the .cpp).
+    add_executable(fuzz_WPShaderParser EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPShaderParser.cpp
+        ${SRC_DIR}/WPShaderParser.cpp
+        ${SRC_DIR}/WPJson.cpp
+    )
+    target_include_directories(fuzz_WPShaderParser PRIVATE
+        ${SRC_DIR}
+        ${SRC_DIR}/Scene/include
+    )
+    target_link_libraries(fuzz_WPShaderParser PRIVATE
+        wpUtils wpFs wpVulkan nlohmann_json
+    )
+    target_compile_options(fuzz_WPShaderParser PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPShaderParser PRIVATE ${_fuzz_san_opts})
+
+    # Drives the glslang CompileToSpv path (no cache dir -> synchronous compile),
+    # which fuzz_WPShaderParser stops short of.  Same sources + link set;
+    # wpVulkan satisfies the glslang/SPIRV-Reflect symbols (host-CPU toolchain,
+    # no Vulkan device).
+    add_executable(fuzz_WPShaderCompile EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPShaderCompile.cpp
+        ${SRC_DIR}/WPShaderParser.cpp
+        ${SRC_DIR}/WPJson.cpp
+    )
+    target_include_directories(fuzz_WPShaderCompile PRIVATE
+        ${SRC_DIR}
+        ${SRC_DIR}/Scene/include
+    )
+    target_link_libraries(fuzz_WPShaderCompile PRIVATE
+        wpUtils wpFs wpVulkan nlohmann_json
+    )
+    target_compile_options(fuzz_WPShaderCompile PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPShaderCompile PRIVATE ${_fuzz_san_opts})
+
+    # Fuzzes the JSON-driven object-construction root of the scene parser
+    # (wpscene::WPScene::FromJson). Skips VFS / SoundManager / sub-parsers —
+    # those are fuzzed separately. Targets the JSON-count-driven resize sites.
+    add_executable(fuzz_WPSceneParser EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPSceneParser.cpp
+        ${SRC_DIR}/wpscene/WPScene.cpp
+        ${SRC_DIR}/wpscene/WPImageObject.cpp
+        ${SRC_DIR}/wpscene/WPAnimationJson.cpp
+        ${SRC_DIR}/wpscene/WPParticleObject.cpp
+        ${SRC_DIR}/wpscene/WPMaterial.cpp
+        ${SRC_DIR}/wpscene/WPLightObject.cpp
+        ${SRC_DIR}/wpscene/WPModelObject.cpp
+        ${SRC_DIR}/wpscene/WPTextObject.cpp
+        ${SRC_DIR}/Type.cpp
+        ${SRC_DIR}/WPJson.cpp
+    )
+    target_include_directories(fuzz_WPSceneParser PRIVATE
+        ${SRC_DIR}
+        ${SRC_DIR}/Scene/include
+    )
+    target_link_libraries(fuzz_WPSceneParser PRIVATE
+        wpUtils wpFs nlohmann_json
+    )
+    target_compile_options(fuzz_WPSceneParser PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPSceneParser PRIVATE ${_fuzz_san_opts})
+
+    add_executable(fuzz_WPParticleParser EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPParticleParser.cpp
+        ${SRC_DIR}/WPParticleParser.cpp
+        ${SRC_DIR}/wpscene/WPParticleObject.cpp
+        ${SRC_DIR}/wpscene/WPMaterial.cpp
+        ${SRC_DIR}/wpscene/WPAnimationJson.cpp
+        ${SRC_DIR}/Type.cpp
+        ${SRC_DIR}/WPJson.cpp
+    )
+    target_include_directories(fuzz_WPParticleParser PRIVATE
+        ${SRC_DIR}
+        ${SRC_DIR}/Scene/include
+        ${SRC_DIR}/Particle/include
+    )
+    # WPParticleParser.cpp transitively pulls Core/Random.hpp, which includes
+    # <effolkronium/random.hpp> in third_party. wpUtils marks third_party as
+    # SYSTEM PRIVATE so the path does not propagate to consumers; restore it on
+    # this target. Same pattern as fuzz_WPTexImageParser above.
+    target_include_directories(fuzz_WPParticleParser SYSTEM PRIVATE
+        "${PROJECT_SOURCE_DIR}/third_party")
+    target_link_libraries(fuzz_WPParticleParser PRIVATE
+        wpUtils wpFs wpParticle nlohmann_json
+    )
+    target_compile_options(fuzz_WPParticleParser PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPParticleParser PRIVATE ${_fuzz_san_opts})
+
+    # WPSoundObject is header-only; no parser .cpp to compile in.
+    # Just need WPJson for the GET_JSON_* helpers used by FromJson.
+    add_executable(fuzz_WPSoundParser EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPSoundParser.cpp
+        ${SRC_DIR}/WPJson.cpp
+    )
+    target_include_directories(fuzz_WPSoundParser PRIVATE ${SRC_DIR})
+    target_link_libraries(fuzz_WPSoundParser PRIVATE
+        wpUtils wpFs nlohmann_json
+    )
+    target_compile_options(fuzz_WPSoundParser PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPSoundParser PRIVATE ${_fuzz_san_opts})
+
+    # Drives the SAX-driven ParseJson gate (depth / element / byte caps +
+    # lenient cleanup pipeline).  Small TU set: only WPJson.cpp itself.
+    add_executable(fuzz_WPJsonParse EXCLUDE_FROM_ALL
+        fuzz/fuzz_WPJsonParse.cpp
+        ${SRC_DIR}/WPJson.cpp
+    )
+    target_include_directories(fuzz_WPJsonParse PRIVATE ${SRC_DIR})
+    target_link_libraries(fuzz_WPJsonParse PRIVATE
+        wpUtils wpFs nlohmann_json
+    )
+    target_compile_options(fuzz_WPJsonParse PRIVATE ${_fuzz_san_opts})
+    target_link_options(fuzz_WPJsonParse PRIVATE ${_fuzz_san_opts})
+
+    # Convenience: build all fuzz harnesses with one target.
+    add_custom_target(fuzzers DEPENDS
+        fuzz_WPMdlParser fuzz_WPTexImageParser fuzz_WPPkgFs
+        fuzz_WPShaderParser fuzz_WPShaderCompile fuzz_WPSceneParser
+        fuzz_WPParticleParser fuzz_WPSoundParser fuzz_WPJsonParse)
+endif()

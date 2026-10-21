@@ -1,0 +1,196 @@
+#include "SceneImageEffectLayer.h"
+#include "SceneNode.h"
+#include "SceneMaterial.h"
+#include "SceneShader.h"
+
+#include "SpecTexs.hpp"
+#include "Core/StringHelper.hpp"
+#include "Utils/Logging.h"
+
+#include <cassert>
+
+using namespace wallpaper;
+
+SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, std::string_view pingpong_a,
+                                             std::string_view pingpong_b)
+    : m_worldNode(node),
+      m_pingpong_a(pingpong_a),
+      m_pingpong_b(pingpong_b),
+      m_final_mesh(std::make_unique<SceneMesh>()),
+      m_final_node(std::make_unique<SceneNode>()) {};
+
+std::size_t SceneImageEffectLayer::RemoveFailedEffects() {
+    std::size_t removed = 0;
+    auto it = m_effects.begin();
+    while (it != m_effects.end()) {
+        bool any_compiled = false;
+        for (auto& n : (*it)->nodes) {
+            if (! n.sceneNode || ! n.sceneNode->HasMaterial()) continue;
+            auto* mat = n.sceneNode->Mesh()->Material();
+            auto& shader = mat->customShader.shader;
+            if (shader && ! shader->codes.empty()) {
+                any_compiled = true;
+                break;
+            }
+        }
+        if (! any_compiled && ! (*it)->nodes.empty()) {
+            LOG_INFO("RemoveFailedEffects: dropping effect '%s' (%zu node(s)) — "
+                     "no node compiled successfully",
+                     (*it)->name.c_str(),
+                     (*it)->nodes.size());
+            it = m_effects.erase(it);
+            removed++;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
+void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
+                                          std::string_view effect_cam) {
+    std::string_view ppong_a = m_pingpong_a, ppong_b = m_pingpong_b;
+    auto             swap_pp = [&ppong_a, &ppong_b]() {
+        std::swap(ppong_a, ppong_b);
+    };
+    auto default_node = SceneNode();
+
+    SceneImageEffectNode* last_output { nullptr };
+    for (auto& eff : m_effects) {
+        eff->chain_input  = std::string(ppong_a);
+        eff->chain_writer = nullptr;
+        for (auto& cmd : eff->commands) {
+            if (sstart_with(cmd.src, WE_EFFECT_PPONG_PREFIX_A)) cmd.src = ppong_a;
+
+            if (sstart_with(cmd.dst, WE_EFFECT_PPONG_PREFIX_A)) cmd.dst = ppong_a;
+        }
+        for (auto it = eff->nodes.begin(); it != eff->nodes.end(); it++) {
+            const bool is_chain_output =
+                sstart_with(it->output, WE_EFFECT_PPONG_PREFIX_B) || it->output == SpecTex_Default;
+            if (is_chain_output) {
+                it->output  = ppong_b;
+                last_output = &(*it);
+            }
+
+            // Explicit guard replacing a data-driven assert stripped under
+            // -DNDEBUG: an effect-layer node with no material would null-deref
+            // on the Material() dereference below (segfault → desktop death).
+            if (! it->sceneNode->HasMaterial()) {
+                LOG_ERROR("effect-layer node has no material, skipping");
+                continue;
+            }
+
+            // Only a node that gets a render pass can do a copy.
+            if (is_chain_output) eff->chain_writer = it->sceneNode.get();
+
+            auto& material = *(it->sceneNode->Mesh()->Material());
+            {
+                material.blenmode = BlendMode::Normal;
+                it->sceneNode->SetCamera(effect_cam.data());
+                it->sceneNode->CopyTrans(default_node);
+                it->sceneNode->Mesh()->ChangeMeshDataFrom(default_mesh);
+            }
+
+            auto& texs = material.textures;
+            std::replace_if(
+                texs.begin(),
+                texs.end(),
+                [](auto& t) {
+                    return sstart_with(t, WE_EFFECT_PPONG_PREFIX_A);
+                },
+                ppong_a);
+        }
+        swap_pp();
+    }
+    if (last_output != nullptr) {
+        // Offscreen nodes write to a per-node RT to avoid compositing into the main scene;
+        // their output is still accessible via id_link_map for dependent effects.
+        last_output->output =
+            m_is_offscreen ? GenOffscreenRT(m_worldNode->ID()) : std::string(SpecTex_Default);
+        auto& mesh     = *(last_output->sceneNode->Mesh());
+        auto& material = *mesh.Material();
+        {
+            material.blenmode = m_final_blend;
+            if (m_is_offscreen) {
+                // Force Normal blend so the first write uses DONT_CARE load op
+                // instead of LOAD on an uninitialized render target (Vulkan UB).
+                material.blenmode = BlendMode::Normal;
+                // Offscreen nodes render their final effect into a dedicated RT.
+                // Use the "effect" camera (2x2 ortho at origin) with the default
+                // mesh and identity transform so the output fills the entire RT.
+                // Cannot use the layer camera here because it has the imgEffect
+                // attached, which would cause ToGraphPass to recursively re-process
+                // the same effect chain.  The global camera would clip content
+                // since offscreen positions are outside its visible area.
+                last_output->sceneNode->SetCamera(std::string(effect_cam));
+                last_output->sceneNode->CopyTrans(default_node);
+                mesh.ChangeMeshDataFrom(default_mesh);
+            } else if (m_passthrough) {
+                // Passthrough compose layers capture the background and run
+                // effects (blend, fisheye, opacity mask) on it.  The final
+                // output uses the compose layer's world-space position so the
+                // result appears at the correct location and size on screen.
+                // The opacity/planet-mask effect clips to alpha=0 outside the
+                // globe, so Normal blend leaves the rest of the screen intact.
+                last_output->sceneNode->SetCamera(m_final_camera);
+                last_output->sceneNode->CopyTrans(*m_final_node);
+                if (m_inherit_parent) {
+                    if (m_parent_proxy) {
+                        last_output->sceneNode->SetParent(m_parent_proxy.get());
+                    } else {
+                        last_output->sceneNode->InheritParent(*m_worldNode);
+                    }
+                }
+                mesh.ChangeMeshDataFrom(*m_final_mesh);
+            } else {
+                last_output->sceneNode->SetCamera(m_final_camera);
+                // Copy the saved local transform from m_final_node
+                // (m_worldNode may have been reset to identity for non-compose layers).
+                last_output->sceneNode->CopyTrans(*m_final_node);
+                // When the image layer has a parent group, inherit that parent so
+                // UpdateTrans() chains the group transform into the world matrix.
+                if (m_inherit_parent) {
+                    if (m_parent_proxy) {
+                        last_output->sceneNode->SetParent(m_parent_proxy.get());
+                    } else {
+                        last_output->sceneNode->InheritParent(*m_worldNode);
+                    }
+                }
+                mesh.ChangeMeshDataFrom(*m_final_mesh);
+            }
+        }
+        // Store the resolved final output node so property script updates
+        // can target it directly (the world node stays at identity for the
+        // base render into the ping-pong buffer).
+        m_resolved_last_output = last_output->sceneNode.get();
+
+        auto& t = m_final_node->Translate();
+        // World transform and mesh extent of the node that actually composites.
+        // A composite mesh is sized in layer pixels; if it lands in a scene
+        // whose world is a fraction of a unit across, it swallows the frame.
+        m_resolved_last_output->UpdateTrans();
+        const auto& cw = m_resolved_last_output->ModelTrans();
+        const double wx = cw(0, 3);
+        const double wy = cw(1, 3);
+        const double wz = cw(2, 3);
+        const double sx = cw.topLeftCorner<3, 3>().col(0).norm();
+        LOG_INFO("ResolveEffect final: output='%.*s' blend=%d (actual=%d) passthrough=%d "
+                 "inherit_parent=%d offscreen=%d translate=(%.1f,%.1f,%.1f) worldNode_id=%d "
+                 "world=(%.3f,%.3f,%.3f) world_scale=%.4f",
+                 (int)last_output->output.size(),
+                 last_output->output.data(),
+                 (int)m_final_blend,
+                 (int)material.blenmode,
+                 m_passthrough,
+                 m_inherit_parent,
+                 m_is_offscreen,
+                 t[0],
+                 t[1],
+                 t[2],
+                 m_worldNode->ID(),
+                 wx,
+                 wy,
+                 wz,
+                 sx);
+    }
+}

@@ -1,0 +1,1566 @@
+#include <doctest.h>
+
+#include "Particle/ParticleSystem.h"
+#include "Particle/ParticleEmitter.h"
+#include "WPMapSequenceParse.hpp"
+#include "Scene/Scene.h"
+#include "Scene/SceneMesh.h"
+
+#include <memory>
+
+using namespace wallpaper;
+
+// ===========================================================================
+// ParticleInstance — pure data container, no rendering needed.
+// ===========================================================================
+
+TEST_SUITE("ParticleInstance") {
+    TEST_CASE("default state is alive with live particles") {
+        ParticleInstance inst;
+        CHECK_FALSE(inst.IsDeath());
+        CHECK_FALSE(inst.IsNoLiveParticle());
+        CHECK(inst.Particles().size() == 0);
+    }
+
+    TEST_CASE("SetDeath / SetNoLiveParticle roundtrip") {
+        ParticleInstance inst;
+        inst.SetDeath(true);
+        CHECK(inst.IsDeath());
+        inst.SetNoLiveParticle(true);
+        CHECK(inst.IsNoLiveParticle());
+    }
+
+    TEST_CASE("Refresh resets death flags and clears particles") {
+        ParticleInstance inst;
+        inst.SetDeath(true);
+        inst.SetNoLiveParticle(true);
+        inst.ParticlesVec().emplace_back();
+        inst.GetBoundedData().particle_idx = 17;
+        REQUIRE(inst.Particles().size() == 1);
+
+        inst.Refresh();
+        CHECK_FALSE(inst.IsDeath());
+        CHECK_FALSE(inst.IsNoLiveParticle());
+        CHECK(inst.Particles().size() == 0);
+        CHECK(inst.GetBoundedData().particle_idx == -1);
+    }
+
+    TEST_CASE("ParticlesVec is a mutable reference") {
+        ParticleInstance inst;
+        inst.ParticlesVec().emplace_back();
+        inst.ParticlesVec().emplace_back();
+        CHECK(inst.Particles().size() == 2);
+    }
+
+    TEST_CASE("GetEventParentParticle returns null without parent or with negative index") {
+        ParticleInstance inst;
+        CHECK(inst.GetEventParentParticle() == nullptr);
+        // Synthesise a "parent set, index unset" state: the helper must still reject -1.
+        ParticleInstance fake_parent;
+        fake_parent.ParticlesVec().emplace_back();
+        inst.GetBoundedData().parent       = &fake_parent;
+        inst.GetBoundedData().particle_idx = -1;
+        CHECK(inst.GetEventParentParticle() == nullptr);
+    }
+
+    TEST_CASE("GetEventParentParticle returns null when index is out of range") {
+        ParticleInstance parent;
+        parent.ParticlesVec().resize(2);
+        ParticleInstance child;
+        child.GetBoundedData().parent       = &parent;
+        child.GetBoundedData().particle_idx = 5;
+        CHECK(child.GetEventParentParticle() == nullptr);
+    }
+
+    TEST_CASE("GetEventParentParticle returns null when the parent particle is dead") {
+        ParticleInstance parent;
+        parent.ParticlesVec().resize(1);
+        parent.ParticlesVec()[0].lifetime = 0.0f;
+        ParticleInstance child;
+        child.GetBoundedData().parent       = &parent;
+        child.GetBoundedData().particle_idx = 0;
+        CHECK(child.GetEventParentParticle() == nullptr);
+    }
+
+    TEST_CASE("GetEventParentParticle returns the live parent particle") {
+        ParticleInstance parent;
+        parent.ParticlesVec().resize(2);
+        parent.ParticlesVec()[1].lifetime = 1.5f;
+        parent.ParticlesVec()[1].size     = 42.0f;
+        ParticleInstance child;
+        child.GetBoundedData().parent       = &parent;
+        child.GetBoundedData().particle_idx = 1;
+        const Particle* p                   = child.GetEventParentParticle();
+        REQUIRE(p != nullptr);
+        CHECK(p->lifetime == doctest::Approx(1.5f));
+        CHECK(p->size == doctest::Approx(42.0f));
+    }
+
+} // ParticleInstance
+
+// ===========================================================================
+// ParticleSubSystem — exercising the non-render-path methods.
+// A Scene + ParticleSystem is created locally; gener stays null so any code
+// path that touches it (only the VertexCount>0 branch in Emitt) is avoided.
+// ===========================================================================
+
+namespace
+{
+
+struct ParticleFixture {
+    Scene                           scene;
+    std::unique_ptr<ParticleSystem> psys;
+    std::shared_ptr<SceneMesh>      mesh;
+
+    ParticleFixture() {
+        psys = std::make_unique<ParticleSystem>(scene);
+        mesh = std::make_shared<SceneMesh>(true);
+    }
+
+    std::unique_ptr<ParticleSubSystem>
+    makeSub(uint32_t maxcount = 10, double rate = 1.0, u32 maxcount_instance = 4,
+            double                       probability = 1.0,
+            ParticleSubSystem::SpawnType type        = ParticleSubSystem::SpawnType::STATIC,
+            float                        starttime   = 0.0f) {
+        return std::make_unique<ParticleSubSystem>(
+            *psys, mesh, maxcount, rate, maxcount_instance, probability, type, nullptr, starttime);
+    }
+};
+
+} // namespace
+
+TEST_SUITE("ParticleSubSystem") {
+    TEST_CASE("Type and MaxInstanceCount reflect constructor args") {
+        ParticleFixture fx;
+        auto sub = fx.makeSub(100, 2.0, 8, 1.0, ParticleSubSystem::SpawnType::EVENT_SPAWN);
+        CHECK(sub->Type() == ParticleSubSystem::SpawnType::EVENT_SPAWN);
+        CHECK(sub->MaxInstanceCount() == 8u);
+    }
+
+    TEST_CASE("Controlpoints default to 8 unlinked entries") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        auto            cps = sub->Controlpoints();
+        CHECK(cps.size() == 8);
+        for (const auto& cp : cps) {
+            CHECK_FALSE(cp.link_mouse);
+            CHECK_FALSE(cp.worldspace);
+        }
+    }
+
+    TEST_CASE("Controlpoints default runtime_flags to 0 (no operator has touched them yet)") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        auto            cps = sub->Controlpoints();
+        for (const auto& cp : cps) {
+            CHECK(cp.runtime_flags == 0u);
+        }
+    }
+
+    TEST_CASE("MarkCpReferenced ORs kCpReferencedFlag onto only the named slot") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->MarkCpReferenced(2);
+        sub->MarkCpReferenced(5);
+        auto cps = sub->Controlpoints();
+        CHECK((cps[2].runtime_flags & kCpReferencedFlag) != 0u);
+        CHECK((cps[5].runtime_flags & kCpReferencedFlag) != 0u);
+        CHECK((cps[0].runtime_flags & kCpReferencedFlag) == 0u);
+        CHECK((cps[1].runtime_flags & kCpReferencedFlag) == 0u);
+        CHECK((cps[7].runtime_flags & kCpReferencedFlag) == 0u);
+    }
+
+    TEST_CASE("MarkCpReferenced is idempotent — same slot, multiple calls, one bit") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->MarkCpReferenced(3);
+        sub->MarkCpReferenced(3);
+        sub->MarkCpReferenced(3);
+        auto cps = sub->Controlpoints();
+        CHECK((cps[3].runtime_flags & kCpReferencedFlag) != 0u);
+        // Only the high bit; lower authored bits remain untouched.
+        CHECK((cps[3].runtime_flags & 0xffu) == 0u);
+    }
+
+    TEST_CASE("MarkCpReferenced clamps out-of-range indices to 0..7") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->MarkCpReferenced(99); // → slot 7
+        sub->MarkCpReferenced(-3); // → slot 0
+        auto cps = sub->Controlpoints();
+        CHECK((cps[7].runtime_flags & kCpReferencedFlag) != 0u);
+        CHECK((cps[0].runtime_flags & kCpReferencedFlag) != 0u);
+    }
+
+    TEST_CASE("CpStartShift defaults to 0 (no shift on bare subsystems)") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        CHECK(sub->CpStartShift() == 0);
+    }
+
+    TEST_CASE("SetCpStartShift / CpStartShift roundtrip stores the authored value") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->SetCpStartShift(3);
+        CHECK(sub->CpStartShift() == 3);
+    }
+
+    TEST_CASE("Resolver applies CpStartShift to slots whose authored parent_cp_index is 0") {
+        // Mirrors the WE child-container semantic: the child's CP[i] resolves through
+        // the parent's CP[i + shift] when the child didn't explicitly declare a parent.
+        ParticleFixture fx;
+        auto            parent = fx.makeSub();
+        auto            child  = fx.makeSub();
+        // Parent CP[2] sits at (50, 60, 70); resolved=offset by default.
+        parent->Controlpoints()[2].offset = Eigen::Vector3d(50, 60, 70);
+        parent->Controlpoints()[2].resolved = Eigen::Vector3d(50, 60, 70);
+        // Child has authored parent_cp_index=0 (the WE editor default), shift=2.
+        // Authored value MUST survive parse and the resolver layers the shift on top.
+        child->Controlpoints()[0].parent_cp_index = 0;
+        child->SetCpStartShift(2);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        child_raw->ResolveControlpointsForInstance(nullptr);
+        CHECK(child_raw->Controlpoints()[0].resolved.x() == doctest::Approx(50.0));
+        CHECK(child_raw->Controlpoints()[0].resolved.y() == doctest::Approx(60.0));
+        CHECK(child_raw->Controlpoints()[0].resolved.z() == doctest::Approx(70.0));
+    }
+
+    TEST_CASE("Resolver leaves authored parent_cp_index alone when CpStartShift is 0") {
+        ParticleFixture fx;
+        auto            parent = fx.makeSub();
+        auto            child  = fx.makeSub();
+        parent->Controlpoints()[5].offset   = Eigen::Vector3d(11, 22, 33);
+        parent->Controlpoints()[5].resolved = Eigen::Vector3d(11, 22, 33);
+        // Child authored an explicit parent_cp_index — no shift.
+        child->Controlpoints()[1].parent_cp_index = 5;
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        child_raw->ResolveControlpointsForInstance(nullptr);
+        CHECK(child_raw->Controlpoints()[1].resolved.x() == doctest::Approx(11.0));
+        CHECK(child_raw->Controlpoints()[1].resolved.y() == doctest::Approx(22.0));
+        CHECK(child_raw->Controlpoints()[1].resolved.z() == doctest::Approx(33.0));
+    }
+
+    TEST_CASE("Explicit parent_cp_index wins over CpStartShift (no double-shift)") {
+        ParticleFixture fx;
+        auto            parent = fx.makeSub();
+        auto            child  = fx.makeSub();
+        parent->Controlpoints()[3].offset   = Eigen::Vector3d(1, 2, 3);
+        parent->Controlpoints()[3].resolved = Eigen::Vector3d(1, 2, 3);
+        // Child explicitly chose parent CP[3]; shift would otherwise add 2 → CP[5].
+        // Author intent must win.
+        child->Controlpoints()[0].parent_cp_index = 3;
+        child->SetCpStartShift(2);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        child_raw->ResolveControlpointsForInstance(nullptr);
+        CHECK(child_raw->Controlpoints()[0].resolved.x() == doctest::Approx(1.0));
+        CHECK(child_raw->Controlpoints()[0].resolved.y() == doctest::Approx(2.0));
+        CHECK(child_raw->Controlpoints()[0].resolved.z() == doctest::Approx(3.0));
+    }
+
+    TEST_CASE("worldspace CP keeps its local offset and ignores parent chain") {
+        ParticleFixture fx;
+        auto            parent = fx.makeSub();
+        auto            child  = fx.makeSub();
+        parent->Controlpoints()[2].offset   = Eigen::Vector3d(99, 99, 99);
+        parent->Controlpoints()[2].resolved = Eigen::Vector3d(99, 99, 99);
+        // Child authored a chain to parent CP[2] but flagged the slot as
+        // worldspace — the resolver must NOT walk the chain.
+        child->Controlpoints()[0].parent_cp_index = 2;
+        child->Controlpoints()[0].worldspace      = true;
+        child->Controlpoints()[0].offset          = Eigen::Vector3d(10, 0, 0);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        child_raw->ResolveControlpointsForInstance(nullptr);
+        CHECK(child_raw->Controlpoints()[0].resolved.x() == doctest::Approx(10.0));
+        CHECK(child_raw->Controlpoints()[0].resolved.y() == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("worldspace CP also ignores follow_parent_particle binding") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].follow_parent_particle = true;
+        sub->Controlpoints()[0].worldspace             = true;
+        sub->Controlpoints()[0].offset                 = Eigen::Vector3d(7, 8, 9);
+        // Bound parent particle at (50, 60, 70) — would normally win, but
+        // worldspace overrides it.
+        ParticleInstance fake_parent;
+        fake_parent.ParticlesVec().resize(1);
+        ParticleInstance host_inst;
+        host_inst.GetBoundedData().parent       = &fake_parent;
+        host_inst.GetBoundedData().particle_idx = 0;
+        host_inst.GetBoundedData().pos          = Eigen::Vector3f(50, 60, 70);
+
+        sub->ResolveControlpointsForInstance(&host_inst);
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(7.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(8.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(9.0));
+    }
+
+    TEST_CASE("AddEmitter/AddInitializer/AddOperator store callables that Emitt dispatches") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+
+        // Nothing calls the initializer directly: Emitt hands the registered list
+        // to each emitter, which applies it to the particle it spawns.  So a
+        // marker lifetime on the spawned particle proves both registrations
+        // landed and that Emitt wired them together.
+        sub->AddInitializer([](Particle& p, double) {
+            p.lifetime = 7.0f;
+        });
+        size_t inits_seen = 0;
+        sub->AddEmitter([&inits_seen](std::vector<Particle>&       particles,
+                                      std::vector<ParticleInitOp>& inits,
+                                      uint32_t                     maxcount,
+                                      double) {
+            inits_seen = inits.size();
+            if (particles.size() >= maxcount) return;
+            Particle p;
+            for (auto& init : inits) init(p, 0.0);
+            particles.push_back(p);
+        });
+        // Operators run after the per-particle update, so this alpha outlives the
+        // ParticleModify::Reset that restores init.alpha (1.0) every tick.
+        sub->AddOperator([](const ParticleInfo& info) {
+            for (auto& p : info.particles) p.alpha = 0.25f;
+        });
+
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+
+        REQUIRE(sub->Instances().size() == 1);
+        const auto& particles = sub->Instances().front()->ParticlesVec();
+        REQUIRE(particles.size() == 1);
+        CHECK(inits_seen == 1);
+        // 7.0 from the initializer, minus the one tick the update loop aged it.
+        CHECK(particles[0].lifetime == doctest::Approx(7.0f - 0.016f));
+        CHECK(particles[0].alpha == doctest::Approx(0.25f));
+    }
+
+    TEST_CASE("AddChild links the parent, and Reset cascades into the child") {
+        ParticleFixture fx;
+        auto            sub       = fx.makeSub();
+        auto            child     = fx.makeSub();
+        auto*           child_raw = child.get();
+        sub->AddChild(std::move(child));
+        CHECK(child_raw->ParentSubsystem() == sub.get());
+
+        // Dirty the child so the cascade has something to undo: a spent instance
+        // holding particles with both death flags latched.
+        auto* inst = child_raw->QueryNewInstance();
+        REQUIRE(inst != nullptr);
+        inst->ParticlesVec().resize(2);
+        inst->SetDeath(true);
+        inst->SetNoLiveParticle(true);
+
+        sub->Reset();
+
+        // Reset -> child->Reset() -> instance Refresh(): re-armed, ready to emit.
+        CHECK(inst->ParticlesVec().empty());
+        CHECK_FALSE(inst->IsDeath());
+        CHECK_FALSE(inst->IsNoLiveParticle());
+    }
+
+    TEST_CASE("QueryNewInstance grows the pool up to max, then returns nullptr") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub(10, 1.0, 3, 1.0); // max 3 instances
+        auto*           a   = sub->QueryNewInstance();
+        auto*           b   = sub->QueryNewInstance();
+        auto*           c   = sub->QueryNewInstance();
+        REQUIRE(a != nullptr);
+        REQUIRE(b != nullptr);
+        REQUIRE(c != nullptr);
+        CHECK(a != b);
+        CHECK(b != c);
+        // Pool full; next call returns nullptr.
+        CHECK(sub->QueryNewInstance() == nullptr);
+    }
+
+    TEST_CASE("QueryNewInstance reuses dead+no-live instance") {
+        ParticleFixture fx;
+        auto            sub   = fx.makeSub(10, 1.0, 1, 1.0); // pool of 1
+        auto*           first = sub->QueryNewInstance();
+        REQUIRE(first != nullptr);
+
+        // Pool full; further query while first is alive returns nullptr.
+        CHECK(sub->QueryNewInstance() == nullptr);
+
+        // Kill the first instance, then the pool should reuse its slot.
+        first->SetDeath(true);
+        first->SetNoLiveParticle(true);
+        auto* recycled = sub->QueryNewInstance();
+        CHECK(recycled == first);
+    }
+
+    TEST_CASE("QueryNewInstance with probability=0 always returns nullptr") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub(10, 1.0, 4, 0.0); // never spawns
+        for (int i = 0; i < 5; i++) CHECK(sub->QueryNewInstance() == nullptr);
+    }
+
+    TEST_CASE("UpdateMouseControlPoints only writes to link_mouse CPs and recurses") {
+        ParticleFixture fx;
+        auto            sub   = fx.makeSub();
+        auto            child = fx.makeSub();
+
+        // Arrange: mark CP[0] link_mouse in both sub and child, leave others alone.
+        sub->Controlpoints()[0].link_mouse   = true;
+        child->Controlpoints()[0].link_mouse = true;
+
+        auto* child_raw = child.get();
+        sub->AddChild(std::move(child));
+
+        sub->UpdateMouseControlPoints(7.5, -3.25);
+
+        CHECK(sub->Controlpoints()[0].offset.x() == doctest::Approx(7.5));
+        CHECK(sub->Controlpoints()[0].offset.y() == doctest::Approx(-3.25));
+        // Non-linked CP stays at default (0, 0, 0)
+        CHECK(sub->Controlpoints()[1].offset.x() == doctest::Approx(0.0));
+        // Recursion reached the child
+        CHECK(child_raw->Controlpoints()[0].offset.x() == doctest::Approx(7.5));
+    }
+
+    TEST_CASE("burst_done flag: false before Emitt; ClearBurstDone resets it") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        CHECK_FALSE(sub->IsBurstDone());
+        // Without invoking the full Emitt path (which needs render data),
+        // we simulate the burst-end transition by toggling via public API.
+        sub->ClearBurstDone();
+        CHECK_FALSE(sub->IsBurstDone());
+    }
+
+} // ParticleSubSystem
+
+// ===========================================================================
+// ParticleSystem top-level — subsystems vector and mouse CP plumbing.
+// ===========================================================================
+
+TEST_SUITE("ParticleSystem") {
+    TEST_CASE("empty subsystem list: Emitt is a no-op") {
+        Scene          scene;
+        ParticleSystem ps(scene);
+        ps.Emitt(); // should not crash
+        CHECK(ps.subsystems.size() == 0);
+    }
+
+    TEST_CASE("UpdateMouseControlPoints converts to scene coordinates") {
+        Scene          scene;
+        ParticleSystem ps(scene);
+        auto           mesh = std::make_shared<SceneMesh>(true);
+        auto           sub  = std::make_unique<ParticleSubSystem>(
+            ps, mesh, 10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC, nullptr, 0);
+        sub->Controlpoints()[0].link_mouse = true;
+        auto* sub_raw                      = sub.get();
+        ps.subsystems.push_back(std::move(sub));
+
+        // mousePos (0.5, 0.5) → scene origin (0, 0)
+        ps.UpdateMouseControlPoints({ 0.5f, 0.5f }, { 1920, 1080 });
+        CHECK(sub_raw->Controlpoints()[0].offset.x() == doctest::Approx(0.0));
+        CHECK(sub_raw->Controlpoints()[0].offset.y() == doctest::Approx(0.0));
+
+        // mousePos (1.0, 0.0) → (+half_width, +half_height) — Y is flipped
+        ps.UpdateMouseControlPoints({ 1.0f, 0.0f }, { 1920, 1080 });
+        CHECK(sub_raw->Controlpoints()[0].offset.x() == doctest::Approx(960.0));
+        CHECK(sub_raw->Controlpoints()[0].offset.y() == doctest::Approx(540.0));
+
+        // mousePos (0.0, 1.0) → (-half_width, -half_height)
+        ps.UpdateMouseControlPoints({ 0.0f, 1.0f }, { 1920, 1080 });
+        CHECK(sub_raw->Controlpoints()[0].offset.x() == doctest::Approx(-960.0));
+        CHECK(sub_raw->Controlpoints()[0].offset.y() == doctest::Approx(-540.0));
+    }
+
+    TEST_CASE("Emitt before starttime skips the subsystem") {
+        Scene scene;
+        scene.elapsingTime = 0.0; // starts at 0
+        ParticleSystem ps(scene);
+        auto           mesh = std::make_shared<SceneMesh>(true);
+        auto           sub  = std::make_unique<ParticleSubSystem>(ps,
+                                                       mesh,
+                                                       10,
+                                                       1.0,
+                                                       1,
+                                                       1.0,
+                                                       ParticleSubSystem::SpawnType::STATIC,
+                                                       nullptr,
+                                                       /*starttime=*/100);
+        auto*          sub_raw = sub.get();
+        ps.subsystems.push_back(std::move(sub));
+
+        // elapsingTime < starttime → subsystem's Emitt returns early,
+        // no instances are created for STATIC.
+        ps.Emitt();
+        CHECK(sub_raw->Instances().size() == 0);
+        // After starttime passes, Emitt enters the STATIC body and auto-creates
+        // the single instance.  Since we have no emitters and no vertex array,
+        // this is a safe code path with no rendering.
+        scene.PassFrameTime(1.0);
+        scene.elapsingTime = 200.0; // jump past starttime directly
+        ps.Emitt();
+        CHECK(sub_raw->Instances().size() == 1);
+    }
+
+} // ParticleSystem
+
+// ===========================================================================
+// Emitt — exercises the full per-frame loop body with a real emitter + operator.
+// ===========================================================================
+
+TEST_SUITE("ParticleSubSystem.Emitt") {
+    // Push one particle with non-zero lifetime when called.
+    static ParticleEmittOp makePushOneEmitter() {
+        return [](std::vector<Particle>&       particles,
+                  std::vector<ParticleInitOp>& inits,
+                  uint32_t                     maxcount,
+                  double /*timepass*/) {
+            if (particles.size() >= maxcount) return;
+            Particle p;
+            p.lifetime = 10.0f;
+            // Run any initializers registered alongside the emitter.
+            for (auto& init : inits) init(p, 0.0);
+            particles.push_back(p);
+        };
+    }
+
+    TEST_CASE("STATIC subsystem with push-one emitter grows particle vector over frames") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        sub->AddEmitter(makePushOneEmitter());
+
+        // A simple operator that increments each particle's lifetime by 0.01.
+        sub->AddOperator([](const ParticleInfo& info) {
+            for (auto& p : info.particles) p.lifetime += 0.01f;
+        });
+
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        REQUIRE(sub->Instances().size() == 1);
+        auto* inst = sub->Instances().front().get();
+        CHECK(inst->ParticlesVec().size() == 1);
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        CHECK(inst->ParticlesVec().size() == 2);
+        // Emitter keeps pushing until maxcount reached
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        CHECK(inst->ParticlesVec().size() == 3);
+    }
+
+    TEST_CASE("spritetrail STATIC: trail history grows alongside particles") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub(4, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        sub->SetSpriteTrail(8, 1.0f);
+        sub->AddEmitter(makePushOneEmitter());
+
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        REQUIRE(sub->Instances().size() == 1);
+        auto* inst = sub->Instances().front().get();
+        CHECK(inst->ParticlesVec().size() == 1);
+        CHECK(inst->TrailHistories().size() == 1);
+        CHECK(inst->TrailHistories()[0].Capacity() == 8u);
+        CHECK(inst->TrailHistories()[0].MaxAge() == doctest::Approx(1.0f));
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        CHECK(inst->ParticlesVec().size() == 2);
+        CHECK(inst->TrailHistories().size() == 2);
+    }
+
+    TEST_CASE("Child EVENT_SPAWN subsystem is nudged to spawn from parent's new particles") {
+        ParticleFixture fx;
+        auto            parent = fx.makeSub(3, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        parent->AddEmitter(makePushOneEmitter());
+
+        auto  child     = fx.makeSub(3, 1.0, 2, 1.0, ParticleSubSystem::SpawnType::EVENT_SPAWN);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        CHECK(child_raw->Instances().size() == 0);
+        fx.scene.PassFrameTime(0.016);
+        parent->Emitt();
+        // After one frame, parent has pushed exactly one particle; spawn_inst
+        // should have queried the child pool once for it.
+        CHECK(child_raw->Instances().size() == 1);
+    }
+
+    TEST_CASE("Child EVENT_DEATH fires when parent particles die") {
+        ParticleFixture fx;
+        auto            parent = fx.makeSub(3, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        // Push particles that die quickly (lifetime ≤ frame time).
+        parent->AddEmitter(
+            [](std::vector<Particle>& ps, std::vector<ParticleInitOp>&, uint32_t max, double) {
+                if (ps.size() >= max) return;
+                Particle p;
+                p.lifetime = 0.001f;
+                ps.push_back(p);
+            });
+
+        auto  child     = fx.makeSub(3, 1.0, 2, 1.0, ParticleSubSystem::SpawnType::EVENT_DEATH);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        CHECK(child_raw->Instances().size() == 0);
+        fx.scene.PassFrameTime(0.032);
+        parent->Emitt();
+        // The particle pushed this tick has lifetime 0.001, far under the 0.032
+        // tick, so it dies within the same Emitt() call that spawns it — the
+        // EVENT_DEATH dispatch fires on tick 1 already, not tick 2.
+        CHECK(child_raw->Instances().size() == 1);
+        fx.scene.PassFrameTime(0.032);
+        parent->Emitt();
+        // Tick 2's own freshly-pushed particle dies the same way, firing a
+        // second, independent EVENT_DEATH dispatch that grows the pool again.
+        CHECK(child_raw->Instances().size() == 2);
+    }
+
+    TEST_CASE("Controlpoints const-overload") {
+        ParticleFixture fx;
+        auto            sub       = fx.makeSub();
+        const auto&     const_sub = *sub;
+        auto            cps       = const_sub.Controlpoints();
+        CHECK(cps.size() == 8);
+    }
+
+} // ParticleSubSystem.Emitt
+
+// ===========================================================================
+// Audio-reactive emit-rate (audioprocessingmode wiring)
+// ===========================================================================
+TEST_SUITE("ParticleSubSystem.AudioReactive") {
+
+    // Emitter that records the emitDur it was called with — sums across calls.
+    static ParticleEmittOp makeTallyEmitter(double* total) {
+        return [total](std::vector<wallpaper::Particle>&,
+                       std::vector<wallpaper::ParticleInitOp>&,
+                       uint32_t,
+                       double emitDur) { *total += emitDur; };
+    }
+
+    TEST_CASE("default flag is false and multiplier is 1.0") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        CHECK_FALSE(sub->IsAudioReactive());
+        CHECK(sub->AudioRateMultiplier() == doctest::Approx(1.0));
+    }
+
+    TEST_CASE("MarkAudioReactive flips flag without changing multiplier") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->MarkAudioReactive();
+        CHECK(sub->IsAudioReactive());
+        CHECK(sub->AudioRateMultiplier() == doctest::Approx(1.0));
+    }
+
+    TEST_CASE("SetAudioRateMultiplier(2.0) doubles emitDur passed to emitter") {
+        ParticleFixture fx;
+        auto            sub_baseline = fx.makeSub(10, 1.0, 1, 1.0);
+        auto            sub_doubled  = fx.makeSub(10, 1.0, 1, 1.0);
+        double          base_total   = 0.0;
+        double          dbl_total    = 0.0;
+        sub_baseline->AddEmitter(makeTallyEmitter(&base_total));
+        sub_doubled->AddEmitter(makeTallyEmitter(&dbl_total));
+        sub_doubled->SetAudioRateMultiplier(2.0);
+        for (int i = 0; i < 5; i++) {
+            fx.scene.PassFrameTime(0.016);
+            sub_baseline->Emitt();
+            sub_doubled->Emitt();
+        }
+        CHECK(dbl_total == doctest::Approx(2.0 * base_total));
+    }
+
+    TEST_CASE("SetAudioRateMultiplier(0.5) halves emitDur passed to emitter") {
+        ParticleFixture fx;
+        auto            sub_baseline = fx.makeSub(10, 1.0, 1, 1.0);
+        auto            sub_halved   = fx.makeSub(10, 1.0, 1, 1.0);
+        double          base_total   = 0.0;
+        double          half_total   = 0.0;
+        sub_baseline->AddEmitter(makeTallyEmitter(&base_total));
+        sub_halved->AddEmitter(makeTallyEmitter(&half_total));
+        sub_halved->SetAudioRateMultiplier(0.5);
+        for (int i = 0; i < 5; i++) {
+            fx.scene.PassFrameTime(0.016);
+            sub_baseline->Emitt();
+            sub_halved->Emitt();
+        }
+        CHECK(half_total == doctest::Approx(0.5 * base_total));
+    }
+
+    TEST_CASE("AudioParams default to mode=0 (off) until set") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        CHECK(sub->AudioParams().mode == 0u);
+        CHECK_FALSE(sub->AudioParams().weShapeAuthored);
+    }
+
+    TEST_CASE("SetAudioParams stores mode + WE-shape config for later read") {
+        ParticleFixture                      fx;
+        auto                                 sub = fx.makeSub();
+        audio_reactive::RateMultiplierParams p;
+        p.mode             = 3;
+        p.weShapeAuthored  = true;
+        p.freqStart        = 8;
+        p.freqEnd          = 12;
+        p.boundsLow        = 0.25f;
+        p.boundsHigh       = 0.75f;
+        p.exponent         = 2.0f;
+        p.amount           = 1.5f;
+        sub->SetAudioParams(p);
+        CHECK(sub->AudioParams().mode == 3u);
+        CHECK(sub->AudioParams().weShapeAuthored);
+        CHECK(sub->AudioParams().freqStart == 8);
+        CHECK(sub->AudioParams().freqEnd == 12);
+        CHECK(sub->AudioParams().boundsLow == doctest::Approx(0.25f));
+        CHECK(sub->AudioParams().boundsHigh == doctest::Approx(0.75f));
+        CHECK(sub->AudioParams().exponent == doctest::Approx(2.0f));
+        CHECK(sub->AudioParams().amount == doctest::Approx(1.5f));
+    }
+}
+// ===========================================================================
+// Nested-STATIC parent-type differentiation
+//
+// WE's `type: static` child has two canonical meanings depending on its
+// parent subsystem's type.  The NieR:Automata 2B thunderbolt scene
+// exercises both in the same tree:
+//
+//   thunderbolt (STATIC root)
+//     ├── thunderbolt_child_spawner (EVENT_FOLLOW)
+//     │     └── thunderbolt_beam_child  (STATIC — one per parent particle)
+//     └── thunderbolt_glow              (STATIC — a single instance)
+//
+// A nested STATIC under an EVENT_FOLLOW parent must get one instance per
+// parent particle so each sub-bolt tracks its own spark via bounded_data.
+// A nested STATIC under a STATIC parent (or any non-event parent) is the
+// author's "single instantaneous-burst subsystem that fires at T=0" case:
+// one auto-created instance, never bound to a parent particle.
+//
+// These tests pin that differentiation so we don't regress the thunderbolt
+// glow-vs-beam distinction again.  We use QueryNewInstance(maxcount=1) as
+// the observable: if auto-create ran, the pool is full; if it didn't, the
+// pool is still empty.
+// ===========================================================================
+
+TEST_SUITE("ParticleSubSystem.NestedStatic") {
+    TEST_CASE("STATIC child under STATIC parent auto-creates its own instance") {
+        ParticleFixture fx;
+        // Parent is STATIC root → auto-instance on Emitt.
+        auto parent = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        // Child is STATIC under STATIC — author's "single burst" case.
+        // maxcount_instance=1 so if auto-create runs, the pool is full.
+        auto  child     = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        fx.scene.PassFrameTime(0.016);
+        parent->Emitt(); // cascades into child->Emitt() at end
+
+        // Child auto-created its single instance → pool of 1 is full.
+        CHECK(child_raw->QueryNewInstance() == nullptr);
+    }
+
+    TEST_CASE("STATIC child under EVENT_FOLLOW parent does NOT auto-create") {
+        ParticleFixture fx;
+        // Parent is EVENT_FOLLOW with no real parent particle to bind to —
+        // no live instances, but its own Emitt still cascades to children.
+        auto parent = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW);
+        // Child is STATIC under EVENT_FOLLOW — author's "per-parent-particle" case.
+        auto  child     = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        fx.scene.PassFrameTime(0.016);
+        parent->Emitt();
+
+        // Child did NOT auto-create (parent is EVENT_FOLLOW) → pool still empty,
+        // QueryNewInstance can freely mint a new slot.
+        CHECK(child_raw->QueryNewInstance() != nullptr);
+    }
+
+    TEST_CASE("STATIC child under EVENT_SPAWN parent does auto-create (not event_follow)") {
+        ParticleFixture fx;
+        // EVENT_SPAWN parent: rule targets ONLY EVENT_FOLLOW for the per-particle
+        // carve-out.  Other event types fall back to the single-instance default.
+        auto parent = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_SPAWN);
+        auto child  = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        auto* child_raw = child.get();
+        parent->AddChild(std::move(child));
+
+        fx.scene.PassFrameTime(0.016);
+        parent->Emitt();
+
+        // Child auto-created → pool full.
+        CHECK(child_raw->QueryNewInstance() == nullptr);
+    }
+
+    TEST_CASE("Top-level STATIC auto-creates (parent is nullptr)") {
+        ParticleFixture fx;
+        // The pre-existing behavior: top-level STATIC with no parent always
+        // auto-creates one instance on first Emitt.
+        auto  sub     = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        auto* sub_raw = sub.get();
+
+        // Before Emitt, pool is empty.
+        auto* first = sub_raw->QueryNewInstance();
+        CHECK(first != nullptr);
+        // Kill so we can see the auto-create path independently.
+        first->SetDeath(true);
+        first->SetNoLiveParticle(true);
+        // Refresh() via QueryNewInstance would reuse — skip by driving Emitt directly
+        // on a fresh subsystem.
+        auto  sub2     = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        auto* sub2_raw = sub2.get();
+        fx.scene.PassFrameTime(0.016);
+        sub2_raw->Emitt();
+        CHECK(sub2_raw->QueryNewInstance() == nullptr); // auto-created, pool full
+    }
+
+    TEST_CASE("EVENT_FOLLOW parent does not spawn a STATIC child instance on its "
+              "own (needs parent particle)") {
+        // This mirrors the NieR hierarchy: a top-level STATIC that contains an
+        // EVENT_FOLLOW whose STATIC grandchild is per-particle.  With no real
+        // grandparent particle, the event_follow pool stays empty and the
+        // STATIC grandchild's per-particle spawn path is never hit.
+        ParticleFixture fx;
+        auto root = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        auto mid  = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW);
+        auto leaf = fx.makeSub(5, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        auto* leaf_raw = leaf.get();
+        mid->AddChild(std::move(leaf));
+        root->AddChild(std::move(mid));
+
+        fx.scene.PassFrameTime(0.016);
+        root->Emitt();
+
+        // Leaf stays empty: parent is EVENT_FOLLOW (no auto-create) AND no
+        // parent particle fired the per-particle spawn_inst path (EVENT_FOLLOW
+        // parent has no auto-instance of its own either).
+        CHECK(leaf_raw->QueryNewInstance() != nullptr);
+    }
+
+} // ParticleSubSystem.NestedStatic
+
+// ===========================================================================
+// ParticleSystem::MaxStartTime / PreSimulate — WE `starttime` semantics.
+// shimmering_particles default wallpaper ships dustmotes.starttime=50 and
+// small_motes_copy1.starttime=200.  Interpreted as "delay before emitting",
+// the user sees a black screen for up to 200s.  WE's actual meaning is
+// "pre-simulate N seconds before frame 1", which PreSimulate() implements.
+// ===========================================================================
+
+TEST_SUITE("ParticleSystem.StartTime") {
+    TEST_CASE("MaxStartTime is zero for an empty system") {
+        ParticleFixture fx;
+        CHECK(fx.psys->MaxStartTime() == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("MaxStartTime is zero when every subsystem has starttime=0") {
+        ParticleFixture fx;
+        fx.psys->subsystems.push_back(fx.makeSub(10, 1.0, 1, 1.0,
+                                                 ParticleSubSystem::SpawnType::STATIC, 0));
+        fx.psys->subsystems.push_back(fx.makeSub(10, 1.0, 1, 1.0,
+                                                 ParticleSubSystem::SpawnType::STATIC, 0));
+        CHECK(fx.psys->MaxStartTime() == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("MaxStartTime picks the largest top-level starttime") {
+        ParticleFixture fx;
+        fx.psys->subsystems.push_back(fx.makeSub(10, 1.0, 1, 1.0,
+                                                 ParticleSubSystem::SpawnType::STATIC, 50));
+        fx.psys->subsystems.push_back(fx.makeSub(10, 1.0, 1, 1.0,
+                                                 ParticleSubSystem::SpawnType::STATIC, 200));
+        fx.psys->subsystems.push_back(fx.makeSub(10, 1.0, 1, 1.0,
+                                                 ParticleSubSystem::SpawnType::STATIC, 5));
+        CHECK(fx.psys->MaxStartTime() == doctest::Approx(200.0));
+    }
+
+    TEST_CASE("MaxStartTime walks nested children") {
+        // shimmering_particles is flat, but NieR-style nested particles can
+        // carry starttime on a child subsystem.  Make sure we catch those.
+        ParticleFixture fx;
+        auto child = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW, 75);
+        auto root  = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC, 10);
+        root->AddChild(std::move(child));
+        fx.psys->subsystems.push_back(std::move(root));
+        CHECK(fx.psys->MaxStartTime() == doctest::Approx(75.0));
+    }
+
+    TEST_CASE("PreSimulate is a no-op when MaxStartTime is 0") {
+        ParticleFixture fx;
+        fx.psys->subsystems.push_back(fx.makeSub(10, 1.0, 1, 1.0,
+                                                 ParticleSubSystem::SpawnType::STATIC, 0));
+
+        fx.scene.elapsingTime = 123.0;   // sentinel — must be preserved
+        fx.scene.frameTime    = 0.016;
+        fx.psys->PreSimulate();
+        CHECK(fx.scene.elapsingTime == doctest::Approx(123.0));
+        CHECK(fx.scene.frameTime == doctest::Approx(0.016));
+    }
+
+    TEST_CASE("PreSimulate restores the scene clock it found on entry") {
+        ParticleFixture fx;
+        auto* sub_raw = fx.makeSub(10, 1.0, 1, 1.0,
+                                   ParticleSubSystem::SpawnType::STATIC, 5).release();
+        fx.psys->subsystems.emplace_back(sub_raw);
+
+        fx.scene.elapsingTime = 0.0;
+        fx.scene.frameTime    = 0.0;
+        fx.psys->PreSimulate(0.1);
+
+        // After pre-sim the scene clock is back to its saved value,
+        // regardless of how many ticks PreSimulate ran internally.
+        CHECK(fx.scene.elapsingTime == doctest::Approx(0.0));
+        CHECK(fx.scene.frameTime == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("PreSimulate clears every subsystem's m_starttime gate") {
+        ParticleFixture fx;
+        auto child = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW, 30);
+        auto* child_raw = child.get();
+        auto  root      = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC, 15);
+        auto* root_raw  = root.get();
+        root->AddChild(std::move(child));
+        fx.psys->subsystems.push_back(std::move(root));
+
+        REQUIRE(root_raw->StartTime() == 15u);
+        REQUIRE(child_raw->StartTime() == 30u);
+
+        fx.psys->PreSimulate(0.5);
+
+        CHECK(root_raw->StartTime() == 0u);
+        CHECK(child_raw->StartTime() == 0u);
+    }
+
+    TEST_CASE("PreSimulate uses the dt argument (iterates until target reached)") {
+        // With dt=5.0 and starttime=20, we expect exactly 4 Emitt calls.
+        // We can't peek Emitt call count directly, but we can observe that
+        // the scene clock was advanced at least that far internally — all
+        // we need is that m_starttime gets cleared (PreSimulate ran to
+        // completion without infinite-looping).
+        ParticleFixture fx;
+        auto* sub_raw = fx.makeSub(10, 1.0, 1, 1.0,
+                                   ParticleSubSystem::SpawnType::STATIC, 20).release();
+        fx.psys->subsystems.emplace_back(sub_raw);
+        REQUIRE(sub_raw->StartTime() == 20u);
+
+        fx.psys->PreSimulate(5.0);
+        CHECK(sub_raw->StartTime() == 0u);
+    }
+
+    TEST_CASE("PreSimulate guards against non-positive dt (no infinite loop)") {
+        ParticleFixture fx;
+        auto* sub_raw = fx.makeSub(10, 1.0, 1, 1.0,
+                                   ParticleSubSystem::SpawnType::STATIC, 50).release();
+        fx.psys->subsystems.emplace_back(sub_raw);
+
+        // dt=0 would infinite-loop if not guarded; we early-out instead.
+        fx.psys->PreSimulate(0.0);
+        // starttime is unchanged because we never ran the pre-sim loop.
+        CHECK(sub_raw->StartTime() == 50u);
+
+        fx.psys->PreSimulate(-1.0);
+        CHECK(sub_raw->StartTime() == 50u);
+    }
+
+    TEST_CASE("Negative starttime is a no-op pre-sim (regression: Nightingale 3276911872)") {
+        // deku_twinkle_shootingstar.json ships "starttime": -2.  Before the
+        // fix, the field was parsed into a uint32_t, wrapping -2 to
+        // 4294967294; MaxStartTime returned ~4.29e9 and PreSimulate looped
+        // for billions of iterations, never returning — Nightingale never
+        // reached its first frame and plasma showed a black desktop.
+        // With float starttime, the sub's m_starttime=-2 is preserved on
+        // StartTime() but MaxStartTime (which starts max at 0.0) clamps to
+        // 0, so PreSimulate early-returns and the clock is untouched.
+        ParticleFixture fx;
+        auto* sub_raw = fx.makeSub(10, 1.0, 1, 1.0,
+                                   ParticleSubSystem::SpawnType::STATIC, -2.0f).release();
+        fx.psys->subsystems.emplace_back(sub_raw);
+        CHECK(sub_raw->StartTime() == doctest::Approx(-2.0f));
+        CHECK(fx.psys->MaxStartTime() == doctest::Approx(0.0));
+
+        fx.scene.elapsingTime = 5.0;
+        fx.scene.frameTime    = 0.016;
+        fx.psys->PreSimulate(0.032);
+        CHECK(fx.scene.elapsingTime == doctest::Approx(5.0));
+    }
+
+    TEST_CASE("Fractional starttime is preserved by MaxStartTime") {
+        ParticleFixture fx;
+        fx.psys->subsystems.push_back(fx.makeSub(10, 1.0, 1, 1.0,
+                                                 ParticleSubSystem::SpawnType::STATIC, 0.7f));
+        CHECK(fx.psys->MaxStartTime() == doctest::Approx(0.7));
+    }
+
+    // Lifecycle paths (Refresh / Reset / death-state cascades)
+    TEST_CASE("Reset() rearms every instance via Refresh") {
+        ParticleFixture fx;
+        auto            sub  = fx.makeSub();
+        auto* inst = sub->QueryNewInstance();
+        REQUIRE(inst != nullptr);
+        inst->ParticlesVec().emplace_back();
+        inst->SetDeath(true);
+        inst->SetNoLiveParticle(true);
+        REQUIRE(inst->Particles().size() == 1);
+
+        sub->Reset();
+
+        CHECK_FALSE(inst->IsDeath());
+        CHECK_FALSE(inst->IsNoLiveParticle());
+        CHECK(inst->Particles().size() == 0);
+    }
+
+    TEST_CASE("Reset() also rearms child subsystems") {
+        ParticleFixture fx;
+        auto            sub      = fx.makeSub();
+        auto            child    = fx.makeSub();
+        auto*           c_raw    = child.get();
+        sub->AddChild(std::move(child));
+        auto* c_inst = c_raw->QueryNewInstance();
+        REQUIRE(c_inst != nullptr);
+        c_inst->SetDeath(true);
+        c_inst->SetNoLiveParticle(true);
+
+        sub->Reset();
+
+        CHECK_FALSE(c_inst->IsDeath());
+        CHECK_FALSE(c_inst->IsNoLiveParticle());
+    }
+
+    TEST_CASE("Reset() resets m_burst_done and m_any_alive_since_reset") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        // Sanity — fresh sub starts not-burst-done.
+        CHECK_FALSE(sub->IsBurstDone());
+        // A Reset() on a fresh sub keeps the same state (no crash on m_instances=empty).
+        sub->Reset();
+        CHECK_FALSE(sub->IsBurstDone());
+    }
+
+    TEST_CASE("ResolveControlpointsForInstance: follow_parent_particle without parent → falls back") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].follow_parent_particle = true;
+        sub->Controlpoints()[0].offset                 = Eigen::Vector3d(11, 22, 33);
+
+        // No parent / no bound particle attached → CP stays at offset.
+        sub->ResolveControlpointsForInstance(nullptr);
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(11.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(22.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(33.0));
+    }
+
+    TEST_CASE("ResolveControlpointsForInstance: worldspace honours offset and ignores parent") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].worldspace = true;
+        sub->Controlpoints()[0].offset     = Eigen::Vector3d(1, 2, 3);
+        sub->ResolveControlpointsForInstance(nullptr);
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(1.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(2.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(3.0));
+    }
+
+    TEST_CASE("ResolveControlpointsForInstance: per-frame velocity calc") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        // First call seeds prev_resolved → velocity zero.
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(0, 0, 0);
+        fx.scene.frameTime             = 0.5; // dt
+        sub->ResolveControlpointsForInstance(nullptr);
+        CHECK(sub->Controlpoints()[0].velocity.norm() == doctest::Approx(0.0));
+
+        // Move CP and call again — velocity = (10,0,0) / 0.5 = (20,0,0).
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(10, 0, 0);
+        sub->ResolveControlpointsForInstance(nullptr);
+        CHECK(sub->Controlpoints()[0].velocity.x() == doctest::Approx(20.0));
+    }
+
+    TEST_CASE("ResolveControlpointsForInstance: dt=0 keeps velocity at zero") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(0, 0, 0);
+        fx.scene.frameTime             = 0.0;
+        sub->ResolveControlpointsForInstance(nullptr);
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(100, 0, 0);
+        sub->ResolveControlpointsForInstance(nullptr);
+        CHECK(sub->Controlpoints()[0].velocity.norm() == doctest::Approx(0.0));
+    }
+
+    // Bound-particle CP-resolution paths (lines 154 + 169-170 of ParticleSystem.cpp).
+    // These are the hot paths for NieR thunderbolt rope subsystems: a child
+    // ParticleSubSystem inherits a parent particle binding via BoundedData and
+    // its CPs follow the bolt particle's position.
+    TEST_CASE("ResolveControlpointsForInstance with bound particle + follow_parent_particle "
+              "snaps CP to parent particle pos") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].follow_parent_particle = true;
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(0, 0, 0);
+
+        // Build a bound-particle context: a parent ParticleInstance with one
+        // particle, plus a child ParticleInstance whose BoundedData links to
+        // the parent at index 0 with a non-zero pos.
+        ParticleInstance parent_inst;
+        parent_inst.ParticlesVec().resize(1);
+        parent_inst.ParticlesVec()[0].lifetime = 1.0f;
+
+        ParticleInstance child_inst;
+        child_inst.GetBoundedData().parent       = &parent_inst;
+        child_inst.GetBoundedData().particle_idx = 0;
+        child_inst.GetBoundedData().pos          = Eigen::Vector3f(7.0f, -5.0f, 2.5f);
+
+        sub->ResolveControlpointsForInstance(&child_inst);
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(7.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(-5.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(2.5));
+    }
+
+    TEST_CASE("ResolveControlpointsForInstance: null-offset CP with bound particle "
+              "substitutes the parent particle pos") {
+        // is_null_offset comes from JSON `offset: null` — we set it directly.
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].offset         = Eigen::Vector3d(99, 99, 99);
+        sub->Controlpoints()[0].is_null_offset = true;
+
+        ParticleInstance parent_inst;
+        parent_inst.ParticlesVec().resize(1);
+        parent_inst.ParticlesVec()[0].lifetime = 1.0f;
+
+        ParticleInstance child_inst;
+        child_inst.GetBoundedData().parent       = &parent_inst;
+        child_inst.GetBoundedData().particle_idx = 0;
+        child_inst.GetBoundedData().pos          = Eigen::Vector3f(11.0f, 22.0f, 33.0f);
+
+        sub->ResolveControlpointsForInstance(&child_inst);
+        // is_null_offset path → fell through to default (line 165 takes offset),
+        // then post-substitution (lines 168-170) writes bound_pos.
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(11.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(22.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(33.0));
+        CHECK(sub->Controlpoints()[0].is_null_resolved == true);
+    }
+
+    TEST_CASE("ResolveControlpointsForInstance: bound particle + worldspace CP keeps offset "
+              "(worldspace ignores parent particle)") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].worldspace             = true;
+        sub->Controlpoints()[0].follow_parent_particle = true; // ignored due to worldspace
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(99, 0, 0);
+
+        ParticleInstance parent_inst;
+        parent_inst.ParticlesVec().resize(1);
+        parent_inst.ParticlesVec()[0].lifetime = 1.0f;
+
+        ParticleInstance child_inst;
+        child_inst.GetBoundedData().parent       = &parent_inst;
+        child_inst.GetBoundedData().particle_idx = 0;
+        child_inst.GetBoundedData().pos          = Eigen::Vector3f(11.0f, 22.0f, 33.0f);
+
+        sub->ResolveControlpointsForInstance(&child_inst);
+        // worldspace branch wins; resolved == offset, NOT bound_pos.
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(99.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(0.0));
+    }
+
+    TEST_CASE("ResolveControlpointsForInstance: dead parent particle is treated as no-bind "
+              "(particle_idx not >= 0 path)") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub();
+        sub->Controlpoints()[0].follow_parent_particle = true;
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(5, 5, 5);
+
+        ParticleInstance parent_inst;
+        ParticleInstance child_inst;
+        // parent set but particle_idx = -1 → has_bound_particle false
+        child_inst.GetBoundedData().parent       = &parent_inst;
+        child_inst.GetBoundedData().particle_idx = -1;
+        child_inst.GetBoundedData().pos          = Eigen::Vector3f(7.0f, -5.0f, 2.5f);
+
+        sub->ResolveControlpointsForInstance(&child_inst);
+        // has_bound_particle=false → falls through to default branch → resolved = offset.
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(5.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(5.0));
+    }
+}
+
+// ===========================================================================
+// Emitt: per-instance dead+empty skip.  Burst-FX subsystems and dynamic-asset
+// pool slots accumulate maxcount_instance entries that are dead with zero
+// live particles.  Each such instance still ran ResolveControlpointsForInstance
+// (8 CPs × parent-chain pointer chasing + per-frame Vector3d velocity write)
+// and dispatched the operator chain over a 0-particle vector — wasted work.
+// The skip preserves bounded-parent death propagation (still runs above), and
+// is a no-op on live instances (operator dispatch + CP resolve unchanged).
+// ===========================================================================
+TEST_SUITE("ParticleSubSystem Emitt dead-instance skip") {
+    // (1) CP resolver is skipped.  Pre-resolve once with offset A; mark dead+empty;
+    // change offset to B; call Emitt; cp.resolved must remain A (resolver did not run).
+    // Revive (SetDeath(false), SetNoLiveParticle(false)); next Emitt picks up B.
+    TEST_CASE("Emitt does not call ResolveControlpointsForInstance on dead+empty instances") {
+        ParticleFixture fx;
+        // EVENT_FOLLOW so STATIC auto-create at lines 266-273 does NOT fire.
+        // Pool of 1; one instance via QueryNewInstance.
+        auto  sub  = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW);
+        auto* inst = sub->QueryNewInstance();
+        REQUIRE(inst != nullptr);
+
+        // Seed CP[0] with offset A, then prime prev_resolved by calling the
+        // resolver directly (mirrors steady-state where one alive frame ran).
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(11, 22, 33);
+        sub->ResolveControlpointsForInstance(inst);
+        REQUIRE(sub->Controlpoints()[0].resolved.x() == doctest::Approx(11.0));
+
+        // Mark dead+empty.
+        inst->SetDeath(true);
+        inst->SetNoLiveParticle(true);
+
+        // Mutate offset to B and run Emitt — the skip means cp.resolved stays at A.
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(99, 88, 77);
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(11.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(22.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(33.0));
+
+        // Revive; resolver runs on the next Emitt and picks up B.
+        inst->SetDeath(false);
+        inst->SetNoLiveParticle(false);
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(99.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(88.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(77.0));
+    }
+
+    // (2) Operator dispatch is skipped.  Counter operator records invocations;
+    // dead+empty across many Emitt calls → counter stays at 0.  Revive → fires.
+    TEST_CASE("Emitt does not dispatch operators on dead+empty instances") {
+        ParticleFixture fx;
+        auto  sub  = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW);
+        auto* inst = sub->QueryNewInstance();
+        REQUIRE(inst != nullptr);
+
+        int call_count = 0;
+        sub->AddOperator([&call_count](const ParticleInfo&) {
+            call_count++;
+        });
+
+        // Mark dead+empty.
+        inst->SetDeath(true);
+        inst->SetNoLiveParticle(true);
+
+        for (int n = 0; n < 10; n++) {
+            fx.scene.PassFrameTime(0.016);
+            sub->Emitt();
+        }
+        CHECK(call_count == 0);
+
+        // Revive — operator fires.  EVENT_FOLLOW has no auto-create path; the
+        // single instance is alive with 0 particles, the iteration loop is empty,
+        // but the operator dispatch still happens.
+        inst->SetDeath(false);
+        inst->SetNoLiveParticle(false);
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        CHECK(call_count == 1);
+    }
+
+    // (3) Live instances keep working: when there ARE live particles on a dead
+    // instance, or when alive with empty vector, operator dispatch must continue.
+    // This pins "skip applies ONLY to dead AND no-live-particle" — neither alone
+    // triggers the skip.
+    TEST_CASE("Emitt still dispatches operators on alive-but-empty instances") {
+        ParticleFixture fx;
+        auto  sub  = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW);
+        auto* inst = sub->QueryNewInstance();
+        REQUIRE(inst != nullptr);
+
+        int call_count = 0;
+        sub->AddOperator([&call_count](const ParticleInfo&) {
+            call_count++;
+        });
+
+        // Alive with empty particle vector — NoLiveParticle is the per-frame
+        // output, but death is false → not the skip case.
+        inst->SetDeath(false);
+        inst->SetNoLiveParticle(true);
+
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        CHECK(call_count == 1);
+    }
+
+    TEST_CASE("Emitt still dispatches operators on dead-but-has-particles instances") {
+        ParticleFixture fx;
+        auto  sub  = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW);
+        auto* inst = sub->QueryNewInstance();
+        REQUIRE(inst != nullptr);
+
+        int call_count = 0;
+        sub->AddOperator([&call_count](const ParticleInfo&) {
+            call_count++;
+        });
+
+        // Dead but particle vector non-empty (and at least one alive) — the
+        // operator pass still needs to run so the existing particles age out.
+        Particle p;
+        p.lifetime = 5.0f;
+        inst->ParticlesVec().push_back(p);
+        inst->SetDeath(true);
+        inst->SetNoLiveParticle(false); // has live particles
+
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        // EVENT_FOLLOW's "clear-on-death" block (lines 343-345) wipes the vector
+        // when dead; afterwards the instance has empty particles but is NOT
+        // NoLiveParticle this frame (state from the previous frame).  The
+        // operator pass runs once on the now-empty vector.  Next frame it will
+        // be NoLiveParticle (no particles to mark live) and the skip kicks in.
+        CHECK(call_count == 1);
+    }
+
+    // (4) Bounded-parent death propagation runs BEFORE the skip, so a child
+    // instance whose parent died still has its death flag set by the propagation
+    // block at lines 318-329 — even though the remainder of the per-instance
+    // work (CP resolve, operators) is skipped.
+    TEST_CASE("Bounded-parent death still propagates through skipped instances") {
+        ParticleFixture fx;
+        // Child: EVENT_FOLLOW so type_has_death is true (death-propagation path
+        // fires).  Pool of 1, manually bound to a synthesised parent instance
+        // carrying a dead particle.
+        auto  child      = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::EVENT_FOLLOW);
+        auto* child_inst = child->QueryNewInstance();
+        REQUIRE(child_inst != nullptr);
+
+        ParticleInstance parent_inst_synth;
+        Particle         pp;
+        pp.lifetime = 0.0f; // already dead
+        parent_inst_synth.ParticlesVec().push_back(pp);
+        // Child's bounded particle points at the now-dead parent particle.
+        // pre_lifetime_ok=true so the propagation block (LifetimeOk false AND
+        // pre_lifetime_ok true) declares the child dead this frame.
+        child_inst->GetBoundedData().parent          = &parent_inst_synth;
+        child_inst->GetBoundedData().particle_idx    = 0;
+        child_inst->GetBoundedData().pre_lifetime_ok = true;
+
+        // Before child->Emitt: child is alive.
+        REQUIRE_FALSE(child_inst->IsDeath());
+
+        // Mark the child no-live-particle so the post-propagation skip would
+        // engage IF death also fires.  The skip MUST NOT block the propagation
+        // block above it.
+        child_inst->SetNoLiveParticle(true);
+
+        fx.scene.PassFrameTime(0.016);
+        child->Emitt();
+
+        // Propagation set death from "particle was alive last frame, dead now".
+        CHECK(child_inst->IsDeath());
+    }
+
+    // (5) STATIC auto-create stays intact: the skip applies only AFTER the
+    // EVENT_FOLLOW clear block, AFTER bounded-death propagation, but before CP
+    // resolve.  A STATIC alive subsystem with auto-created instance must run
+    // normally.
+    TEST_CASE("STATIC alive subsystem with auto-created instance runs CP resolve normally") {
+        ParticleFixture fx;
+        auto            sub = fx.makeSub(10, 1.0, 1, 1.0, ParticleSubSystem::SpawnType::STATIC);
+        sub->Controlpoints()[0].offset = Eigen::Vector3d(7, 8, 9);
+
+        fx.scene.PassFrameTime(0.016);
+        sub->Emitt();
+        // The auto-created instance is alive; CP resolver ran with offset (7,8,9).
+        CHECK(sub->Controlpoints()[0].resolved.x() == doctest::Approx(7.0));
+        CHECK(sub->Controlpoints()[0].resolved.y() == doctest::Approx(8.0));
+        CHECK(sub->Controlpoints()[0].resolved.z() == doctest::Approx(9.0));
+    }
+
+} // ParticleSubSystem Emitt dead-instance skip
+
+// ===========================================================================
+// ParticleSystem global emit budget — kMaxParticlesPerFrame caps aggregate
+// spawning across all subsystems per ParticleSystem::Emitt() call.  Subsystems
+// past the budget skip their spawn phase but still tick update/operators/trail
+// so existing particles age out normally; a one-shot LOG_INFO records the
+// offender, re-armed on ParticleSystem destroy/recreate (scene reload).
+// ===========================================================================
+
+namespace
+{
+
+// Saturating emitter — every tick, push particles until maxcount is reached.
+// Exposes the spawn-cap as the only ceiling on live particle count, so the
+// budget gate can be observed directly in the post-tick particle total.
+static ParticleEmittOp saturatingEmitter() {
+    return [](std::vector<Particle>& ps, std::vector<ParticleInitOp>&,
+              uint32_t maxcount, double /*dt*/) {
+        while (ps.size() < maxcount) {
+            Particle p;
+            p.lifetime = 100.0f; // long-lived so they stick around within the tick
+            ps.push_back(p);
+        }
+    };
+}
+
+} // namespace
+
+TEST_SUITE("ParticleSystem global emit budget") {
+    TEST_CASE("budget exhaustion gates further spawning within one tick") {
+        ParticleFixture fx;
+        constexpr uint32_t per_sub = 20'000;
+        // Build enough subsystems that N * per_sub overshoots the budget by
+        // at least 2x — leaves headroom to detect a working gate.
+        constexpr int n_subs = (int)(2 * kMaxParticlesPerFrame / per_sub) + 1;
+        for (int i = 0; i < n_subs; ++i) {
+            auto sub = fx.makeSub(per_sub, 1.0, 1, 1.0,
+                                  ParticleSubSystem::SpawnType::STATIC);
+            sub->AddEmitter(saturatingEmitter());
+            fx.psys->subsystems.emplace_back(std::move(sub));
+        }
+        fx.scene.frameTime    = 0.016;
+        fx.scene.elapsingTime = 0.0;
+
+        fx.psys->Emitt();
+
+        // Tally live particles across every subsystem's auto-created instance.
+        // STATIC type auto-creates one instance per sub on first Emitt, so each
+        // emitter target is that instance's ParticlesVec.
+        size_t total = 0;
+        for (auto& sub : fx.psys->subsystems) {
+            for (auto& inst : sub->Instances()) {
+                if (inst) total += inst->Particles().size();
+            }
+        }
+        // Hard upper bound: budget + one full subsystem of overshoot, since
+        // the check fires AFTER each sub's emit, not mid-emit.  Without the
+        // gate, total = n_subs * per_sub = ~420k; with the gate, total <=
+        // 200k + 20k = 220k.
+        CHECK(total <= kMaxParticlesPerFrame + per_sub);
+        // And it must have actually saturated some subs (not zero).
+        CHECK(total >= kMaxParticlesPerFrame);
+        // The latch flag should be set, exactly once.
+        CHECK(fx.psys->GlobalEmitWarned());
+    }
+
+    TEST_CASE("warning fires exactly once per ParticleSystem lifetime") {
+        ParticleFixture fx;
+        constexpr uint32_t per_sub = 20'000;
+        constexpr int n_subs = (int)(2 * kMaxParticlesPerFrame / per_sub) + 1;
+        for (int i = 0; i < n_subs; ++i) {
+            auto sub = fx.makeSub(per_sub, 1.0, 1, 1.0,
+                                  ParticleSubSystem::SpawnType::STATIC);
+            sub->AddEmitter(saturatingEmitter());
+            fx.psys->subsystems.emplace_back(std::move(sub));
+        }
+        fx.scene.frameTime    = 0.016;
+        fx.scene.elapsingTime = 0.0;
+
+        // Two ticks in a row — second tick must NOT clear the sticky latch.
+        // (We're testing the latch is sticky: compare_exchange_strong succeeds
+        //  exactly once on the false->true edge.  A subsequent tick re-tests
+        //  the over-budget condition but the CAS no-ops.)
+        fx.psys->Emitt();
+        CHECK(fx.psys->GlobalEmitWarned());
+        fx.psys->Emitt();
+        CHECK(fx.psys->GlobalEmitWarned()); // sticky after the first edge
+    }
+
+    TEST_CASE("fresh ParticleSystem starts unwarned (lifetime-bound re-arm)") {
+        Scene scene;
+        // Two distinct ParticleSystems — the warning latch lives per-object,
+        // so a fresh one (mirroring scene reload destroying + recreating)
+        // begins unwarned regardless of any prior process state.
+        auto ps1 = std::make_unique<ParticleSystem>(scene);
+        auto ps2 = std::make_unique<ParticleSystem>(scene);
+        CHECK_FALSE(ps1->GlobalEmitWarned());
+        CHECK_FALSE(ps2->GlobalEmitWarned());
+    }
+
+    TEST_CASE("update phase still runs for budget-skipped subsystems") {
+        ParticleFixture fx;
+        // sub_first exhausts the budget on its own — needs maxcount large
+        // enough that one saturating emit fills past the cap.  Use maxcount =
+        // kMaxParticlesPerFrame (per-sub limit at parse time is 20000 in
+        // production, but this is a pure-C++ test with no parser involved, so
+        // we can construct any maxcount).
+        auto sub_first = fx.makeSub(kMaxParticlesPerFrame + 1000, 1.0, 1, 1.0,
+                                    ParticleSubSystem::SpawnType::STATIC);
+        sub_first->AddEmitter(saturatingEmitter());
+        fx.psys->subsystems.emplace_back(std::move(sub_first));
+
+        // sub_second is the victim — its emit will be skipped, but its update
+        // phase (operator dispatch) must still run.  Counter operator records
+        // every call so we can prove the skip preserves the update path.
+        auto sub_second = fx.makeSub(100, 1.0, 1, 1.0,
+                                     ParticleSubSystem::SpawnType::STATIC);
+        int  op_call_count = 0;
+        sub_second->AddOperator([&op_call_count](const ParticleInfo&) {
+            op_call_count++;
+        });
+        auto* sub_second_raw = sub_second.get();
+        fx.psys->subsystems.emplace_back(std::move(sub_second));
+
+        fx.scene.frameTime    = 0.016;
+        fx.scene.elapsingTime = 0.0;
+
+        // Tick once to auto-create both STATIC instances; sub_first exhausts
+        // budget, sub_second's emit is skipped — but the operator dispatch
+        // happens AFTER the gated spawn block, so it must still fire.
+        fx.psys->Emitt();
+        REQUIRE(sub_second_raw->Instances().size() == 1);
+        auto& inst = sub_second_raw->Instances().front();
+        REQUIRE(inst);
+        // Tick 1's operator ran once on the empty instance (alive auto-create).
+        CHECK(op_call_count == 1);
+        // sub_second's particle vector is empty — the spawn block was skipped.
+        CHECK(inst->ParticlesVec().empty());
+
+        // Pre-populate sub_second with one particle to prove the per-particle
+        // ChangeLifetime + operator pass continues to age them out.
+        Particle p;
+        p.lifetime      = 10.0f;
+        p.init.lifetime = 10.0f;
+        inst->ParticlesVec().push_back(p);
+
+        // Second tick — sub_first re-exhausts, sub_second's emit stays gated,
+        // operator must still tick (op_call_count goes 1 -> 2).
+        fx.scene.elapsingTime = 0.5;
+        fx.psys->Emitt();
+        CHECK(op_call_count == 2);
+        // ChangeLifetime decrements by particleTime (clamped frameTime * rate)
+        // and our counter operator does NOT touch lifetime, so the particle
+        // should be at 10.0 - 0.016 = 9.984 after tick 2.
+        CHECK(inst->ParticlesVec().front().lifetime ==
+              doctest::Approx(10.0f - 0.016f));
+        // Still no new spawns into sub_second's vector beyond our pre-pop.
+        CHECK(inst->ParticlesVec().size() == 1);
+    }
+
+    TEST_CASE("per-subsystem maxcount cap holds even at saturating dynamic rate") {
+        // Paranoia check on the spec's open-question note: a hostile script
+        // writing m_dynamic_rate_multiplier = 1e6 still hits the per-instance
+        // `if (maxcount == particles.size()) break` in the emitter, so the
+        // per-subsystem cap is the backstop the global cap relies on.
+        ParticleFixture fx;
+        auto sub = fx.makeSub(20'000, 1.0, 1, 1.0,
+                              ParticleSubSystem::SpawnType::STATIC);
+        sub->AddEmitter(saturatingEmitter());
+        sub->SetDynamicRateMultiplier(1e6);
+        fx.psys->subsystems.emplace_back(std::move(sub));
+        fx.scene.frameTime    = 0.032;
+        fx.scene.elapsingTime = 0.0;
+        fx.psys->Emitt();
+        auto& inst = fx.psys->subsystems.front()->Instances().front();
+        REQUIRE(inst);
+        CHECK(inst->Particles().size() == 20'000);
+        // Single sub well under cap — no warning expected.
+        CHECK_FALSE(fx.psys->GlobalEmitWarned());
+    }
+
+} // ParticleSystem global emit budget
