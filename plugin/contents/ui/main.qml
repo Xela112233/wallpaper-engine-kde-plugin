@@ -111,6 +111,10 @@ Rectangle {
     // playback state for scene scripts and web wallpapers (Scene.qml,
     // QtWebView.qml); off, neither backend watches the player.
     property bool   mediaIntegration: wallpaper.configuration.MediaIntegration
+    // The media players the media integration leaves out (we-manager
+    // media-blocklist patch): MprisMonitor's ignoredPlayers in Scene.qml and
+    // QtWebView.qml, live.  we-manager writes it; the settings page does not.
+    property string mediaBlocklist: wallpaper.configuration.MediaBlocklist ?? ""
 
     
     property var curOpt: ({})

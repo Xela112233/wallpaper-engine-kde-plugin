@@ -247,7 +247,15 @@ Item {
         active: background.mediaIntegration
         onActiveChanged: if (!active) webobjCtl.clearMedia()
         sourceComponent: MprisMonitor {
-            Component.onCompleted: engage()
+            id: mprisMonitor
+            // The players to leave out (MediaBlocklist), set before engage()
+            // and followed live (we-manager media-blocklist patch); through
+            // Common.setIfSupported, for a library from before that patch.
+            Component.onCompleted: {
+                Common.setIfSupported(mprisMonitor, "MprisMonitor", "ignoredPlayers",
+                                      Qt.binding(function() { return background.mediaBlocklist || ""; }));
+                engage();
+            }
             onMediaAvailableChanged: function(available) {
                 if (available) webobjCtl.pushMediaStatus(true);
                 else webobjCtl.clearMedia();

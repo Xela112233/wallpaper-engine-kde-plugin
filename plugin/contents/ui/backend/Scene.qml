@@ -48,10 +48,20 @@ Item{
         active: background.mediaIntegration
         onActiveChanged: if (!active) player.mediaStatusChanged(false)
         sourceComponent: MprisMonitor {
+            id: mprisMonitor
+            // The players to leave out (MediaBlocklist), set before engage()
+            // and followed live: an ignored player is dropped and the next
+            // one taken (we-manager media-blocklist patch).  Through
+            // Common.setIfSupported: a library from before that patch has no
+            // ignoredPlayers, and naming it here would fail this file.
             // Engage the D-Bus watch + position poll so signals fire for
             // scene-script subscribers. Video backends skip the cost
             // automatically (they never instantiate MprisMonitor).
-            Component.onCompleted: engage()
+            Component.onCompleted: {
+                Common.setIfSupported(mprisMonitor, "MprisMonitor", "ignoredPlayers",
+                                      Qt.binding(function() { return background.mediaBlocklist || ""; }));
+                engage();
+            }
             onPlaybackStateChanged: function(state) {
                 player.mediaPlaybackChanged(state);
             }

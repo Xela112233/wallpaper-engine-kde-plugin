@@ -66,6 +66,19 @@ int mprisPlayerRank(const QString& service, bool playing);
 // depend on the order the async PlaybackStatus replies arrive in.
 bool mprisScanCandidateBetter(int rank, int index, int bestRank, int bestIndex);
 
+// The name a player goes by in MediaBlocklist (we-manager media-blocklist
+// patch): the part of an MPRIS bus name after org.mpris.MediaPlayer2., cut at
+// a ".instance" suffix (the MPRIS spec's suffix for a further instance:
+// firefox.instance_1_84, vlc.instance7389), lowercased.  The prefix is
+// matched without regard to case.  "" for a name that is no MPRIS player.
+QString mprisPlayerStem(const QString& service);
+
+// MediaBlocklist's text as stems: split on commas and white space and
+// lowercased; an entry that is a whole bus name or carries an .instance
+// suffix is cut to its stem as mprisPlayerStem does.  Empty entries, and any
+// with a character outside [a-z0-9_.-], are dropped.
+QSet<QString> parseIgnoredPlayers(const QString& text);
+
 // The art URL to act on for an incoming metadata update. `prevTrack` /
 // `newTrack` identify the track (see applyMetadata). An update for the same
 // track that carries no art keeps `prevArt`: plasma-browser-integration follows
@@ -103,6 +116,11 @@ class MprisMonitor : public QQuickItem {
     // and it reads true for every live item, so QML asking it whether a media
     // player is around would be told "yes" forever.
     Q_PROPERTY(bool mediaAvailable READ mediaAvailable NOTIFY mediaAvailableChanged)
+    // The players to leave out, as MediaBlocklist's text (we-manager
+    // media-blocklist patch).  The scan skips them and one that appears is
+    // never connected; a change drops the active player when it is now
+    // ignored, then scans again, so an unignored player can be taken.
+    Q_PROPERTY(QString ignoredPlayers READ ignoredPlayers WRITE setIgnoredPlayers NOTIFY ignoredPlayersChanged)
     // Test seam: lets tst_mpriscolors invoke the private disconnectFromPlayer
     // and applyPlaybackStatus without promoting them to public/Q_INVOKABLE
     // (production has no external caller for either; the slots are only
@@ -134,6 +152,9 @@ public:
     // transitions as the scene script's mediaStatusChanged event.
     bool mediaAvailable() const { return m_mediaAvailable; }
 
+    QString ignoredPlayers() const { return m_ignoredText; }
+    void    setIgnoredPlayers(const QString& text);
+
     // Start watching D-Bus for MPRIS player services + poll position.
     // Call from QML when the wallpaper subscribes to media-info signals
     // (propertiesChanged / playbackStateChanged / timelineChanged /
@@ -158,6 +179,7 @@ signals:
     // Carries the new value so a QML handler forwards the argument rather
     // than reading the property back off the item.
     void mediaAvailableChanged(bool available);
+    void ignoredPlayersChanged();
 
 private slots:
     void handlePropertiesChanged(const QString& interface, const QVariantMap& changed,
@@ -196,8 +218,12 @@ private:
     // don't pay the 1Hz position-poll cost. Tests can force-engage by
     // calling either Q_INVOKABLE.
     void ensureEngaged();
+    // Whether `service` is one of the players to leave out.
+    bool ignored(const QString& service) const;
 
     QDBusConnection m_sessionBus;
+    QString         m_ignoredText;
+    QSet<QString>   m_ignored;
     QString         m_activeService;
     QTimer          m_positionTimer;
     double          m_lastPosition { 0 };

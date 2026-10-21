@@ -205,6 +205,19 @@ private slots:
     void mediaAvailable_isOwnPropertyFollowingTheConnection();
     // The QML test stub must not offer members the real monitor lacks.
     void qmlStubSurfaceMatchesTheRealMonitor();
+
+    // ── MediaBlocklist (we-manager media-blocklist patch): players the
+    // media integration leaves out.  The tables are we-manager's too
+    // (src/we_manager/mediaplayers.py), so both suites pin one rule.
+    void playerStem_table();
+    void parseIgnoredPlayers_table();
+    void ignoredPlayers_skipsThePlayingPlayerForTheNext();
+    void ignoredPlayers_everyPlayerIgnoredConnectsNone_andClearingTakesOneAgain();
+    void ignoredPlayers_ignoringTheActivePlayerDropsItAndTakesTheNext();
+    void ignoredPlayers_anIgnoredPlayerAppearingIsNeitherConnectedNorRescanned();
+    void ignoredPlayers_sameListInOtherWordsNotifiesButDoesNotRescan();
+    void ignoredPlayers_anInstanceNameIsIgnoredByItsStem();
+    void lateReplies_fromAPlayerNoLongerActiveEmitNothing();
 };
 
 // Helper: create a solid-color image
@@ -1408,10 +1421,15 @@ private:
 
 // RAII helper: registers a unique service+object on the session bus and
 // unregisters it on destruction.  Returns the registered service name.
+//
+// Each registration has a session-bus connection of its own: a connection
+// holds one object per path, so two fakes on one connection could not both
+// answer at /org/mpris/MediaPlayer2 with their own status.
 class FakeMprisRegistration {
 public:
     FakeMprisRegistration(FakeMprisService* svc, const QString& nameSuffix)
-        : m_bus(QDBusConnection::sessionBus()),
+        : m_connectionName("wek-testfake-" + nameSuffix),
+          m_bus(QDBusConnection::connectToBus(QDBusConnection::SessionBus, m_connectionName)),
           m_serviceName("org.mpris.MediaPlayer2.testfake_" + nameSuffix) {
         if (! m_bus.isConnected()) return;
         m_objectRegistered  = m_bus.registerVirtualObject("/org/mpris/MediaPlayer2", svc);
@@ -1420,11 +1438,13 @@ public:
     ~FakeMprisRegistration() {
         if (m_serviceRegistered) m_bus.unregisterService(m_serviceName);
         if (m_objectRegistered) m_bus.unregisterObject("/org/mpris/MediaPlayer2");
+        QDBusConnection::disconnectFromBus(m_connectionName);
     }
     bool    ok() const { return m_serviceRegistered && m_objectRegistered; }
     QString serviceName() const { return m_serviceName; }
 
 private:
+    QString         m_connectionName;
     QDBusConnection m_bus;
     QString         m_serviceName;
     bool            m_objectRegistered { false };
@@ -2219,6 +2239,177 @@ void TestMprisColors::qmlStubSurfaceMatchesTheRealMonitor() {
                                          QString::fromUtf8(method.parameterMetaType(i).name()))));
         }
     }
+}
+
+// ===========================================================================
+// MediaBlocklist (we-manager media-blocklist patch)
+// ===========================================================================
+
+void TestMprisColors::playerStem_table() {
+    const QList<QPair<QString, QString>> rows {
+        { "org.mpris.MediaPlayer2.vlc", "vlc" },
+        { "org.mpris.MediaPlayer2.firefox.instance_1_84", "firefox" },
+        { "org.mpris.MediaPlayer2.chromium.instance12345", "chromium" },
+        { "org.mpris.MediaPlayer2.Spotify", "spotify" },
+        { "org.mpris.MediaPlayer2.plasma-browser-integration", "plasma-browser-integration" },
+        { "org.mpris.MediaPlayer2.io.github.celluloid_player.Celluloid", "io.github.celluloid_player.celluloid" },
+        { "org.freedesktop.Notifications", "" },
+    };
+    for (const auto& [service, stem] : rows)
+        QVERIFY2(wekde::mprisPlayerStem(service) == stem,
+                 qPrintable(service + " -> " + wekde::mprisPlayerStem(service) + ", want " + stem));
+}
+
+void TestMprisColors::parseIgnoredPlayers_table() {
+    using Set = QSet<QString>;
+    const QList<QPair<QString, Set>> rows {
+        { "Spotify, chromium ,,vlc\n bad/name", Set { "spotify", "chromium", "vlc" } },
+        { "org.mpris.MediaPlayer2.spotify", Set { "spotify" } },
+        // The prefix without regard to case: the entry is lowercased first.
+        { "org.mpris.mediaplayer2.Spotify", Set { "spotify" } },
+        { "firefox.instance_1_84 vlc.instance7389", Set { "firefox", "vlc" } },
+        { "io.github.celluloid_player.Celluloid", Set { "io.github.celluloid_player.celluloid" } },
+        { "org.mpris.MediaPlayer2.", Set {} },
+        { "  ,\t, ", Set {} },
+        { "", Set {} },
+    };
+    for (const auto& [text, want] : rows) {
+        const Set got = wekde::parseIgnoredPlayers(text);
+        QVERIFY2(got == want, qPrintable(QStringLiteral("%1 -> %2").arg(text, QStringList(got.cbegin(), got.cend()).join(','))));
+    }
+}
+
+void TestMprisColors::ignoredPlayers_skipsThePlayingPlayerForTheNext() {
+    FakeMprisService      playing("Playing");
+    FakeMprisService      paused("Paused");
+    FakeMprisRegistration a(&playing, "a");
+    FakeMprisRegistration b(&paused, "b");
+    if (! a.ok() || ! b.ok()) QSKIP("session bus or service registration unavailable in this env");
+    {
+        MprisMonitor plain;              // without the list the playing one wins
+        plain.engage();
+        QTRY_VERIFY_WITH_TIMEOUT(! plain.activeService().isEmpty(), 2000);
+        if (plain.activeService() != a.serviceName())
+            QSKIP("session bus has another MPRIS player; run under dbus-run-session");
+    }
+    MprisMonitor m;
+    m.setIgnoredPlayers(QStringLiteral("testfake_a"));
+    m.engage();
+    QTRY_COMPARE_WITH_TIMEOUT(m.activeService(), b.serviceName(), 2000);
+}
+
+void TestMprisColors::ignoredPlayers_everyPlayerIgnoredConnectsNone_andClearingTakesOneAgain() {
+    FakeMprisService      playing("Playing");
+    FakeMprisService      paused("Paused");
+    FakeMprisRegistration a(&playing, "a");
+    FakeMprisRegistration b(&paused, "b");
+    if (! a.ok() || ! b.ok()) QSKIP("session bus or service registration unavailable in this env");
+    MprisMonitor m;
+    QSignalSpy   avail(&m, &MprisMonitor::mediaAvailableChanged);
+    m.setIgnoredPlayers(QStringLiteral("testfake_a, testfake_b"));
+    m.engage();
+    QTest::qWait(500);                   // the scan's ListNames has come back
+    if (! m.activeService().isEmpty())
+        QSKIP("session bus has another MPRIS player; run under dbus-run-session");
+    QCOMPARE(m.mediaAvailable(), false);
+    QCOMPARE(avail.count(), 0);
+    m.setIgnoredPlayers(QString());
+    QTRY_COMPARE_WITH_TIMEOUT(m.activeService(), a.serviceName(), 2000);
+    QCOMPARE(m.mediaAvailable(), true);
+}
+
+void TestMprisColors::ignoredPlayers_ignoringTheActivePlayerDropsItAndTakesTheNext() {
+    FakeMprisService      playing("Playing");
+    FakeMprisService      paused("Paused");
+    FakeMprisRegistration a(&playing, "a");
+    FakeMprisRegistration b(&paused, "b");
+    if (! a.ok() || ! b.ok()) QSKIP("session bus or service registration unavailable in this env");
+    MprisMonitor m;
+    m.engage();
+    QTRY_VERIFY_WITH_TIMEOUT(! m.activeService().isEmpty(), 2000);
+    if (m.activeService() != a.serviceName())
+        QSKIP("session bus has another MPRIS player; run under dbus-run-session");
+    QSignalSpy avail(&m, &MprisMonitor::mediaAvailableChanged);
+    m.setIgnoredPlayers(QStringLiteral("testfake_a"));
+    QCOMPARE(avail.count(), 1);          // dropped at once: scripts hear the player go
+    QCOMPARE(avail.at(0).at(0).toBool(), false);
+    QCOMPARE(m.activeService(), QString());
+    QTRY_COMPARE_WITH_TIMEOUT(m.activeService(), b.serviceName(), 2000);
+    QCOMPARE(avail.last().at(0).toBool(), true);
+}
+
+void TestMprisColors::ignoredPlayers_anIgnoredPlayerAppearingIsNeitherConnectedNorRescanned() {
+    MprisMonitor m;
+    m.setIgnoredPlayers(QStringLiteral("spotify, plasma-browser-integration"));
+    invokeSlot(&m, "handleNameOwnerChanged", Q_ARG(QString, "org.mpris.MediaPlayer2.spotify"),
+               Q_ARG(QString, ""), Q_ARG(QString, ":1.77"));
+    QCOMPARE(m.activeService(), QString());
+    // With a player active, the browser integration appearing would rescan
+    // (handleNameOwnerChanged_browserIntegrationAppears_rescans); ignored, it does not.
+    if (! injectFakeService(m, kFirefoxNative))
+        QSKIP("could not establish an active MPRIS service for this test");
+    const quint64 genBefore = m.m_scanGeneration;
+    invokeSlot(&m, "handleNameOwnerChanged", Q_ARG(QString, kBrowserIntegration), Q_ARG(QString, ""),
+               Q_ARG(QString, ":1.51"));
+    QCOMPARE(m.m_scanGeneration, genBefore);
+    QCOMPARE(m.activeService(), kFirefoxNative);
+}
+
+void TestMprisColors::ignoredPlayers_sameListInOtherWordsNotifiesButDoesNotRescan() {
+    FakeMprisService      playing("Playing");
+    FakeMprisRegistration a(&playing, "a");
+    if (! a.ok()) QSKIP("session bus or service registration unavailable in this env");
+    MprisMonitor m;
+    m.engage();
+    QTRY_VERIFY_WITH_TIMEOUT(! m.activeService().isEmpty(), 2000);
+    QSignalSpy changed(&m, &MprisMonitor::ignoredPlayersChanged);
+    m.setIgnoredPlayers(QStringLiteral("vlc"));
+    QCOMPARE(changed.count(), 1);
+    const quint64 gen = m.m_scanGeneration;
+    m.setIgnoredPlayers(QStringLiteral(" VLC,"));   // other text, the same player
+    QCOMPARE(changed.count(), 2);
+    QCOMPARE(m.ignoredPlayers(), QStringLiteral(" VLC,"));
+    QCOMPARE(m.m_scanGeneration, gen);
+    m.setIgnoredPlayers(QStringLiteral(" VLC,"));   // the same text
+    QCOMPARE(changed.count(), 2);
+    QCOMPARE(m.m_scanGeneration, gen);
+}
+
+void TestMprisColors::ignoredPlayers_anInstanceNameIsIgnoredByItsStem() {
+    FakeMprisService      playing("Playing");
+    FakeMprisService      paused("Paused");
+    FakeMprisRegistration b(&playing, "b.instance42");
+    FakeMprisRegistration a(&paused, "a");
+    if (! a.ok() || ! b.ok()) QSKIP("session bus or service registration unavailable in this env");
+    QCOMPARE(wekde::mprisPlayerStem(b.serviceName()), QStringLiteral("testfake_b"));
+    MprisMonitor m;
+    m.setIgnoredPlayers(QStringLiteral("testfake_b"));
+    m.engage();
+    QTRY_COMPARE_WITH_TIMEOUT(m.activeService(), a.serviceName(), 2000);
+}
+
+// The replies to a player's first Gets, and to a position poll, that land
+// after the player was dropped (now ignored, or gone) must not reach the
+// wallpaper: the dropped player is still alive and answering.
+void TestMprisColors::lateReplies_fromAPlayerNoLongerActiveEmitNothing() {
+    FakeMprisService      playing("Playing", 120'000'000, 5'000'000, "Late", { "Reply" });
+    FakeMprisRegistration a(&playing, "a");
+    if (! a.ok()) QSKIP("session bus or service registration unavailable in this env");
+    MprisMonitor m;
+    QSignalSpy   props(&m, &MprisMonitor::propertiesChanged);
+    QSignalSpy   state(&m, &MprisMonitor::playbackStateChanged);
+    QSignalSpy   timeline(&m, &MprisMonitor::timelineChanged);
+    m.connectToPlayer(a.serviceName());  // its three Gets go out
+    invokeSlot(&m, "pollPosition");      // and a poll
+    m.disconnectFromPlayer();            // dropped before any reply is read
+    QTest::qWait(500);
+    QCOMPARE(props.count(), 0);
+    QCOMPARE(state.count(), 0);
+    QCOMPARE(timeline.count(), 0);
+    // Connected, the same replies do arrive.
+    m.connectToPlayer(a.serviceName());
+    QTRY_VERIFY_WITH_TIMEOUT(props.count() > 0, 2000);
+    QCOMPARE(props.last().at(0).toString(), QStringLiteral("Late"));
 }
 
 QTEST_GUILESS_MAIN(TestMprisColors)

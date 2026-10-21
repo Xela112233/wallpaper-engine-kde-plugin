@@ -973,6 +973,22 @@ TestCase {
         compare(Object.keys(webobj.mediaTimeline).length, 0);
     }
 
+    // MediaBlocklist (we-manager media-blocklist patch): the web page's
+    // monitor follows the screen's list live, the same monitor.
+    function test_mediaBlocklist_reachesTheMonitorLive() {
+        background.mediaIntegration = true;
+        const loader = _findMprisLoader();
+        verify(loader !== null && loader.item !== null);
+        const mpris = loader.item;
+        compare(mpris.ignoredPlayers, "");
+        background.mediaBlocklist = "vlc";
+        compare(mpris.ignoredPlayers, "vlc");
+        compare(loader.item, mpris);
+        compare(mpris.engageCount, 1);
+        background.mediaBlocklist = "";
+        compare(mpris.ignoredPlayers, "");
+    }
+
     function test_mediaIntegration_offDestroysTheMonitorAndClears() {
         background.mediaIntegration = true;
         const loader = _findMprisLoader();

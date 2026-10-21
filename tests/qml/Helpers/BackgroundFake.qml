@@ -27,6 +27,7 @@ QtObject {
     property bool   systemAudioCapture: true // matches main.xml default
     property bool   verboseLogging: false    // matches main.xml default (VerboseLogging)
     property bool   mediaIntegration: true   // matches main.xml default
+    property string mediaBlocklist:   ""     // matches main.xml default (media-blocklist patch)
     property bool   cameraParallax: true  // per-wallpaper mouse_parallax (main.qml)
     property bool   pixelArt:    false    // per-wallpaper pixel_art (main.qml)
     property int    processPriority: 0    // ProcessPriority (main.qml), matches main.xml default

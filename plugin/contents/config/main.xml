@@ -252,6 +252,10 @@
       <label>Media integration: scene and web wallpapers get the media player's title, artist, album, cover, playback state and position over MPRIS</label>
       <default>true</default>
     </entry>
+    <entry name="MediaBlocklist" type="String">
+      <label>Media players the media integration ignores: MPRIS names (the part after org.mpris.MediaPlayer2., without a .instance suffix), comma-separated, for example spotify,chromium</label>
+      <default></default>
+    </entry>
     <entry name="VideoFolderPath" type="Path">
       <label>Plain video wallpapers folder</label>
       <default></default>

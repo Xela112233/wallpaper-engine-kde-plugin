@@ -12,6 +12,7 @@
 #include <QNetworkReply>
 #include <QThreadPool>
 #include <QSet>
+#include <QRegularExpression>
 #include <QUrl>
 #include <QDebug>
 #include <QLoggingCategory>
@@ -108,6 +109,59 @@ int wekde::mprisPlayerRank(const QString& service, bool playing) {
     return (playing ? 2 : 0) + (service == browserIntegration ? 1 : 0);
 }
 
+namespace
+{
+// An MPRIS name, already lowercased, cut to its stem: the prefix and an
+// .instance suffix off.
+QString stemOfLowered(QString name) {
+    static const QString prefix   = QString::fromLatin1(MPRIS_PREFIX).toLower();
+    static const QString instance = QStringLiteral(".instance");
+    if (name.startsWith(prefix)) name.remove(0, prefix.size());
+    const int cut = name.indexOf(instance);
+    if (cut >= 0) name.truncate(cut);
+    return name;
+}
+} // namespace
+
+QString wekde::mprisPlayerStem(const QString& service) {
+    const QString lowered = service.toLower();
+    if (! lowered.startsWith(QString::fromLatin1(MPRIS_PREFIX).toLower())) return QString();
+    return stemOfLowered(lowered);
+}
+
+QSet<QString> wekde::parseIgnoredPlayers(const QString& text) {
+    static const QRegularExpression separators(QStringLiteral("[,\\s]+"));
+    static const QRegularExpression valid(QStringLiteral("^[a-z0-9_.-]+$"));
+    QSet<QString> out;
+    for (const QString& entry : text.split(separators, Qt::SkipEmptyParts)) {
+        const QString stem = stemOfLowered(entry.trimmed().toLower());
+        if (! stem.isEmpty() && valid.match(stem).hasMatch()) out.insert(stem);
+    }
+    return out;
+}
+
+bool MprisMonitor::ignored(const QString& service) const {
+    return ! m_ignored.isEmpty() && m_ignored.contains(mprisPlayerStem(service));
+}
+
+void MprisMonitor::setIgnoredPlayers(const QString& text) {
+    if (text == m_ignoredText) return;
+    m_ignoredText = text;
+    emit ignoredPlayersChanged();
+    const QSet<QString> now = parseIgnoredPlayers(text);
+    if (now == m_ignored) return;    // the same players in other words: nothing to do
+    m_ignored = now;
+    QStringList sorted(now.cbegin(), now.cend());
+    sorted.sort();
+    qCInfo(lcWekMpris) << "MprisMonitor: ignored players" << sorted;
+    if (! m_engaged) return;         // engage()'s first scan reads them
+    if (! m_activeService.isEmpty() && ignored(m_activeService)) {
+        qCInfo(lcWekMpris) << "MprisMonitor: dropped" << m_activeService << "(MediaBlocklist)";
+        disconnectFromPlayer();
+    }
+    findActivePlayer();
+}
+
 bool wekde::mprisScanCandidateBetter(int rank, int index, int bestRank, int bestIndex) {
     if (bestIndex < 0) return true;
     return rank > bestRank || (rank == bestRank && index < bestIndex);
@@ -202,7 +256,7 @@ void MprisMonitor::findActivePlayer() {
                 // regardless of async reply arrival order.
                 QStringList players;
                 for (const QString& name : reply.value()) {
-                    if (name.startsWith(MPRIS_PREFIX)) players << name;
+                    if (name.startsWith(MPRIS_PREFIX) && ! ignored(name)) players << name;
                 }
                 if (players.isEmpty()) return;
 
@@ -356,7 +410,8 @@ void MprisMonitor::fetchAllProperties() {
                      MPRIS_PATH,
                      MPRIS_PLAYER_IF,
                      "PlaybackStatus",
-                     [this](const QVariant& v) {
+                     [this, service](const QVariant& v) {
+                         if (service != m_activeService) return;   // a player since dropped
                          applyPlaybackStatus(v.toString());
                      });
 
@@ -368,7 +423,8 @@ void MprisMonitor::fetchAllProperties() {
                      MPRIS_PATH,
                      MPRIS_PLAYER_IF,
                      "Metadata",
-                     [this](const QVariant& v) {
+                     [this, service](const QVariant& v) {
+                         if (service != m_activeService) return;
                          applyMetadata(qdbus_cast<QVariantMap>(v.value<QDBusArgument>()));
                      });
 
@@ -379,7 +435,8 @@ void MprisMonitor::fetchAllProperties() {
                      MPRIS_PATH,
                      MPRIS_PLAYER_IF,
                      "Position",
-                     [this](const QVariant& v) {
+                     [this, service](const QVariant& v) {
+                         if (service != m_activeService) return;
                          m_lastPosition = v.toLongLong() / 1e6;
                          emit timelineChanged(m_lastPosition, m_duration, m_playbackState);
                      });
@@ -415,6 +472,9 @@ void MprisMonitor::handleNameOwnerChanged(const QString& name, const QString& ol
                                           const QString& newOwner) {
     Q_UNUSED(oldOwner)
     if (! name.startsWith(MPRIS_PREFIX)) return;
+    // An ignored player is never connected and starts no rescan; the active
+    // one vanishing is still handled.
+    if (ignored(name) && name != m_activeService) return;
 
     if (! newOwner.isEmpty() && m_activeService.isEmpty()) {
         // New player appeared and we have no active one
@@ -444,10 +504,13 @@ void MprisMonitor::pollPosition() {
     msg << QString(MPRIS_PLAYER_IF) << QStringLiteral("Position");
     m_pollPending = true;
     auto* watcher = new QDBusPendingCallWatcher(m_sessionBus.asyncCall(msg), this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher* w) {
+    const QString service = m_activeService;
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, service](QDBusPendingCallWatcher* w) {
         m_pollPending                     = false;
         QDBusPendingReply<QVariant> reply = *w;
-        if (reply.isValid()) {
+        // A reply from a player dropped since (MediaBlocklist, or gone)
+        // must not move the new one's timeline.
+        if (reply.isValid() && service == m_activeService) {
             m_lastPosition = reply.value().toLongLong() / 1e6;
             emit timelineChanged(m_lastPosition, m_duration, m_playbackState);
         }

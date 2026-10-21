@@ -110,6 +110,21 @@ TestCase {
         compare(mpris.engageCount, 1);
     }
 
+    // MediaBlocklist (we-manager media-blocklist patch): the screen's list
+    // reaches the monitor's ignoredPlayers, and a change reaches the same
+    // monitor live: no new monitor, no second engage().
+    function test_mediaBlocklist_reachesTheMonitorLive() {
+        const mpris = _findChildByMethodName(scene, "invokeShortcut");
+        verify(mpris !== null);
+        compare(mpris.ignoredPlayers, "");
+        background.mediaBlocklist = "spotify,chromium";
+        compare(mpris.ignoredPlayers, "spotify,chromium");
+        compare(_findChildByMethodName(scene, "invokeShortcut"), mpris);
+        compare(mpris.engageCount, 1);
+        background.mediaBlocklist = "";
+        compare(mpris.ignoredPlayers, "");
+    }
+
     function test_mprisPlaybackStateForwardsToPlayer() {
         const mpris  = _findChildByMethodName(scene, "invokeShortcut");
         const player = _findScenePlayer();

@@ -1,6 +1,6 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: src/MprisMonitor.hpp + src/MprisMonitor.cpp
-// Last contract review: 2026-09-08
+// Last contract review: 2026-11-11
 //
 // tst_mpriscolors::qmlStubSurfaceMatchesTheRealMonitor diffs everything below
 // against MprisMonitor's metaobject, so a member the real monitor does not
@@ -17,6 +17,9 @@ QtObject {
     // `mediaAvailable` property can't live here too — QML would auto-generate
     // a second, parameterless mediaAvailableChanged for it.
     signal mediaAvailableChanged(bool available)
+    // MediaBlocklist's text (we-manager media-blocklist patch), as the real
+    // Q_PROPERTY; QML generates the same argument-less ignoredPlayersChanged.
+    property string ignoredPlayers: ""
 
     // ── test recorders (test-only stub) ──────────────────────────────────
     property int  invokeShortcutCount: 0

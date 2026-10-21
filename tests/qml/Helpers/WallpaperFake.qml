@@ -78,6 +78,7 @@ Item {
         "PostProcessing":      "",
         "SystemAudioCapture":  true,      // matches main.xml default
         "MediaIntegration":    true,      // matches main.xml default
+        "MediaBlocklist":      "",        // matches main.xml default (media-blocklist patch)
         "VideoFolderPath":     "",
         "PostProcessingLevels": true,    // marker key, never read
         "ActivePlaylistId":    "",
