@@ -574,7 +574,10 @@ Flickable {
                         id: sliderFps
                         Layout.fillWidth: true
                         from: 5
-                        to: 60
+                        // The key has no maximum and the renderer takes up to
+                        // 1000; 240 covers today's fastest panels.  A lower
+                        // `to` would clamp a value set elsewhere on Apply.
+                        to: 240
                         stepSize: 1.0
                         snapMode: Slider.SnapOnRelease
                     }

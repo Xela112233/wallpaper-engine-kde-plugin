@@ -178,8 +178,10 @@ Item {
         WebChannel.id: "wpeQml"
         onLoadedChanged: {
             if (!loaded) return;  // only react to false->true (lifecycle thaws are silent)
+            // The page gets the configured Fps from the start (Wallpaper
+            // Engine's applyGeneralProperties); onFpsChanged keeps it current.
             if (!webobj.generalProperties || Object.keys(webobj.generalProperties).length === 0)
-                webobjCtl.pushGeneralProperties({fps: 24});
+                webobjCtl.pushGeneralProperties({fps: webItem.fps});
             var wpDir = Common.urlNative(webItem.source.toString());
             wpDir = wpDir.substring(0, wpDir.lastIndexOf('/'));
             // Load user properties from project.json BEFORE signaling,
@@ -201,7 +203,7 @@ Item {
                 // pushUserProperties + pushGeneralProperties each fire their
                 // matching sig* signal automatically — no explicit emit needed.
                 webobjCtl.pushUserProperties(userProps);
-                webobjCtl.pushGeneralProperties(webobj.generalProperties || {fps: 24});
+                webobjCtl.pushGeneralProperties(webobj.generalProperties || {fps: webItem.fps});
             });
         }
     }
