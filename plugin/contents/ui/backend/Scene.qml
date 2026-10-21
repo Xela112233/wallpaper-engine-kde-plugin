@@ -127,6 +127,12 @@ Item{
             // priority patch has no processPriority (Common.setIfSupported).
             Common.setIfSupported(player, "SceneViewer", "processPriority",
                                   Qt.binding(function() { return background.processPriority; }));
+            // Hardware video decoding for the scene's video layers
+            // (mpv-options patch, MpvHwdec); a change reloads the scene.
+            // Before the first frame: the scene loads only once the renderer
+            // is up, so the first load already uses it.
+            Common.setIfSupported(player, "SceneViewer", "videoHwdec",
+                                  Qt.binding(function() { return background.mpvHwdec; }));
         }
 
         Connections {
@@ -282,6 +288,7 @@ Item{
         player.postprocessingOverride = player.postprocessingOverride;
         player.cameraParallax = player.cameraParallax;
         player.pixelArt = player.pixelArt;
+        if ("videoHwdec" in player) player.videoHwdec = player.videoHwdec;
         player.muted = player.muted;
         volumeFade.freeze();
     }

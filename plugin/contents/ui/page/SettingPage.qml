@@ -21,6 +21,8 @@ Flickable {
     property alias cfg_MpvStats: ckbox_mpvStats.checked
     property alias cfg_MpvPowerSaving: ckbox_mpvPowerSaving.checked
     property alias cfg_MpvInterpolation: ckbox_mpvInterpolation.checked
+    property alias cfg_MpvHwdec: ckbox_mpvHwdec.checked
+    property alias cfg_MpvLoadInMemory: ckbox_mpvLoadInMemory.checked
     property alias cfg_VerboseLogging: ckbox_verboseLogging.checked
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
@@ -819,6 +821,50 @@ Flickable {
                     enabled: !ckbox_mpvPowerSaving.checked
                     ToolTip.visible: hovered
                     ToolTip.text: i18nc("@info:tooltip", "mpv frame interpolation (tscale=oversample): blends neighbouring frames where a frame change falls between two display refreshes, and retimes the video to the display (up to 1% faster or slower; with sound, the pitch moves as much). Redraws at the display's refresh rate, so it costs noticeably more GPU time, most on high-refresh panels. Video is then timed by the refreshes drawn: if the desktop cannot draw every one, it plays slower than normal; switch this off then. Has no effect while power-saving playback is on.")
+                }
+            }
+
+            // Shown for both backends: video layers inside scenes follow it too.
+            OptionItem {
+                text: i18nc("@label settings option", "Hardware video decoding")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/tuning.svg'
+                actor: Switch {
+                    id: ckbox_mpvHwdec
+                    ToolTip.visible: hovered
+                    ToolTip.text: i18nc("@info:tooltip", "Decode video wallpapers (mpv) and video layers in scenes on the GPU through VA-API where possible. Switch it off only when the driver's video decoding is broken (black or green frames, flicker, periodic black screens): decoding then runs on the CPU, which costs noticeably more CPU time. The QtMultimedia backend chooses its own decoder.")
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Load video into memory")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/tuning.svg'
+                visible: cfg_VideoBackend == Common.VideoBackend.Mpv
+                actor: Switch {
+                    id: ckbox_mpvLoadInMemory
+                    ToolTip.visible: hovered
+                    ToolTip.text: i18nc("@info:tooltip", "Keep the whole video file (up to 1 GiB) in mpv's cache, so a loop never reads the disk again. Uses as much memory as the file is large. Applies from the next video loaded. Most useful for large files on slow disks; the system's file cache usually keeps a looping file in memory anyway.")
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Video timing")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/tuning.svg'
+                visible: cfg_VideoBackend == Common.VideoBackend.Mpv
+                enabled: !ckbox_mpvPowerSaving.checked && !ckbox_mpvInterpolation.checked
+                actor: ComboBox {
+                    model: [
+                        { text: i18nc("@item:inlistbox video timing", "Video clock (default)"),           value: 0 },
+                        { text: i18nc("@item:inlistbox video timing", "Resample to the display"),         value: 1 },
+                        { text: i18nc("@item:inlistbox video timing", "Drop or repeat frames to the display"), value: 2 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_MpvVideoSync = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_MpvVideoSync))
+                    ToolTip.visible: hovered
+                    ToolTip.text: i18nc("@info:tooltip", "How mpv times the frames, which decides how smooth playback and the loop point look on a given screen. Video clock: frames at the video's own rate, as the plugin always did. Resample to the display: mpv retimes the video to the screen's refresh rate (up to 1% faster or slower). Drop or repeat frames: the video keeps its own speed and mpv drops or repeats a frame where the two rates drift apart. Both display modes count the refreshes the desktop draws, so if it cannot draw every one the video may play slower; go back to Video clock then. Smooth video motion and power-saving playback set their own timing and take precedence.")
                 }
             }
         }

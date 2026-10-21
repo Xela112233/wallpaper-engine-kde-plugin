@@ -51,6 +51,11 @@ public:
     int width() const { return m_width; }
     int height() const { return m_height; }
 
+    /// Before open(): false sets mpv's hwdec=no instead of vaapi, so the
+    /// video decodes on the CPU (the KDE plugin's MpvHwdec off).
+    void setHardwareDecoding(bool on) { m_hwdec = on; }
+    bool hardwareDecoding() const { return m_hwdec; }
+
 protected:
     static void  onMpvRenderUpdate(void* ctx);
     virtual void renderFrame();
@@ -58,6 +63,7 @@ protected:
     int    m_width;
     int    m_height;
     size_t m_stride;
+    bool   m_hwdec { true };
 
     mpv_handle*         m_mpv { nullptr };
     mpv_render_context* m_renderCtx { nullptr };

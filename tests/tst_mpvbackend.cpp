@@ -24,6 +24,8 @@
 #include <QTemporaryFile>
 #include <QUrl>
 #include <QVariant>
+#include <QQuickWindow>
+#include <QScreen>
 
 #include <clocale>
 
@@ -156,6 +158,15 @@ private slots:
     void powerSaving_setsFastOptions_andRestoresPrevious();
     void powerSaving_defaultOff_leavesOptionsAlone();
     void interpolation_withoutWindow_writesNothing();
+    // mpv-options patch (MpvHwdec, MpvLoadInMemory, MpvVideoSync, streams).
+    void hwdec_defaultAuto_offWritesNo();
+    void cachePlan_table();
+    void isNetworkSource_schemes();
+    void loadInMemory_sizesCacheBeforeLoad_andGoesBack();
+    void localFile_withoutLoadInMemory_keepsCacheOff();
+    void networkSource_enablesCache();
+    void videoSync_withoutWindow_writesNothing();
+    void videoSync_onScreen_precedence();
     void frameCapDelayMs_table();
     void maxFps_negativeClampsToUncapped();
     void beginShutdown_neverInitializedCore_doesNotWarn();
@@ -889,6 +900,21 @@ void TestMpvBackend::powerSaving_setsFastOptions_andRestoresPrevious() {
     QCOMPARE(obj->getProperty("video-sync").toString(), QStringLiteral("display-resample"));
 }
 
+namespace
+{
+// An option as mpv's own string form spells it: the node API hands flags
+// (interpolation, cache=yes/no) back as bools and hwdec as a list.
+QString optionText(MpvObject* obj, const char* name) {
+    const QVariant v = obj->getProperty(QString::fromLatin1(name));
+    if (v.typeId() == QMetaType::Bool) return v.toBool() ? QStringLiteral("yes") : QStringLiteral("no");
+    if (v.typeId() == QMetaType::QVariantList) return v.toStringList().join(QLatin1Char(','));
+    return v.toString();
+}
+qint64 int64Property(MpvObject* obj, const char* name) {
+    return obj->getProperty(QString::fromLatin1(name)).toLongLong();
+}
+} // namespace
+
 // MpvInterpolation needs a screen to take its refresh rate from; an item that
 // is not on screen (or never had interpolation on) must leave mpv's options as
 // the constructor set them, so the default path is exactly as before.
@@ -899,13 +925,169 @@ void TestMpvBackend::interpolation_withoutWindow_writesNothing() {
     obj->setInterpolation(true);
     QCOMPARE(spy.count(), 1);
     QVERIFY(obj->interpolation());
-    QCOMPARE(obj->getProperty("interpolation").toString(), QStringLiteral("no"));
+    QCOMPARE(optionText(obj.get(), "interpolation"), QStringLiteral("no"));
     QCOMPARE(obj->getProperty("video-sync").toString(), QStringLiteral("display-resample"));
     obj->setPowerSaving(true);
     obj->setPowerSaving(false);
     QCOMPARE(obj->getProperty("video-sync").toString(), QStringLiteral("display-resample"));
     obj->setInterpolation(false);
     QCOMPARE(spy.count(), 2);
+}
+
+void TestMpvBackend::hwdec_defaultAuto_offWritesNo() {
+    auto obj = makeObject();
+    QVERIFY(obj->hwdec());
+    QCOMPARE(optionText(obj.get(), "hwdec"), QStringLiteral("auto"));
+    QSignalSpy spy(obj.get(), &MpvObject::hwdecChanged);
+    obj->setHwdec(true); // unchanged: no write, no signal
+    QCOMPARE(spy.count(), 0);
+    obj->setHwdec(false);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(optionText(obj.get(), "hwdec"), QStringLiteral("no"));
+    obj->setHwdec(true);
+    QCOMPARE(optionText(obj.get(), "hwdec"), QStringLiteral("auto"));
+    QCOMPARE(spy.count(), 2);
+}
+
+void TestMpvBackend::cachePlan_table() {
+    using P = MpvObject::CachePlan;
+    // Streams: mpv's cache with its own sizes, whatever loadInMemory says.
+    P p = MpvObject::cachePlan(true, false, -1);
+    QVERIFY(p.cache);
+    QCOMPARE(p.maxBytes, qint64(0));
+    QCOMPARE(p.maxBackBytes, qint64(0));
+    QVERIFY(MpvObject::cachePlan(true, true, 1000).cache);
+    // A local file without the option: no cache, as before the patch.
+    QVERIFY(! MpvObject::cachePlan(false, false, 100 << 20).cache);
+    // In memory: room for all of it, forward and back.
+    const qint64 size = qint64(100) << 20;
+    p                 = MpvObject::cachePlan(false, true, size);
+    QVERIFY(p.cache);
+    QVERIFY(p.maxBytes > size);
+    QCOMPARE(p.maxBackBytes, p.maxBytes);
+    // Unknown size, or too large for the cap: stays on disk.
+    QVERIFY(! MpvObject::cachePlan(false, true, -1).cache);
+    QVERIFY(! MpvObject::cachePlan(false, true, MpvObject::kMemoryCacheCap).cache);
+    QVERIFY(MpvObject::cachePlan(false, true, qint64(800) << 20).maxBytes <= MpvObject::kMemoryCacheCap);
+}
+
+void TestMpvBackend::isNetworkSource_schemes() {
+    QVERIFY(MpvObject::isNetworkSource(QUrl("https://example.invalid/live.m3u8")));
+    QVERIFY(MpvObject::isNetworkSource(QUrl("HTTP://example.invalid/a.mp4")));
+    QVERIFY(MpvObject::isNetworkSource(QUrl("rtsp://example.invalid/cam")));
+    QVERIFY(MpvObject::isNetworkSource(QUrl("ytdl://abc")));
+    QVERIFY(! MpvObject::isNetworkSource(QUrl::fromLocalFile("/tmp/a.mp4")));
+    QVERIFY(! MpvObject::isNetworkSource(QUrl("qrc:/a.mp4")));
+}
+
+
+void TestMpvBackend::loadInMemory_sizesCacheBeforeLoad_andGoesBack() {
+    auto obj = makeObject();
+    obj->initCallback();
+    const qint64 defaultMax  = int64Property(obj.get(), "demuxer-max-bytes");
+    const qint64 defaultBack = int64Property(obj.get(), "demuxer-max-back-bytes");
+    QVERIFY(defaultMax > 0);
+
+    QTemporaryFile file(QDir::temp().filePath(QStringLiteral("wekde-mpv-memXXXXXX.mp4")));
+    QVERIFY(file.open());
+    file.write(QByteArray(3 << 20, '\0'));
+    file.flush();
+    QSignalSpy spy(obj.get(), &MpvObject::loadInMemoryChanged);
+    obj->setLoadInMemory(true);
+    QCOMPARE(spy.count(), 1);
+    obj->setSource(QUrl::fromLocalFile(file.fileName()));
+    const auto plan = MpvObject::cachePlan(false, true, file.size());
+    QCOMPARE(optionText(obj.get(), "cache"), QStringLiteral("yes"));
+    QCOMPARE(int64Property(obj.get(), "demuxer-max-bytes"), plan.maxBytes);
+    QCOMPARE(int64Property(obj.get(), "demuxer-max-back-bytes"), plan.maxBackBytes);
+
+    // Off again: the next load is back on the constructor's cache=no and
+    // mpv's own sizes.
+    QTemporaryFile other(QDir::temp().filePath(QStringLiteral("wekde-mpv-diskXXXXXX.mp4")));
+    QVERIFY(other.open());
+    other.write(QByteArray(1024, '\0'));
+    other.flush();
+    obj->setLoadInMemory(false);
+    obj->setSource(QUrl::fromLocalFile(other.fileName()));
+    QCOMPARE(optionText(obj.get(), "cache"), QStringLiteral("no"));
+    QCOMPARE(int64Property(obj.get(), "demuxer-max-bytes"), defaultMax);
+    QCOMPARE(int64Property(obj.get(), "demuxer-max-back-bytes"), defaultBack);
+}
+
+void TestMpvBackend::localFile_withoutLoadInMemory_keepsCacheOff() {
+    auto obj = makeObject();
+    obj->initCallback();
+    const qint64 defaultMax = int64Property(obj.get(), "demuxer-max-bytes");
+    QTemporaryFile file(QDir::temp().filePath(QStringLiteral("wekde-mpv-plainXXXXXX.mp4")));
+    QVERIFY(file.open());
+    file.write(QByteArray(1024, '\0'));
+    file.flush();
+    obj->setSource(QUrl::fromLocalFile(file.fileName()));
+    QCOMPARE(optionText(obj.get(), "cache"), QStringLiteral("no"));
+    QCOMPARE(int64Property(obj.get(), "demuxer-max-bytes"), defaultMax);
+}
+
+void TestMpvBackend::networkSource_enablesCache() {
+    auto obj = makeObject();
+    obj->initCallback();
+    // mpv opens it asynchronously; nothing here waits for the (absent) network.
+    obj->setSource(QUrl("http://127.0.0.1:9/never.mp4"));
+    QCOMPARE(optionText(obj.get(), "cache"), QStringLiteral("yes"));
+}
+
+void TestMpvBackend::videoSync_withoutWindow_writesNothing() {
+    auto obj = makeObject();
+    QSignalSpy spy(obj.get(), &MpvObject::videoSyncChanged);
+    obj->setVideoSync(2);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(obj->videoSync(), 2);
+    QCOMPARE(obj->getProperty("video-sync").toString(), QStringLiteral("display-resample"));
+    obj->setVideoSync(7); // out of range: the video clock
+    QCOMPARE(obj->videoSync(), 0);
+}
+
+// On a window: the display modes engage with the screen's rate, power saving
+// beats interpolation beats videoSync, and leaving them all goes to the clock.
+void TestMpvBackend::videoSync_onScreen_precedence() {
+    QQuickWindow win;
+    auto         obj = makeObject();
+    obj->setParentItem(win.contentItem());
+    QVERIFY(obj->window() == &win);
+    QScreen* screen = win.screen();
+    if (! screen || screen->refreshRate() <= 0) QSKIP("the platform reports no screen refresh rate");
+    const double hz = screen->refreshRate();
+    auto overrideHz = [&] { return obj->getProperty("display-fps-override").toDouble(); };
+    auto sync       = [&] { return obj->getProperty("video-sync").toString(); };
+    auto interp     = [&] { return optionText(obj.get(), "interpolation"); };
+    // Nothing chosen: the constructor's options stand.
+    QCOMPARE(sync(), QStringLiteral("display-resample"));
+    QCOMPARE(overrideHz(), 0.0);
+
+    obj->setVideoSync(2);
+    QCOMPARE(sync(), QStringLiteral("display-vdrop"));
+    QCOMPARE(qRound(overrideHz()), qRound(hz));
+    QCOMPARE(interp(), QStringLiteral("no"));
+
+    obj->setInterpolation(true);
+    QCOMPARE(sync(), QStringLiteral("display-resample"));
+    QCOMPARE(interp(), QStringLiteral("yes"));
+    obj->setInterpolation(false);
+    QCOMPARE(sync(), QStringLiteral("display-vdrop"));
+    QCOMPARE(interp(), QStringLiteral("no"));
+
+    obj->setPowerSaving(true);
+    QCOMPARE(sync(), QStringLiteral("audio"));
+    QCOMPARE(overrideHz(), 0.0);
+    obj->setPowerSaving(false);
+    QCOMPARE(sync(), QStringLiteral("display-vdrop"));
+    QCOMPARE(qRound(overrideHz()), qRound(hz));
+
+    obj->setVideoSync(1);
+    QCOMPARE(sync(), QStringLiteral("display-resample"));
+    obj->setVideoSync(0);
+    QCOMPARE(sync(), QStringLiteral("audio"));
+    QCOMPARE(overrideHz(), 0.0);
+    obj->setParentItem(nullptr);
 }
 
 void TestMpvBackend::powerSaving_defaultOff_leavesOptionsAlone() {

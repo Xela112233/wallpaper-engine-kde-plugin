@@ -4,6 +4,7 @@
 #include <QtGlobal>
 #include <QtCore/QObject>
 #include <QtCore/QDir>
+#include <QtCore/QFileInfo>
 #include <QtCore/QThread>
 
 #include <QtGui/QGuiApplication>
@@ -370,15 +371,96 @@ void MpvObject::setPowerSaving(bool on) {
     }
     // Interpolation needs display sync, which power saving turns off; whichever
     // of the two QML bindings fires last, its video-sync must end up right.
-    applyInterpolation(true);
+    applyDisplaySync(true);
     emit powerSavingChanged();
 }
 
 void MpvObject::setInterpolation(bool on) {
     if (on == m_interpolation) return;
     m_interpolation = on;
-    applyInterpolation();
+    applyDisplaySync();
     emit interpolationChanged();
+}
+
+// hwdec is a runtime option: mpv reopens the decoder of the playing file.
+// Never switched off, nothing is written and the constructor's auto stands.
+void MpvObject::setHwdec(bool on) {
+    if (on == m_hwdec) return;
+    m_hwdec = on;
+    if (m_inited_ok && ! m_stopping) mpv_set_property_string(m_mpv, "hwdec", on ? "auto" : "no");
+    emit hwdecChanged();
+}
+
+// Taken at the next load (setSource): the demuxer cache is sized when mpv
+// opens the file.
+void MpvObject::setLoadInMemory(bool on) {
+    if (on == m_loadInMemory) return;
+    m_loadInMemory = on;
+    emit loadInMemoryChanged();
+}
+
+void MpvObject::setVideoSync(int mode) {
+    mode = (mode >= 0 && mode <= 2) ? mode : 0;
+    if (mode == m_videoSync) return;
+    m_videoSync = mode;
+    applyDisplaySync();
+    emit videoSyncChanged();
+}
+
+const char* MpvObject::videoSyncMode(int mode) {
+    switch (mode) {
+    case 1: return "display-resample";
+    case 2: return "display-vdrop";
+    default: return nullptr;
+    }
+}
+
+bool MpvObject::isNetworkSource(const QUrl& source) {
+    static const QStringList schemes { "http", "https", "rtmp", "rtmps", "rtsp", "rtp",
+                                       "udp",  "tcp",   "srt",  "mms",   "ytdl" };
+    return schemes.contains(source.scheme().toLower());
+}
+
+MpvObject::CachePlan MpvObject::cachePlan(bool network, bool loadInMemory, qint64 fileSize) {
+    CachePlan plan;
+    if (network) {
+        // mpv's own stream defaults: readahead into a cache of its default size.
+        plan.cache = true;
+        return plan;
+    }
+    if (loadInMemory && fileSize > 0) {
+        // The cache holds demuxed packets, a little more than the file's bytes.
+        const qint64 want = fileSize + fileSize / 8 + (qint64(4) << 20);
+        // A file that does not fit stays on disk, as without the option.
+        if (want <= kMemoryCacheCap) {
+            plan.cache        = true;
+            plan.maxBytes     = want;
+            plan.maxBackBytes = want; // the played part stays, for the loop's seek back
+        }
+    }
+    return plan;
+}
+
+// Before each loadfile.  A player that never loads a stream or a file into
+// memory writes nothing here, so its options stay the constructor's.
+void MpvObject::applyCachePlan(const QUrl& source) {
+    qint64 size = -1;
+    if (m_loadInMemory && source.isLocalFile()) {
+        const QFileInfo fi(source.toLocalFile());
+        if (fi.isFile()) size = fi.size();
+    }
+    const CachePlan plan = cachePlan(isNetworkSource(source), m_loadInMemory, size);
+    if (m_loadInMemory && size > 0 && ! plan.cache) {
+        qCWarning(wekdeMpv) << "load into memory: the file is larger than the 1 GiB cache, playing it from disk:"
+                            << source.toLocalFile() << size << "bytes";
+    }
+    if (! plan.cache && ! m_cacheTouched) return;
+    mpv_set_property_string(m_mpv, "cache", plan.cache ? "yes" : "no");
+    int64_t fwd  = plan.maxBytes ? plan.maxBytes : m_defaultMaxBytes;
+    int64_t back = plan.maxBackBytes ? plan.maxBackBytes : m_defaultMaxBackBytes;
+    if (fwd > 0) mpv_set_property(m_mpv, "demuxer-max-bytes", MPV_FORMAT_INT64, &fwd);
+    if (back > 0) mpv_set_property(m_mpv, "demuxer-max-back-bytes", MPV_FORMAT_INT64, &back);
+    m_cacheTouched = true;
 }
 
 // The window can be absent (not in a scene yet) or move to another screen;
@@ -386,38 +468,52 @@ void MpvObject::setInterpolation(bool on) {
 void MpvObject::followScreen() {
     QObject::disconnect(m_refreshConn);
     QScreen* s = window() ? window()->screen() : nullptr;
-    if (s) m_refreshConn = connect(s, &QScreen::refreshRateChanged, this, [this] { applyInterpolation(); });
-    applyInterpolation();
+    if (s) m_refreshConn = connect(s, &QScreen::refreshRateChanged, this, [this] { applyDisplaySync(); });
+    applyDisplaySync();
 }
 
-// Owns video-sync once interpolation has been on.  On: display-resample with
-// the screen's rate as display-fps-override (vo_libmpv cannot report it, and
-// interpolation needs display sync).  Off again: video-sync=audio, i.e. the
-// system clock without an audio track, which is what display-resample did
-// here before (it never engaged) and what keeps mpv from syncing to a rate it
-// measured meanwhile.  Never on: nothing is written, the constructor's options
-// stand.  `force` re-applies after setPowerSaving() restored its options.
-void MpvObject::applyInterpolation(bool force) {
+// Owns video-sync once interpolation or a display videoSync mode has been on.
+// Interpolation: display-resample with the screen's rate as
+// display-fps-override (vo_libmpv cannot report it, and without it mpv's
+// display sync never starts), tscale=oversample, interpolation=yes.  A
+// display videoSync mode: that video-sync with the same override, no
+// interpolation.  Power saving (video-sync=audio, its own) wins over both,
+// interpolation over videoSync.  None of them wanted any more:
+// video-sync=audio, i.e. the system clock without an audio track, which is
+// what display-resample did here before (it never engaged) and what keeps mpv
+// from syncing to a rate it measured meanwhile.  Never on: nothing is written,
+// the constructor's options stand.  `force` re-applies after setPowerSaving()
+// restored its options.
+void MpvObject::applyDisplaySync(bool force) {
     if (! m_inited_ok || m_stopping || ! window()) return; // nothing on screen to retime
-    const QScreen* s    = window()->screen();
-    const double   hz   = s ? s->refreshRate() : 0.0;
-    const bool     want = m_interpolation && ! m_powerSaving && hz > 0;
-    if (want) {
-        if (! force && m_appliedOn && hz == m_appliedHz) return;
+    const QScreen* s      = window()->screen();
+    const double   hz     = s ? s->refreshRate() : 0.0;
+    const bool     interp = m_interpolation && ! m_powerSaving && hz > 0;
+    const char*    mode   = (m_powerSaving || hz <= 0) ? nullptr
+                            : interp                    ? "display-resample"
+                                                        : videoSyncMode(m_videoSync);
+    if (mode) {
+        if (! force && m_appliedSync == mode && m_appliedOn == interp && hz == m_appliedHz) return;
         const QByteArray fps = QByteArray::number(hz, 'f', 3);
-        mpv_set_property_string(m_mpv, "video-sync", "display-resample");
+        mpv_set_property_string(m_mpv, "video-sync", mode);
         mpv_set_property_string(m_mpv, "display-fps-override", fps.constData());
-        mpv_set_property_string(m_mpv, "tscale", "oversample");
-        mpv_set_property_string(m_mpv, "interpolation", "yes");
-        m_appliedOn = true;
-        m_appliedHz = hz;
-        m_syncOwned = true;
+        if (interp) {
+            mpv_set_property_string(m_mpv, "tscale", "oversample");
+            mpv_set_property_string(m_mpv, "interpolation", "yes");
+        } else if (m_appliedOn) {
+            mpv_set_property_string(m_mpv, "interpolation", "no");
+        }
+        m_appliedOn   = interp;
+        m_appliedSync = mode;
+        m_appliedHz   = hz;
+        m_syncOwned   = true;
     } else {
-        if (! m_syncOwned || (! force && ! m_appliedOn)) return;
+        if (! m_syncOwned || (! force && m_appliedSync.empty())) return;
         mpv_set_property_string(m_mpv, "interpolation", "no");
         mpv_set_property_string(m_mpv, "display-fps-override", "0");
         mpv_set_property_string(m_mpv, "video-sync", "audio");
         m_appliedOn = false;
+        m_appliedSync.clear();
         m_appliedHz = 0;
     }
 }
@@ -474,6 +570,7 @@ void MpvObject::setSource(const QUrl& source) {
         m_source = source;
         return;
     }
+    applyCachePlan(source);
     bool result = this->command(QVariantList {
         "loadfile",
         source.isLocalFile() ? QDir::toNativeSeparators(source.toLocalFile()) : source.url() });
@@ -687,6 +784,15 @@ MpvObject::MpvObject(QQuickItem* parent)
         return;
     }
     m_inited_ok = true;
+    // mpv's own demuxer cache sizes, which a load without a cache plan of its
+    // own goes back to (applyCachePlan).
+    {
+        int64_t bytes = 0;
+        if (mpv_get_property(m_mpv, "demuxer-max-bytes", MPV_FORMAT_INT64, &bytes) >= 0)
+            m_defaultMaxBytes = bytes;
+        if (mpv_get_property(m_mpv, "demuxer-max-back-bytes", MPV_FORMAT_INT64, &bytes) >= 0)
+            m_defaultMaxBackBytes = bytes;
+    }
 
     // Observe the properties that define Status and pump mpv's event queue so
     // statusChanged() actually fires — QML bindings on `status` depend on it.

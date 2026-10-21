@@ -114,6 +114,18 @@
       <label>Smooth video motion: mpv blends frames at the display's refresh rate (interpolation, tscale=oversample); costs GPU time, ignored while power saving is on</label>
       <default>false</default>
     </entry>
+    <entry name="MpvHwdec" type="Bool">
+      <label>Hardware video decoding: video wallpapers (mpv) and video layers in scenes decode on the GPU through VA-API where they can; off decodes on the CPU, for drivers whose video decoding is broken</label>
+      <default>true</default>
+    </entry>
+    <entry name="MpvLoadInMemory" type="Bool">
+      <label>Load videos into memory: mpv keeps the whole file (up to 1 GiB) in its demuxer cache, so a loop never reads the disk again</label>
+      <default>false</default>
+    </entry>
+    <entry name="MpvVideoSync" type="Int">
+      <label>Video timing: 0 the video's own clock (default), 1 retimed to the screen's refresh rate (display-resample), 2 frames dropped or repeated to the screen's refresh rate (display-vdrop); smooth video motion and power saving take precedence</label>
+      <default>0</default>
+    </entry>
     <entry name="VerboseLogging" type="Bool">
       <label>Verbose logging</label>
       <default>false</default>

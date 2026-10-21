@@ -381,4 +381,20 @@ TestCase {
         compare(p.pixelArt, true, "the outgoing scene followed the next wallpaper's pixel art");
         own.destroy();
     }
+
+    // mpv-options patch: MpvHwdec also covers the scene's video layers.
+    function test_videoHwdec_followsSetting_andFreezes() {
+        const own = optionsSceneComp.createObject(tc);
+        let p = null;
+        for (const c of (own.children || []).concat(own.data || []))
+            if (c && typeof c.setAcceptMouse === "function") p = c;
+        verify(p !== null);
+        compare(p.videoHwdec, true);
+        background.mpvHwdec = false;
+        compare(p.videoHwdec, false);
+        own.freezeOptions();
+        background.mpvHwdec = true;
+        compare(p.videoHwdec, false, "the outgoing scene followed the next wallpaper's decoding");
+        own.destroy();
+    }
 }

@@ -12,6 +12,9 @@ Item {
     property bool   mute:      false
     property bool   powerSaving: false
     property bool   interpolation: false
+    property bool   hwdec:       true
+    property bool   loadInMemory: false
+    property int    videoSync:   0
     property int    maxFps:      0
 
     // ── test recorders (test-only stub) ──────────────────────────────────

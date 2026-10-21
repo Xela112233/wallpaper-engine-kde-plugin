@@ -60,6 +60,10 @@ class SceneObject : public QQuickItem {
                    userPropertiesChanged)
     Q_PROPERTY(bool hdrOutput READ hdrOutput WRITE setHdrOutput)
     Q_PROPERTY(bool systemAudioCapture READ systemAudioCapture WRITE setSystemAudioCapture)
+    // Hardware decoding for the scene's video layers (the KDE plugin's
+    // MpvHwdec): true tries VA-API first, as before; false decodes them on the
+    // CPU.  The decoders are made at scene load, so a change reloads it.
+    Q_PROPERTY(bool videoHwdec READ videoHwdec WRITE setVideoHwdec)
     // Wallpaper Engine's language code ("en-us", "de-de", "zh-chs"), handed to
     // SceneScript as applyGeneralSettings({language}): at load and on each
     // change.  Empty leaves `language` out (we-manager's language patch).
@@ -136,6 +140,7 @@ public:
     bool    muted() const;
     bool    hdrOutput() const;
     bool    systemAudioCapture() const;
+    bool    videoHwdec() const;
     QString language() const;
     QString userProperties() const;
     QString postprocessingOverride() const;
@@ -155,6 +160,7 @@ public:
     void setUserProperties(const QString&);
     void setHdrOutput(bool);
     void setSystemAudioCapture(bool);
+    void setVideoHwdec(bool);
     void setLanguage(const QString&);
     void setPostprocessingOverride(const QString&);
     void setMsaaMode(int);
@@ -414,6 +420,7 @@ private:
     bool        m_deterministic { false };
     std::string m_cache_path_override; // empty = use GetDefaultCachePath()
     bool        m_systemAudioCapture { false };
+    bool        m_videoHwdec { true };
     QString     m_language;
     QString     m_postprocessingOverride;
     int         m_msaaMode { 0 };

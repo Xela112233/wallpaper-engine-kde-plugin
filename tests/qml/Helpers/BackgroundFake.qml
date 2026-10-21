@@ -19,6 +19,9 @@ QtObject {
     property bool   mpvStats:    false
     property bool   mpvPowerSaving: false
     property bool   mpvInterpolation: false
+    property bool   mpvHwdec:    true     // matches main.xml default
+    property bool   mpvLoadInMemory: false
+    property int    mpvVideoSync: 0
     property bool   hdrOutput:   false
     property string postProcessing: ""    // empty = wallpaper-default; matches main.qml
     property bool   systemAudioCapture: true // matches main.xml default

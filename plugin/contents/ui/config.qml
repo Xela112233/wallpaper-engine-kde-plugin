@@ -45,6 +45,8 @@ ColumnLayout {
     property alias  cfg_MpvStats:            settingPage.cfg_MpvStats
     property alias  cfg_MpvPowerSaving:      settingPage.cfg_MpvPowerSaving
     property alias  cfg_MpvInterpolation:    settingPage.cfg_MpvInterpolation
+    property alias  cfg_MpvHwdec:            settingPage.cfg_MpvHwdec
+    property alias  cfg_MpvLoadInMemory:     settingPage.cfg_MpvLoadInMemory
     property alias  cfg_VerboseLogging:      settingPage.cfg_VerboseLogging
     property alias  cfg_Speed:               settingPage.cfg_Speed
     property alias  cfg_MuteAudio:           settingPage.cfg_MuteAudio
@@ -86,6 +88,9 @@ ColumnLayout {
     property int    cfg_PauseAction
     property int    cfg_StopScope
     property int    cfg_VideoBackend
+    // The Video timing combo on SettingPage reads and writes it unqualified
+    // (mpv-options patch), like cfg_VideoBackend.
+    property int    cfg_MpvVideoSync
     // Render resolution and anti-aliasing combo boxes on SettingPage read
     // and write these two unqualified (Common.cbCurrentValue/cbIndexOfValue,
     // same shape as cfg_PauseMode/cfg_DisplayMode/cfg_VideoBackend above) --

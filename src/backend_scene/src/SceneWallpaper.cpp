@@ -348,6 +348,7 @@ private:
     int32_t     m_msaa_mode { 0 };
     bool        m_camera_parallax { true };
     bool        m_pixel_art { false };
+    bool        m_video_hwdec { true };
     // Last present-mode policy + refresh-hz seen from QML.  Cached so the
     // PROPERTY_FPS path (which mirrors fps into the swapchain) can re-issue
     // the same policy without expecting QML to repost it.  Defaults match the
@@ -1866,17 +1867,22 @@ private:
             // Collect per-texture failure messages so the user gets a single
             // bundled diagnostic instead of N overlapping overlays.
             std::vector<std::string> decode_failures;
+            // MpvHwdec off: no VA-API decoder at all, and the software one
+            // with hwdec=no (PROPERTY_VIDEO_HWDEC).
+            bool video_hwdec { true };
+            msg->findBool("video_hwdec", &video_hwdec);
             for (auto& vt : scene->videoTextures) {
                 std::shared_ptr<VideoTextureDecoder> decoder;
                 std::string                          hwErr, swErr;
 #ifdef HAVE_EGL_HWDEC
-                {
+                if (video_hwdec) {
                     auto hw = std::make_shared<HWVideoTextureDecoder>(vt.width, vt.height);
                     if (hw->open(vt.videoFilePath, &hwErr)) decoder = hw;
                 }
 #endif
                 if (! decoder) {
                     auto sw = std::make_shared<VideoTextureDecoder>(vt.width, vt.height);
+                    sw->setHardwareDecoding(video_hwdec);
                     if (sw->open(vt.videoFilePath, &swErr)) decoder = sw;
                 }
                 if (decoder) {
@@ -2913,6 +2919,18 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                     CALL_MHANDLER_CMD(LOAD_SCENE, msg);
                 }
             }
+        } else if (property == PROPERTY_VIDEO_HWDEC) {
+            bool value { true };
+            msg->findBool("value", &value);
+            if (value != m_video_hwdec) {
+                m_video_hwdec = value;
+                LOG_INFO("Scene video layers: hardware decoding %s", value ? "on" : "off");
+                // The decoders are made when the scene is set on the render
+                // thread, so only a reload changes them.
+                if (! m_source.empty() && ! m_assets.empty()) {
+                    CALL_MHANDLER_CMD(LOAD_SCENE, msg);
+                }
+            }
         } else if (property == PROPERTY_CAMERA_PARALLAX || property == PROPERTY_PIXEL_ART) {
             bool value { property == PROPERTY_CAMERA_PARALLAX };
             msg->findBool("value", &value);
@@ -3617,6 +3635,7 @@ void MainHandler::loadScene() {
     {
         auto msg = CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_SET_SCENE);
         msg->setObject("scene", scene);
+        msg->setBool("video_hwdec", m_video_hwdec);
         msg->post();
     }
 

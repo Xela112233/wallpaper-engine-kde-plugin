@@ -2,6 +2,8 @@
 
 #include "VideoTextureDecoder.hpp"
 
+#include <mpv/client.h>
+
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -48,6 +50,15 @@ public:
 
     // Force m_opened so acquireFrame() proceeds; bypasses the libmpv loadFile.
     void forceOpened() { m_opened.store(true); }
+
+    // The hwdec option mpv was created with (empty before open()).
+    std::string hwdecOption() const {
+        if (! m_mpv) return {};
+        char*       v = mpv_get_property_string(m_mpv, "hwdec");
+        std::string s = v ? v : "";
+        mpv_free(v);
+        return s;
+    }
 };
 } // namespace
 
@@ -396,6 +407,24 @@ TEST_SUITE("VideoTextureDecoder::open (gated on WEKDE_HAS_VIDEO)") {
         CHECK(d.isPlaying() == true);
         // Time queries are 0 until mpv reports any progress.
         CHECK(d.getCurrentTimeSec() >= 0.0);
+    }
+
+    // The KDE plugin's MpvHwdec off: the scene's video layers decode on the CPU.
+    TEST_CASE("setHardwareDecoding(false) creates mpv with hwdec=no") {
+        const char* gate = std::getenv("WEKDE_HAS_VIDEO");
+        if (! gate || gate[0] == '\0') {
+            MESSAGE("skipped: set WEKDE_HAS_VIDEO=1 with libmpv-capable runtime");
+            return;
+        }
+        TestableDecoder on(32, 32);
+        CHECK(on.hardwareDecoding());
+        REQUIRE(on.open("/this/path/does/not/exist.mp4"));
+        CHECK(on.hwdecOption() == "vaapi");
+        TestableDecoder off(32, 32);
+        off.setHardwareDecoding(false);
+        CHECK_FALSE(off.hardwareDecoding());
+        REQUIRE(off.open("/this/path/does/not/exist.mp4"));
+        CHECK(off.hwdecOption() == "no");
     }
 
     TEST_CASE("open() with a real file: play→pause toggles m_playing") {

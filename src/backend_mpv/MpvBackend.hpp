@@ -84,6 +84,17 @@ class MpvObject : public QQuickFramebufferObject {
     // Opt-in (MpvInterpolation): frame blending at the display's refresh
     // rate, interpolation=yes with tscale=oversample.
     Q_PROPERTY(bool interpolation READ interpolation WRITE setInterpolation NOTIFY interpolationChanged)
+    // MpvHwdec (default on): hwdec=auto, else hwdec=no (CPU decoding, for
+    // broken VA-API drivers).  Written live; mpv reopens the decoder.
+    Q_PROPERTY(bool hwdec READ hwdec WRITE setHwdec NOTIFY hwdecChanged)
+    // MpvLoadInMemory: a local file is held whole in mpv's demuxer cache
+    // (up to kMemoryCacheCap), so the loop wraps inside the cache.  Taken at
+    // the next load.
+    Q_PROPERTY(bool loadInMemory READ loadInMemory WRITE setLoadInMemory NOTIFY loadInMemoryChanged)
+    // MpvVideoSync: 0 the video's own clock (nothing written, as before),
+    // 1 display-resample, 2 display-vdrop, both with the screen's refresh
+    // rate as display-fps-override.  Power saving and interpolation win.
+    Q_PROPERTY(int videoSync READ videoSync WRITE setVideoSync NOTIFY videoSyncChanged)
     // Upper bound on how often a new video frame is drawn; 0 = every frame
     // mpv produces.  mpv drops the frames in between, like on a slow display.
     Q_PROPERTY(int maxFps READ maxFps WRITE setMaxFps NOTIFY maxFpsChanged)
@@ -128,6 +139,9 @@ public:
     int     volume() const;
     bool    powerSaving() const { return m_powerSaving; }
     bool    interpolation() const { return m_interpolation; }
+    bool    hwdec() const { return m_hwdec; }
+    bool    loadInMemory() const { return m_loadInMemory; }
+    int     videoSync() const { return m_videoSync; }
     int     maxFps() const { return m_maxFps; }
 
     // The mpv options powerSaving sets: the built-in `fast` profile (bilinear
@@ -139,12 +153,35 @@ public:
     // the previous one; 0 = draw now.  maxFps <= 0 disables the cap.
     static int frameCapDelayMs(int maxFps, qint64 sinceLastMs);
 
+    // The demuxer cache a load gets.  Network streams always get mpv's cache
+    // and readahead (the constructor's cache=no would make them stutter);
+    // a local file with loadInMemory gets a cache big enough for all of it
+    // (forward and back, so the loop's seek to the start stays in the
+    // cache), at most kMemoryCacheCap; anything else keeps cache=no.  A size
+    // of 0 means mpv's own default.  `fileSize` < 0: unknown.
+    struct CachePlan {
+        bool   cache { false };
+        qint64 maxBytes { 0 };
+        qint64 maxBackBytes { 0 };
+    };
+    static constexpr qint64 kMemoryCacheCap = qint64(1) << 30; // 1 GiB
+    static CachePlan        cachePlan(bool network, bool loadInMemory, qint64 fileSize);
+    // http(s), rtmp(s), rtsp, rtp, udp, tcp, srt, mms and ytdl URLs; Mpv.qml's
+    // load watchdog waits longer for the same schemes.
+    static bool isNetworkSource(const QUrl& source);
+    // The video-sync value for MpvVideoSync's mode, or nullptr for 0 (the
+    // video's clock: leave mpv's option alone).
+    static const char* videoSyncMode(int mode);
+
     void setSource(const QUrl& source);
     void setMute(const bool& mute);
     void setLogfile(const QString& logfile);
     void setVolume(const int& volume);
     void setPowerSaving(bool on);
     void setInterpolation(bool on);
+    void setHwdec(bool on);
+    void setLoadInMemory(bool on);
+    void setVideoSync(int mode);
     void setMaxFps(int fps);
 
 public slots:
@@ -188,6 +225,9 @@ signals:
     void volumeChanged();
     void powerSavingChanged();
     void interpolationChanged();
+    void hwdecChanged();
+    void loadInMemoryChanged();
+    void videoSyncChanged();
     void maxFpsChanged();
     void logfileChanged();
 
@@ -215,7 +255,7 @@ private:
     // display-fps-override from the screen this item is on, and followed when
     // the window moves to another screen or the mode changes.  m_applied* is
     // what mpv has now (skips repeated writes); m_syncOwned is set once
-    // interpolation was on, from then on applyInterpolation() owns video-sync.
+    // interpolation was on, from then on applyDisplaySync() owns video-sync.
     bool                    m_interpolation { false };
     bool                    m_appliedOn { false };
     double                  m_appliedHz { 0.0 };
@@ -224,7 +264,22 @@ private:
     QMetaObject::Connection m_screenConn;
     QMetaObject::Connection m_refreshConn;
     void                    followScreen();
-    void                    applyInterpolation(bool force = false);
+    // Owns video-sync, display-fps-override and interpolation once
+    // interpolation or a display videoSync mode has been on.
+    void applyDisplaySync(bool force = false);
+    // mpv-options patch.  m_appliedSync is the display mode mpv has now
+    // ("" none), next to m_appliedOn (interpolation) and m_appliedHz.
+    bool        m_hwdec { true };
+    bool        m_loadInMemory { false };
+    int         m_videoSync { 0 };
+    std::string m_appliedSync;
+    // Cache options: written only once a load needed a cache, so a player
+    // that never does keeps the constructor's options exactly.  The defaults
+    // are mpv's own, read after mpv_initialize().
+    bool   m_cacheTouched { false };
+    qint64 m_defaultMaxBytes { 0 };
+    qint64 m_defaultMaxBackBytes { 0 };
+    void   applyCachePlan(const QUrl& source);
     // Frame-rate cap (GUI thread): when the last redraw went out, and a
     // single-shot timer for a deferred one.
     int           m_maxFps { 0 };

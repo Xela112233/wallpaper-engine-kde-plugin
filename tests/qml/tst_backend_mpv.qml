@@ -339,6 +339,55 @@ TestCase {
         item.destroy();
     }
 
+    // mpv-options patch: hwdec, load-in-memory and the timing mode follow
+    // their settings, and an outgoing (frozen) backend keeps its own.
+    function test_mpvOptions_followSettings_andFreeze() {
+        const p = _findMpvPlayer();
+        compare(p.hwdec, true);
+        compare(p.loadInMemory, false);
+        compare(p.videoSync, 0);
+        background.mpvHwdec = false;
+        background.mpvLoadInMemory = true;
+        background.mpvVideoSync = 2;
+        compare(p.hwdec, false);
+        compare(p.loadInMemory, true);
+        compare(p.videoSync, 2);
+        background.mpvHwdec = true;
+        background.mpvLoadInMemory = false;
+        background.mpvVideoSync = 0;
+
+        background.mpvHwdec = false;
+        background.mpvVideoSync = 1;
+        const item = freshMpvComp.createObject(mpv.parent);
+        const q = item.data.find(o => o && typeof o.setProperty === "function"
+                                      && typeof o.command === "function");
+        item.freezeOptions();
+        background.mpvHwdec = true;
+        background.mpvLoadInMemory = true;
+        background.mpvVideoSync = 0;
+        compare(q.hwdec, false, "frozen backend followed the hardware decoding switch");
+        compare(q.loadInMemory, false, "frozen backend followed the load-in-memory switch");
+        compare(q.videoSync, 1, "frozen backend followed the video timing");
+        background.mpvLoadInMemory = false;
+        item.destroy();
+    }
+
+    // A stream gets a longer load watchdog than a file: opening it and
+    // filling the network cache can take a while.
+    function test_loadWatchdog_longerForStreams() {
+        const item = freshMpvComp.createObject(mpv.parent);
+        function watchdog(o) {
+            for (const c of (o.children || []).concat(o.data || []))
+                if (c && typeof c.start === "function" && typeof c.interval !== "undefined"
+                    && c.interval >= 15000) return c;
+            return null;
+        }
+        compare(watchdog(item).interval, 15000);
+        item.source = "https://example.invalid/live.m3u8";
+        compare(watchdog(item).interval, 60000);
+        item.destroy();
+    }
+
     function test_prepareDestroy_stops_the_player_asynchronously() {
         const item = freshMpvComp.createObject(mpv.parent);
         const p = item.data.find(o => o && typeof o.stopAsync === "function");

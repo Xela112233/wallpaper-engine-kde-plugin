@@ -723,6 +723,14 @@ void SceneObject::setCameraParallax(bool value) {
     SET_PROPERTY(Bool, wallpaper::PROPERTY_CAMERA_PARALLAX, value);
 }
 
+bool SceneObject::videoHwdec() const { return m_videoHwdec; }
+
+void SceneObject::setVideoHwdec(bool value) {
+    if (m_videoHwdec == value) return;
+    m_videoHwdec = value;
+    SET_PROPERTY(Bool, wallpaper::PROPERTY_VIDEO_HWDEC, value);
+}
+
 bool SceneObject::pixelArt() const { return m_pixelArt; }
 
 void SceneObject::setPixelArt(bool value) {

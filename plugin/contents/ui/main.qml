@@ -54,6 +54,11 @@ Rectangle {
     property bool   mpvStats: wallpaper.configuration.MpvStats
     property bool   mpvPowerSaving: wallpaper.configuration.MpvPowerSaving
     property bool   mpvInterpolation: wallpaper.configuration.MpvInterpolation
+    // mpv-options patch: GPU decoding (also for video layers in scenes),
+    // whole-file demuxer cache, and the video timing mode.
+    property bool   mpvHwdec: wallpaper.configuration.MpvHwdec
+    property bool   mpvLoadInMemory: wallpaper.configuration.MpvLoadInMemory
+    property int    mpvVideoSync: wallpaper.configuration.MpvVideoSync
     property bool   verboseLogging: wallpaper.configuration.VerboseLogging
 
     property string videoFolderPath: wallpaper.configuration.VideoFolderPath

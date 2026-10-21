@@ -138,6 +138,11 @@ constexpr std::string_view PROPERTY_MSAA_MODE                   = "msaa_mode";
 // the output nearest-neighbour instead of bilinear.
 constexpr std::string_view PROPERTY_CAMERA_PARALLAX             = "camera_parallax";
 constexpr std::string_view PROPERTY_PIXEL_ART                   = "pixel_art";
+// Hardware decoding for video layers (the KDE plugin's MpvHwdec).  true
+// (default): the EGL/VA-API decoder first, as before; false: only the
+// software decoder, with mpv's hwdec=no.  Applied when the decoders are made
+// at scene load, so a change reloads the scene.
+constexpr std::string_view PROPERTY_VIDEO_HWDEC                 = "video_hwdec";
 // Swapchain present-mode policy (Auto / Fifo / FifoRelaxed / Mailbox / Immediate).
 // Encoded as int matching the PresentModePolicy enum in Vulkan/Swapchain.hpp.
 // Default 0 = Auto, preserving today's FIFO behaviour for matched Fps/refresh.

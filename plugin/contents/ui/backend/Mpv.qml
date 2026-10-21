@@ -73,6 +73,21 @@ Item{
         // Opt-in frame blending at the display's refresh rate.  It needs
         // mpv's display sync, which power saving turns off (video-sync=audio).
         interpolation: background.mpvInterpolation && !background.mpvPowerSaving
+        // mpv-options patch.  hwdec off decodes on the CPU (broken VA-API
+        // drivers); loadInMemory caches the whole file from the next load;
+        // videoSync picks the timing, below interpolation and power saving.
+        // Bound here rather than declared: a plugin library from before the
+        // patch (plasmashell keeps its library across an upgrade inside a
+        // session) has none of the three, and a declaration would fail this
+        // file and every video wallpaper (Common.setIfSupported).  Before
+        // the first frame, so the first load already uses them.
+        Component.onCompleted: {
+            Common.setIfSupported(player, "Mpv", "hwdec", Qt.binding(function() { return background.mpvHwdec; }));
+            Common.setIfSupported(player, "Mpv", "loadInMemory",
+                                  Qt.binding(function() { return background.mpvLoadInMemory; }));
+            Common.setIfSupported(player, "Mpv", "videoSync",
+                                  Qt.binding(function() { return background.mpvVideoSync; }));
+        }
         Connections {
             ignoreUnknownSignals: true
             function onFirstFrame() {
@@ -104,14 +119,17 @@ Item{
     }
     Timer {
         id: loadWatchdog
-        interval: 15000
+        // A network stream can take much longer to open and fill mpv's
+        // network cache (MpvObject's isNetworkSource names the same schemes);
+        // its own failures still arrive at once through sourceLoadFailed.
+        interval: /^(https?|rtmps?|rtsp|rtp|udp|tcp|srt|mms|ytdl):/i.test(String(videoItem.source)) ? 60000 : 15000
         repeat: false
         running: true
         onTriggered: {
             if (videoItem.parent
                 && typeof videoItem.parent.loadInfoShow === "function") {
                 videoItem.parent.loadInfoShow(
-                    "MPV produced no frame within 15s.");
+                    "MPV produced no frame within " + (interval / 1000) + "s.");
             }
         }
     }
@@ -136,6 +154,8 @@ Item{
         player.powerSaving = player.powerSaving;
         player.maxFps = player.maxFps;
         player.interpolation = player.interpolation;
+        for (const name of ["hwdec", "loadInMemory", "videoSync"])
+            if (name in player) player[name] = player[name];
         volumeFade.freeze();
     }
     // Called by main.qml once this backend has faded out, some time before
