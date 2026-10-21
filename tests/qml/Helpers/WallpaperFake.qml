@@ -64,6 +64,7 @@ Item {
         "PerOptChanged":       0,
         "CustomConf":          "",
         "HdrOutput":           false,
+        "SceneOptions":        true,     // marker key, never read
         "PostProcessing":      "",
         "SystemAudioCapture":  true,      // matches main.xml default
         "MediaIntegration":    true,      // matches main.xml default

@@ -334,4 +334,32 @@ TestCase {
         verify(lastLoadInfoMsg.indexOf("GL interop init failed") !== -1);
         verify(! wd.running);
     }
+
+    // ── per-wallpaper scene options (mouse_parallax, pixel_art) ─────────────
+    // Scene.qml hands background.cameraParallax / pixelArt to the renderer,
+    // which reloads the scene on a change; a backend that has become the
+    // outgoing layer keeps the ones it was built with.
+    // Its own instance: freezeOptions() would pin the shared `scene` for the
+    // other tests.
+    Component { id: optionsSceneComp; Backend.Scene { source: "stub://options.pkg" } }
+    function test_sceneOptions_followBackground_andFreeze() {
+        const own = optionsSceneComp.createObject(tc);
+        verify(own !== null);
+        let p = null;
+        for (const c of (own.children || []).concat(own.data || []))
+            if (c && typeof c.setAcceptMouse === "function") p = c;
+        verify(p !== null);
+        compare(p.cameraParallax, true);
+        compare(p.pixelArt, false);
+        background.cameraParallax = false;
+        background.pixelArt = true;
+        compare(p.cameraParallax, false);
+        compare(p.pixelArt, true);
+        own.freezeOptions();
+        background.cameraParallax = true;
+        background.pixelArt = false;
+        compare(p.cameraParallax, false, "the outgoing scene followed the next wallpaper's parallax");
+        compare(p.pixelArt, true, "the outgoing scene followed the next wallpaper's pixel art");
+        own.destroy();
+    }
 }

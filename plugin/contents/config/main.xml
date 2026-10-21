@@ -122,6 +122,10 @@
       <label>Mouse Input</label>
       <default>true</default>
     </entry>
+    <entry name="SceneOptions" type="Bool">
+      <label>Marker, never read: this build takes the per-wallpaper scene options mouse_parallax and pixel_art from each wallpaper's settings file; tools tell it from other builds by this entry</label>
+      <default>true</default>
+    </entry>
     <entry name="AnimatedPreview" type="Bool">
       <label>Animated Preview</label>
       <default>true</default>

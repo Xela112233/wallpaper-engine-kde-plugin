@@ -502,6 +502,10 @@ QSGNode* SceneObject::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
     }
 
     node->setRect(boundingRect());
+    // Pixel art: Qt scales the finished frame to the item nearest-neighbour,
+    // so a scene rendered below native (RenderScale) stays crisp too.  The
+    // GUI thread is blocked while this runs, so reading m_pixelArt is safe.
+    node->setFiltering(m_pixelArt ? QSGTexture::Nearest : QSGTexture::Linear);
     return node;
 }
 
@@ -665,6 +669,23 @@ void SceneObject::setMsaaMode(int value) {
     if (m_msaaMode == value) return;
     m_msaaMode = value;
     SET_PROPERTY(Int32, wallpaper::PROPERTY_MSAA_MODE, value);
+}
+
+bool SceneObject::cameraParallax() const { return m_cameraParallax; }
+
+void SceneObject::setCameraParallax(bool value) {
+    if (m_cameraParallax == value) return;
+    m_cameraParallax = value;
+    SET_PROPERTY(Bool, wallpaper::PROPERTY_CAMERA_PARALLAX, value);
+}
+
+bool SceneObject::pixelArt() const { return m_pixelArt; }
+
+void SceneObject::setPixelArt(bool value) {
+    if (m_pixelArt == value) return;
+    m_pixelArt = value;
+    SET_PROPERTY(Bool, wallpaper::PROPERTY_PIXEL_ART, value);
+    update(); // updatePaintNode sets the output texture's filtering
 }
 
 QString SceneObject::userProperties() const { return m_userProperties; }

@@ -342,6 +342,8 @@ private:
     bool        m_system_audio_capture { false };
     std::string m_postprocessing_override;
     int32_t     m_msaa_mode { 0 };
+    bool        m_camera_parallax { true };
+    bool        m_pixel_art { false };
     // Last present-mode policy + refresh-hz seen from QML.  Cached so the
     // PROPERTY_FPS path (which mirrors fps into the swapchain) can re-issue
     // the same policy without expecting QML to repost it.  Defaults match the
@@ -2895,6 +2897,23 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                          value.empty() ? "(scene default)" : value.c_str());
                 // Bloom pipeline selection happens at scene-load, so a runtime
                 // change must reload the scene to take effect.
+                if (! m_source.empty() && ! m_assets.empty()) {
+                    CALL_MHANDLER_CMD(LOAD_SCENE, msg);
+                }
+            }
+        } else if (property == PROPERTY_CAMERA_PARALLAX || property == PROPERTY_PIXEL_ART) {
+            bool value { property == PROPERTY_CAMERA_PARALLAX };
+            msg->findBool("value", &value);
+            bool& held = property == PROPERTY_CAMERA_PARALLAX ? m_camera_parallax : m_pixel_art;
+            if (held != value) {
+                held = value;
+                m_scene_parser.SetCameraParallax(m_camera_parallax);
+                m_scene_parser.SetPixelArt(m_pixel_art);
+                LOG_INFO("Scene options: camera parallax %s, pixel art %s",
+                         m_camera_parallax ? "on" : "off",
+                         m_pixel_art ? "on" : "off");
+                // Both are read while the scene is parsed (ParseCamera, the
+                // texture headers), so a change reloads it.
                 if (! m_source.empty() && ! m_assets.empty()) {
                     CALL_MHANDLER_CMD(LOAD_SCENE, msg);
                 }

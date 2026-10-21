@@ -376,6 +376,8 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
     auto& file     = *pfile;
     auto  startpos = file.Tell();
     if (! LoadHeader(file, img.header)) return nullptr;
+    if (m_forceNearest)
+        img.header.sample.minFilter = img.header.sample.magFilter = TextureFilter::NEAREST;
     const i32 variant = texvariant::SelectVariant(img.header.variants, m_variantSelector);
     if (variant != 0)
         LOG_INFO("tex '%s': user properties select variant %d", name.c_str(), variant);
@@ -724,6 +726,7 @@ ImageHeader WPTexImageParser::ParseHeader(const std::string& name) {
     auto& file = *pfile;
 
     if (! LoadHeader(file, header)) return header;
+    if (m_forceNearest) header.sample.minFilter = header.sample.magFilter = TextureFilter::NEAREST;
     if (header.count < 0) return header;
 
     usize image_count = (usize)header.count;

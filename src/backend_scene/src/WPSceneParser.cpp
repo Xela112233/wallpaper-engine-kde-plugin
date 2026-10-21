@@ -193,6 +193,8 @@ struct ParseContext {
     // hdr+bloom but no postprocessing field.
     std::string postprocessing_override;
     int         msaa_mode { 0 };
+    // WPSceneParser::SetCameraParallax: false keeps camera parallax off.
+    bool camera_parallax { true };
 
     // Layer names referenced by any SceneScript (via getLayer('X')).  These
     // layers may have their visibility toggled at runtime, so we keep them in
@@ -1356,7 +1358,7 @@ void InitContext(ParseContext&                     context,
 
     {
         WPCameraParallax cam_para;
-        cam_para.enable         = sc.general.cameraparallax;
+        cam_para.enable         = sc.general.cameraparallax && context.camera_parallax;
         cam_para.amount         = sc.general.cameraparallaxamount;
         cam_para.delay          = sc.general.cameraparallaxdelay;
         cam_para.mouseinfluence = sc.general.cameraparallaxmouseinfluence;
@@ -6010,6 +6012,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     context.hide_pattern            = m_hide_pattern;
     context.postprocessing_override = m_postprocessing_override;
     context.msaa_mode               = m_msaa_mode;
+    context.camera_parallax         = m_camera_parallax;
     // Plumb the host's cooperative-cancellation flag (set by
     // SceneWallpaper::abortLoad when the wallpaper's screen goes away
     // mid-load) into the parse context so per-object hot loops can poll it.
@@ -6040,6 +6043,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     // LoadMaterial calls on the same instance hit the cache instead of
     // re-opening .tex files.
     auto imageParser = std::make_unique<WPTexImageParser>(&vfs);
+    imageParser->SetForceNearest(m_pixel_art);
     // Textures are decoded later on the render thread; keep the selector's
     // own copy of the properties this scene was built with.
     imageParser->SetVariantSelector(

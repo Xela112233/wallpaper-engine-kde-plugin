@@ -23,6 +23,8 @@ Item {
     property bool   hdrOutput:      false
     property string postprocessingOverride: ""  // wallpaper-default when empty
     property int    msaaMode:       0    // 0 = automatic tiering, 1/2/4 = pinned
+    property bool   cameraParallax: true   // false: the scene's camera parallax stays off
+    property bool   pixelArt:       false  // true: nearest-neighbour textures and output
     property real   renderScale:    1.0  // fraction of native resolution to render at
     property bool   systemAudioCapture: false
     property int    presentMode:    0    // Swapchain present-mode policy (Auto=0)

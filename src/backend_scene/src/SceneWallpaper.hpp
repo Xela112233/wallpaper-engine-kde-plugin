@@ -131,6 +131,13 @@ constexpr std::string_view PROPERTY_SYSTEM_AUDIO_CAPTURE         = "system_audio
 constexpr std::string_view PROPERTY_SCREENSHOT_PATH              = "screenshot_path";
 constexpr std::string_view PROPERTY_POSTPROCESSING_OVERRIDE      = "postprocessing_override";
 constexpr std::string_view PROPERTY_MSAA_MODE                   = "msaa_mode";
+// Per-wallpaper switches the KDE plugin's main.qml reads from <id>.json
+// (mouse_parallax, pixel_art).  Both are applied while the scene is parsed,
+// so a change reloads it.  camera_parallax false drops the scene's
+// cursor-driven camera parallax; pixel_art true samples every texture and
+// the output nearest-neighbour instead of bilinear.
+constexpr std::string_view PROPERTY_CAMERA_PARALLAX             = "camera_parallax";
+constexpr std::string_view PROPERTY_PIXEL_ART                   = "pixel_art";
 // Swapchain present-mode policy (Auto / Fifo / FifoRelaxed / Mailbox / Immediate).
 // Encoded as int matching the PresentModePolicy enum in Vulkan/Swapchain.hpp.
 // Default 0 = Auto, preserving today's FIFO behaviour for matched Fps/refresh.

@@ -114,6 +114,8 @@ Item{
         hdrOutput: background.hdrOutput
         postprocessingOverride: background.postProcessing
         msaaMode: background.msaaMode
+        cameraParallax: background.cameraParallax
+        pixelArt: background.pixelArt
         renderScale: background.renderScale
         systemAudioCapture: background.systemAudioCapture
         Component.onCompleted: {
@@ -272,6 +274,8 @@ Item{
         userPropsJson = userPropsJson;
         player.speed = player.speed;
         player.postprocessingOverride = player.postprocessingOverride;
+        player.cameraParallax = player.cameraParallax;
+        player.pixelArt = player.pixelArt;
         player.muted = player.muted;
         volumeFade.freeze();
     }

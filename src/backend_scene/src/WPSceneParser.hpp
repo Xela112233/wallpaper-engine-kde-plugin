@@ -25,6 +25,12 @@ public:
     void SetPostprocessingOverride(const std::string& pp) { m_postprocessing_override = pp; }
     // 0 = automatic (resolution/pass-count tiering), 1/2/4 = pinned by the user.
     void SetMsaaMode(int mode) { m_msaa_mode = mode; }
+    // False: the scene's cursor-driven camera parallax stays off whatever
+    // scene.json says (the KDE plugin's per-wallpaper mouse_parallax).
+    void SetCameraParallax(bool on) { m_camera_parallax = on; }
+    // True: every texture is sampled nearest-neighbour, as if each .tex had
+    // its author's no-interpolation flag (the per-wallpaper pixel_art).
+    void SetPixelArt(bool on) { m_pixel_art = on; }
 
     // Plumb a cooperative-cancellation atomic flag set by the host
     // (MainHandler) when the wallpaper's display surface goes away
@@ -42,6 +48,8 @@ private:
     std::string       m_hide_pattern;
     std::string       m_postprocessing_override;
     int               m_msaa_mode { 0 };
+    bool              m_camera_parallax { true };
+    bool              m_pixel_art { false };
     std::atomic_bool* m_abort_flag { nullptr };
 };
 } // namespace wallpaper

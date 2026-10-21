@@ -28,6 +28,11 @@ function mainXmlKeys() {
     return [...text.matchAll(/<entry name="([^"]+)"/g)].map((m) => m[1]);
 }
 
+// SceneOptions: a marker, never read.  It tells tools (we-manager reads main.xml) that this
+// build takes the per-wallpaper scene options mouse_parallax and pixel_art, which live in
+// each wallpaper's <id>.json, not in this config.
+ALLOWLIST.add('SceneOptions');
+
 function walkQmlFiles(dir) {
     const out = [];
     for (const entry of readdirSync(dir, { withFileTypes: true })) {

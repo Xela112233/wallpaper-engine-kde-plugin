@@ -101,6 +101,12 @@ Rectangle {
     property real   speed: get_opt_value('speed', wallpaper.configuration.Speed)
     // User properties for scene wallpapers (JSON string format)
     property string userPropsJson: curOpt['user_props'] ? JSON.stringify(curOpt['user_props']) : ""
+    // Scene options per wallpaper (<id>.json): mouse_parallax false keeps the
+    // scene's cursor-driven camera parallax off (clicks and cursor effects
+    // still work, unlike MouseInput); pixel_art true samples nearest-neighbour.
+    // The renderer reloads the scene when one changes.
+    property bool   cameraParallax: get_opt_value('mouse_parallax', true) !== false
+    property bool   pixelArt: get_opt_value('pixel_art', false) === true
 
     property int    perOptChanged: wallpaper.configuration.PerOptChanged
     onPerOptChangedChanged: {

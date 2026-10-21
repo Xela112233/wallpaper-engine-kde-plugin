@@ -30,6 +30,11 @@ public:
 
     void SetCachePath(const std::string& path) { m_cachePath = path; }
 
+    // Pixel art: every texture is sampled nearest-neighbour (min and mag),
+    // as the author's no-interpolation flag does for one.  Set it before the
+    // first Parse()/ParseHeader(); the headers it caches carry it.
+    void SetForceNearest(bool on) { m_forceNearest = on; }
+
     // Decides which conditional variant Parse() builds for a texture that has
     // them. Unset, every texture loads its base image. Set it before the first
     // Parse(); PrefetchTextures reads it from worker threads.
@@ -43,6 +48,7 @@ private:
     fs::VFS*    m_vfs;
     i64         m_maxTotalBytes;
     std::string m_cachePath;
+    bool        m_forceNearest { false };
     texvariant::Selector m_variantSelector;
     // Guards m_registered only.  PrefetchTextures() (below) calls Parse()
     // for many names at once from a worker pool, and Parse() both reads

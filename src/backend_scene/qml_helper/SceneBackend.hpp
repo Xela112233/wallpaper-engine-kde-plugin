@@ -70,6 +70,14 @@ class SceneObject : public QQuickItem {
     // drawing), 1 = off, 2 or 4 = pinned.  The sample count is baked into the
     // render passes at scene load, so a change reloads the scene.
     Q_PROPERTY(int msaaMode READ msaaMode WRITE setMsaaMode)
+    // Per-wallpaper switches (main.qml: mouse_parallax and pixel_art in the
+    // wallpaper's <id>.json).  cameraParallax false keeps the scene's
+    // cursor-driven camera parallax off; the cursor still reaches the scene.
+    // pixelArt true samples every texture, and the finished frame when Qt
+    // scales it to the screen, nearest-neighbour.  Both are applied when the
+    // scene is parsed, so a change reloads it.
+    Q_PROPERTY(bool cameraParallax READ cameraParallax WRITE setCameraParallax)
+    Q_PROPERTY(bool pixelArt READ pixelArt WRITE setPixelArt)
     // Fraction of the display's native resolution to render at, 1.0 = native.
     // Almost everything the renderer does is per-pixel and per-pass, so
     // rendering below native and letting Qt upscale is the largest single
@@ -121,6 +129,8 @@ public:
     QString userProperties() const;
     QString postprocessingOverride() const;
     int     msaaMode() const;
+    bool    cameraParallax() const;
+    bool    pixelArt() const;
     qreal   nativeAspectRatio() const;
 
     void setFps(int);
@@ -135,6 +145,8 @@ public:
     void setSystemAudioCapture(bool);
     void setPostprocessingOverride(const QString&);
     void setMsaaMode(int);
+    void setCameraParallax(bool);
+    void setPixelArt(bool);
 
     // debug
     bool vulkanValid() const;
@@ -388,6 +400,8 @@ private:
     bool        m_systemAudioCapture { false };
     QString     m_postprocessingOverride;
     int         m_msaaMode { 0 };
+    bool        m_cameraParallax { true };
+    bool        m_pixelArt { false };
     qreal       m_renderScale { 1.0 };
     QString     m_userProperties;
     int         m_renderPixelWidth { 0 };

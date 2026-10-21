@@ -943,6 +943,27 @@ RowLayout {
                                     def_val: cfg_BackgroundColor,
                                 },
                             },
+                            // Off: the scene's cursor-driven camera parallax
+                            // stays still; clicks and cursor effects still work.
+                            {
+                                scene_only: true,
+                                text: i18nc("@label per-wallpaper scene option", "Mouse parallax"),
+                                config_key: 'mouse_parallax',
+                                comp: right_opt_switch,
+                                props: {
+                                    def_val: true,
+                                },
+                            },
+                            // Nearest-neighbour textures and output: crisp pixel art.
+                            {
+                                scene_only: true,
+                                text: i18nc("@label per-wallpaper scene option", "Pixel art optimization"),
+                                config_key: 'pixel_art',
+                                comp: right_opt_switch,
+                                props: {
+                                    def_val: false,
+                                },
+                            },
                             {
                                 text: i18nc("@label per-wallpaper mute audio option", "Mute Audio"),
                                 config_key: 'mute_audio',
