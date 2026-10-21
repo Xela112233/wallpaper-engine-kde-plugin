@@ -517,11 +517,15 @@ TestCase {
     // The production handler forwards (level, msg, line, src) to QML console
     // with a [WEK-page LEVELTAG] prefix.  We assert against the
     // _lastConsoleForward seam on the outer webItem (production: null).
+    // Info lines need Verbose logging (background.verboseLogging); each test
+    // that turns it on turns it off again.
     function test_javaScriptConsoleMessage_routesToQmlConsoleByLevel() {
         const wev = _findWebEngineView();
         verify(wev !== null);
+        background.verboseLogging = true;
         web._lastConsoleForward = null;
         wev.javaScriptConsoleMessage(0, "info hello", 12, "wp.js");
+        background.verboseLogging = false;
         verify(web._lastConsoleForward !== null);
         compare(web._lastConsoleForward.qmlLevel, "log");
         verify(web._lastConsoleForward.message.indexOf("[WEK-page INFO]") !== -1);
@@ -538,11 +542,29 @@ TestCase {
         verify(web._lastConsoleForward.message.indexOf("[WEK-page ERROR]") !== -1);
     }
 
+    function test_javaScriptConsoleMessage_infoDroppedUnlessVerbose() {
+        // Without Verbose logging a page's console.log never reaches the
+        // journal; its warnings and errors still do.
+        const wev = _findWebEngineView();
+        verify(wev !== null);
+        compare(background.verboseLogging, false);
+        web._lastConsoleForward = null;
+        wev.javaScriptConsoleMessage(0, "every frame", 9, "wp.js");
+        compare(web._lastConsoleForward, null, "an info line was forwarded with Verbose logging off");
+        wev.javaScriptConsoleMessage(1, "careful", 10, "wp.js");
+        verify(web._lastConsoleForward !== null);
+        compare(web._lastConsoleForward.qmlLevel, "warn");
+        web._lastConsoleForward = null;
+        wev.javaScriptConsoleMessage(2, "broken", 11, "wp.js");
+        verify(web._lastConsoleForward !== null);
+        compare(web._lastConsoleForward.qmlLevel, "error");
+    }
+
     function test_javaScriptConsoleMessage_emptySourceID_usesInlineLabel() {
         const wev = _findWebEngineView();
         verify(wev !== null);
         web._lastConsoleForward = null;
-        wev.javaScriptConsoleMessage(0, "from inline", 3, "");
+        wev.javaScriptConsoleMessage(1, "from inline", 3, "");
         verify(web._lastConsoleForward !== null);
         verify(web._lastConsoleForward.message.indexOf("<inline>:3") !== -1,
             "empty sourceID must surface as <inline>");

@@ -443,6 +443,12 @@ Item {
         // window.addEventListener('error') shim emits via console.error so
         // uncaught throws land at level 2.
         onJavaScriptConsoleMessage: (level, message, lineNumber, sourceID) => {
+            // A page's console.log/info lines (level 0) reach the journal only
+            // with "Verbose logging" on: a web wallpaper logging every frame
+            // would otherwise write to disk all day.  Warnings and errors
+            // (uncaught exceptions included) always do.
+            if (level === 0 && !background.verboseLogging)
+                return;
             const levelTag = level === 2 ? "ERROR" : (level === 1 ? "WARN" : "INFO");
             const src      = sourceID && sourceID.length > 0 ? sourceID : "<inline>";
             const msg      = "[WEK-page " + levelTag + "] " + src + ":" + lineNumber

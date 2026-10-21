@@ -699,7 +699,7 @@ Flickable {
                 actor: Switch {
                     id: ckbox_verboseLogging
                     ToolTip.visible: hovered
-                    ToolTip.text: i18nc("@info:tooltip", "Write detailed renderer messages to the system journal. Turn it on when reporting a bug, then off again.")
+                    ToolTip.text: i18nc("@info:tooltip", "Write detailed renderer messages, and web wallpapers' console info lines, to the system journal. Turn it on when reporting a bug, then off again.")
                 }
             }
        }
