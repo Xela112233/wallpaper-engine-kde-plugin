@@ -27,6 +27,7 @@ Flickable {
     property alias cfg_SafeStartAfterCrash: ckbox_safeStartAfterCrash.checked
     property alias cfg_VramStop: ckbox_vramStop.checked
     property alias cfg_ReloadAfterSleep: ckbox_reloadAfterSleep.checked
+    property alias cfg_LocalStoragePerWallpaper: ckbox_localStoragePerWallpaper.checked
     property alias cfg_UnpauseOnShowDesktop: ckbox_unpauseOnShowDesktop.checked
     property alias cfg_UnpauseOnOverview: ckbox_unpauseOnOverview.checked
     property alias cfg_UnloadAfterPausedMin: spin_unloadAfterPausedMin.value
@@ -978,6 +979,24 @@ Flickable {
                     Text {
                         Layout.fillWidth: true
                         text: i18nc("@info reload after sleep help text", "Three seconds after the computer wakes from a suspend or hibernation, the wallpaper loads again, so a graphics driver that came back broken does not leave it frozen or black. A stopped wallpaper, or one held back by safe start, is left as it is. Each reload is a line in the journal: journalctl --user -b | grep '[WEK] resume'")
+                        color: Kirigami.Theme.disabledTextColor
+                        wrapMode: Text.WordWrap
+                        font.italic: true
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    }
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Saved data per wallpaper and screen")
+                text_color: Kirigami.Theme.textColor
+                actor: Switch {
+                    id: ckbox_localStoragePerWallpaper
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        text: i18nc("@info saved data per wallpaper help text", "What a scene's scripts save (a high score, a layout) is kept for each wallpaper on its own, and what they save for the screen for each screen on its own, as Wallpaper Engine does, in ~/.config/wekde/localstorage (at most 100 KiB per file). Off, it stays in the renderer's cache, where one file is shared by every wallpaper and a wallpaper's screens share the other. Switching does not copy what was saved the other way; both stay where they are.")
                         color: Kirigami.Theme.disabledTextColor
                         wrapMode: Text.WordWrap
                         font.italic: true

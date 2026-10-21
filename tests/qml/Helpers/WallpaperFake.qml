@@ -96,6 +96,7 @@ Item {
         "ReloadAfterSleep":    true,
         "ProcessPriority":     0,
         "ShareRenderer":       0,        // matches main.xml default (we-manager clone patch)
-        "SpanGroup":           0         // matches main.xml default (we-manager span patch)
+        "SpanGroup":           0,        // matches main.xml default (we-manager span patch)
+        "LocalStoragePerWallpaper": false  // matches main.xml default (localstorage patch)
     })
 }

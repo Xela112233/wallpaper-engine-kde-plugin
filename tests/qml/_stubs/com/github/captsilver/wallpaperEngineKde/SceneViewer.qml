@@ -28,6 +28,8 @@ Item {
     property bool   pixelArt:       false  // true: nearest-neighbour textures and output
     property var    sceneQuality:   ({})   // {textures: 0 full, 1 performance, 2 automatic} (texture-quality patch)
     property int    vramMiB:        0      // what the scene holds after its first frame; tests set it
+    property bool   storagePerWallpaper: false  // localstorage patch: LocalStoragePerWallpaper
+    property string storageScreen:  ""     // the screen of LOCATION_SCREEN (the output's connector)
     property real   renderScale:    1.0  // fraction of native resolution to render at
     property bool   systemAudioCapture: false
     property bool   audioOutput:        true    // mute patch: AudioOutput

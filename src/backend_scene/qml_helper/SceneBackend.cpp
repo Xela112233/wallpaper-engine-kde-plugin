@@ -14,6 +14,7 @@
 #include "JsFloatPack.hpp"
 #include "JsSyntaxNormalize.hpp"
 #include "LocalStorageQuota.hpp"
+#include "LocalStorageLayout.hpp"
 #include "PropertyScriptDispatchJs.hpp"
 #include "EngineResolution.hpp"
 #include "RenderCallbackGuard.hpp"
@@ -1791,13 +1792,20 @@ QString SceneObject::localStoragePath(bool global) const {
     const auto name = [](std::string_view v) {
         return QString::fromUtf8(v.data(), static_cast<qsizetype>(v.size()));
     };
+    // LocalStoragePerWallpaper (we-manager localstorage patch): the
+    // wallpaper's own folder under <config>/wekde/localstorage.
+    if (m_lsPerWallpaper) {
+        return wek::qml_helper::PerWallpaperStoragePath(
+            wek::qml_helper::PerWallpaperStorageRoot(), m_lsSceneId, global, m_lsScreenKey);
+    }
     QString base = QString::fromStdString(cachePath());
     if (global) return base + "/" + name(wallpaper::platform::kLocalStorageGlobalFile);
     if (m_lsSceneId.isEmpty()) return {};
     return base + "/" + m_lsSceneId + "/" + name(wallpaper::platform::kLocalStorageSceneFile);
 }
 
-QJsonObject SceneObject::readLocalStorageScope(const QString& path, bool* rejected) {
+QJsonObject SceneObject::readLocalStorageScope(const QString& path, bool* rejected,
+                                               qsizetype preloadCap) {
     if (rejected) *rejected = false;
     if (path.isEmpty()) return {};
     QFile f(path);
@@ -1810,12 +1818,12 @@ QJsonObject SceneObject::readLocalStorageScope(const QString& path, bool* reject
     // blob written by an old runaway script would OOM plasmashell on scene
     // load via f.readAll().
     const auto file_size = f.size();
-    if (file_size > wek::qml_helper::kMaxLsPreloadBytes) {
+    if (file_size > preloadCap) {
         LOG_ERROR("localStorage file '%s' size %lld exceeds pre-load cap %lld; treating scope as "
                   "empty",
                   qPrintable(path),
                   (long long)file_size,
-                  (long long)wek::qml_helper::kMaxLsPreloadBytes);
+                  (long long)preloadCap);
         if (rejected) *rejected = true;
         return {};
     }
@@ -1857,7 +1865,11 @@ void SceneObject::ensureLocalStorageLoaded() {
 
     auto loadFile = [this](const QString& path, bool global) -> QJsonObject {
         bool        rejected = false;
-        QJsonObject obj      = readLocalStorageScope(path, &rejected);
+        QJsonObject obj      = readLocalStorageScope(
+            path,
+            &rejected,
+            m_lsPerWallpaper ? wek::qml_helper::kMaxLsWallpaperPreloadBytes
+                             : wek::qml_helper::kMaxLsPreloadBytes);
         // Arm flush-on-first-write so the next debounce tick rewrites an
         // unusable file at normal size, recovering without manual cleanup.
         if (rejected) {
@@ -1869,6 +1881,13 @@ void SceneObject::ensureLocalStorageLoaded() {
         }
         return obj;
     };
+    // LocalStoragePerWallpaper: the clear token first, so a clear that lands
+    // while the files are read is noticed at the first flush.
+    if (m_lsPerWallpaper) {
+        m_lsStale      = false;
+        m_lsClearToken = wek::qml_helper::StorageClearToken(
+            wek::qml_helper::PerWallpaperStorageRoot(), m_lsSceneId);
+    }
     m_lsGlobal = loadFile(localStoragePath(true), true);
     m_lsScreen = loadFile(localStoragePath(false), false);
     // Reset cached serialized-byte counts; first lsSet recomputes lazily.
@@ -1964,6 +1983,17 @@ bool SceneObject::flushLocalStorageScope(bool global) {
     QSet<QString>& removed = global ? m_lsGlobalRemoved : m_lsScreenRemoved;
     bool&          cleared = global ? m_lsGlobalCleared : m_lsScreenCleared;
 
+    // LocalStoragePerWallpaper: a scene that was running when its data was
+    // cleared from outside (we-manager's Clear saved wallpaper data) writes
+    // nothing more.  It still holds the old values in its script and would
+    // put them back while it waits for the reloaded scene's first frame.
+    if (m_lsPerWallpaper && localStorageClearedOutside()) {
+        pending.clear();
+        removed.clear();
+        cleared = false;
+        return true;
+    }
+
     // Re-read rather than trusting the snapshot taken at scene load: a
     // sibling instance on another screen shares this file and may have
     // written keys we have never seen.  clear() is the one case that means
@@ -1971,17 +2001,58 @@ bool SceneObject::flushLocalStorageScope(bool global) {
     QJsonObject merged;
     if (! cleared) {
         bool rejected = false;
-        merged        = readLocalStorageScope(path, &rejected);
+        merged        = readLocalStorageScope(
+            path,
+            &rejected,
+            m_lsPerWallpaper ? wek::qml_helper::kMaxLsWallpaperPreloadBytes
+                             : wek::qml_helper::kMaxLsPreloadBytes);
         // An unusable file is what we are recovering from -- overwrite it.
         if (rejected) merged = {};
     }
+    // LocalStoragePerWallpaper: the file itself never passes the cap.  Each
+    // instance kept its own view under it (lsSetPerWallpaper), so only what
+    // another screen's instance wrote to the shared global file meanwhile can
+    // push the merge over; this instance's writes then give way.
+    QJsonObject onFile;
+    if (m_lsPerWallpaper) onFile = merged;
     for (const QString& key : std::as_const(pending)) {
         if (scope.contains(key)) merged.insert(key, scope.value(key));
     }
     for (const QString& key : std::as_const(removed)) merged.remove(key);
+    if (m_lsPerWallpaper &&
+        wek::qml_helper::SerializedScopeSize(merged) > wek::qml_helper::kMaxLsWallpaperFileBytes) {
+        LOG_ERROR("localStorage '%s': with what another screen saved meanwhile, this write would "
+                  "pass the cap of %lld bytes; it is dropped",
+                  qPrintable(path),
+                  (long long)wek::qml_helper::kMaxLsWallpaperFileBytes);
+        scope = onFile;
+        (global ? m_lsGlobalBytes : m_lsScreenBytes).reset();
+        pending.clear();
+        removed.clear();
+        cleared = false;
+        return true;
+    }
 
     bool& errorLogged = global ? m_lsGlobalWriteErrorLogged : m_lsScreenWriteErrorLogged;
     if (! writeLocalStorageScope(path, merged, errorLogged)) return false;
+    if (m_lsPerWallpaper) {
+        // A clear that came while this was written: the token is written
+        // before the files are deleted, so the file just made is this
+        // instance's alone (every scene of this process writes on this one
+        // thread) and goes again.
+        if (localStorageClearedOutside()) {
+            QFile::remove(path);
+            pending.clear();
+            removed.clear();
+            cleared = false;
+            return true;
+        }
+        // A wallpaper keeps the files of kMaxLsScreenFiles screens.
+        if (! global) {
+            const QFileInfo fi(path);
+            wek::qml_helper::PruneScreenStorageFiles(fi.absolutePath(), fi.fileName());
+        }
+    }
 
     // Adopt the merged view so reads see the sibling's keys and the next
     // flush starts from a clean slate.
@@ -2014,6 +2085,10 @@ QJSValue SceneObject::lsGet(int loc, const QString& key) {
 void SceneObject::lsSet(int loc, const QString& key, const QJSValue& value) {
     ensureLocalStorageLoaded();
     QJsonValue jv = QJsonValue::fromVariant(value.toVariant());
+    if (m_lsPerWallpaper) {
+        lsSetPerWallpaper(loc, key, jv);
+        return;
+    }
 
     QJsonObject&              scope  = (loc == 0) ? m_lsGlobal : m_lsScreen;
     bool&                     dirty  = (loc == 0) ? m_lsGlobalDirty : m_lsScreenDirty;
@@ -2139,6 +2214,99 @@ void SceneObject::lsClear(int loc) {
             scheduleLocalStorageFlush();
         }
     }
+}
+
+// lsSet with LocalStoragePerWallpaper on.  The scope's size after the set is
+// computed exactly (a 60 KiB value replacing itself must fit under a 100 KiB
+// cap, which the cache files' estimate of old size + new value would refuse).
+void SceneObject::lsSetPerWallpaper(int loc, const QString& key, const QJsonValue& value) {
+    QJsonObject& scope = (loc == 0) ? m_lsGlobal : m_lsScreen;
+    QJsonObject  next  = scope;
+    next.insert(key, value);
+    const qsizetype size = wek::qml_helper::SerializedScopeSize(next);
+    if (size > wek::qml_helper::kMaxLsWallpaperFileBytes) {
+        if (m_jsEngine) {
+            m_jsEngine->throwError(
+                QJSValue::RangeError,
+                QStringLiteral("QuotaExceededError: %1 bytes would exceed the localStorage cap of "
+                               "%2 bytes per wallpaper and location")
+                    .arg(size)
+                    .arg((qsizetype)wek::qml_helper::kMaxLsWallpaperFileBytes));
+        }
+        if (! m_lsQuotaWarned) {
+            m_lsQuotaWarned = true;
+            LOG_INFO("localStorage quota exceeded (per wallpaper, %s): size=%lld cap=%lld key='%s'",
+                     (loc == 0) ? "GLOBAL" : "SCREEN",
+                     (long long)size,
+                     (long long)wek::qml_helper::kMaxLsWallpaperFileBytes,
+                     qPrintable(key));
+        }
+        return;
+    }
+    scope                                              = next;
+    ((loc == 0) ? m_lsGlobalDirty : m_lsScreenDirty)   = true;
+    ((loc == 0) ? m_lsGlobalBytes : m_lsScreenBytes)   = size;
+    (loc == 0 ? m_lsGlobalPending : m_lsScreenPending).insert(key);
+    (loc == 0 ? m_lsGlobalRemoved : m_lsScreenRemoved).remove(key);
+    scheduleLocalStorageFlush();
+}
+
+// Whether this instance's data was cleared from outside since it read its
+// scopes (LocalStoragePerWallpaper only).  The first time it finds that, it
+// drops both scopes; from then on it answers true without looking.
+bool SceneObject::localStorageClearedOutside() {
+    if (m_lsStale) return true;
+    if (wek::qml_helper::StorageClearToken(wek::qml_helper::PerWallpaperStorageRoot(),
+                                           m_lsSceneId) == m_lsClearToken)
+        return false;
+    LOG_ERROR("localStorage of '%s' was cleared while its scene ran: the scene drops what it held "
+              "and saves nothing more until it is loaded again",
+              qPrintable(m_lsSceneId));
+    m_lsStale  = true;
+    m_lsGlobal = {};
+    m_lsScreen = {};
+    m_lsGlobalBytes.reset();
+    m_lsScreenBytes.reset();
+    return true;
+}
+
+// storagePerWallpaper or storageScreen changed while the scopes are loaded:
+// what is pending goes to the files it was meant for, and the scopes are read
+// again, from the new place, at the script's next access.
+void SceneObject::moveLocalStorage() {
+    if (! m_lsLoaded) return;
+    if (m_lsGlobalDirty || m_lsScreenDirty) flushLocalStorage();
+    m_lsLoaded = false;
+    m_lsGlobal = {};
+    m_lsScreen = {};
+    m_lsSceneId.clear();
+    m_lsGlobalPending.clear();
+    m_lsScreenPending.clear();
+    m_lsGlobalRemoved.clear();
+    m_lsScreenRemoved.clear();
+    m_lsGlobalCleared          = false;
+    m_lsScreenCleared          = false;
+    m_lsGlobalDirty            = false;
+    m_lsScreenDirty            = false;
+    m_lsGlobalWriteErrorLogged = false;
+    m_lsScreenWriteErrorLogged = false;
+    m_lsStale                  = false;
+    m_lsClearToken.clear();
+    m_lsGlobalBytes.reset();
+    m_lsScreenBytes.reset();
+}
+
+void SceneObject::setStoragePerWallpaper(bool value) {
+    if (m_lsPerWallpaper == value) return;
+    moveLocalStorage();
+    m_lsPerWallpaper = value;
+}
+
+void SceneObject::setStorageScreen(const QString& value) {
+    if (m_lsScreenKey == value) return;
+    // Off, no path depends on the screen: nothing to move.
+    if (m_lsPerWallpaper) moveLocalStorage();
+    m_lsScreenKey = value;
 }
 
 // Helper: strip ES module syntax that QJSEngine doesn't support

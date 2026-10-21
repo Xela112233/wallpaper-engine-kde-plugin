@@ -113,6 +113,18 @@ class SceneObject : public QQuickItem {
     // that are given the same key.  Empty, the default: nothing is published
     // and nothing of the sharing exists.
     Q_PROPERTY(QString shareKey READ shareKey WRITE setShareKey NOTIFY shareKeyChanged)
+    // SceneScript localStorage per wallpaper and per screen (the KDE plugin's
+    // LocalStoragePerWallpaper, we-manager localstorage patch).  false, the
+    // default: the two files under the renderer's cache, as always.  true:
+    // Wallpaper Engine's scopes, one folder per wallpaper under
+    // <config>/wekde/localstorage (LocalStorageLayout.hpp), LOCATION_GLOBAL
+    // for the wallpaper on every screen and LOCATION_SCREEN for the screen
+    // storageScreen names (the output's connector; a plain input, so a
+    // renderer shared by several screens is given the screen it stands for).
+    // A change writes what is pending where it belonged and reads the other
+    // place at the script's next access.
+    Q_PROPERTY(bool storagePerWallpaper READ storagePerWallpaper WRITE setStoragePerWallpaper)
+    Q_PROPERTY(QString storageScreen READ storageScreen WRITE setStorageScreen)
     // Fraction of the display's native resolution to render at, 1.0 = native.
     // Almost everything the renderer does is per-pixel and per-pass, so
     // rendering below native and letting Qt upscale is the largest single
@@ -171,6 +183,8 @@ public:
     bool    cameraParallax() const;
     bool    pixelArt() const;
     QVariantMap sceneQuality() const { return m_sceneQuality; }
+    bool        storagePerWallpaper() const { return m_lsPerWallpaper; }
+    QString     storageScreen() const { return m_lsScreenKey; }
     int         vramMiB() const { return m_vramMiB; }
     QString     shareKey() const { return m_shareKey; }
     void        setShareKey(const QString&);
@@ -198,6 +212,8 @@ public:
     void setCameraParallax(bool);
     void setPixelArt(bool);
     void setSceneQuality(const QVariantMap&);
+    void setStoragePerWallpaper(bool);
+    void setStorageScreen(const QString&);
 
     // debug
     bool vulkanValid() const;
@@ -1206,12 +1222,37 @@ private:
     // Reads one scope file.  `rejected` reports a file that exists but is
     // unusable (oversized or not a JSON object) so the caller overwrites it
     // instead of merging into garbage.
-    static QJsonObject readLocalStorageScope(const QString& path, bool* rejected);
+    // `preloadCap`: a larger file is not read (LocalStorageQuota.hpp's for the
+    // cache files; LocalStorageLayout.hpp's for a wallpaper's own).
+    static QJsonObject readLocalStorageScope(const QString& path, bool* rejected,
+                                             qsizetype preloadCap);
     // Replaces the live scope file in one rename(2).  False on any failure,
     // with the previous file left intact.  `errorLogged` is the caller's
     // one-shot log latch.
     static bool writeLocalStorageScope(const QString& path, const QJsonObject& obj,
                                        bool& errorLogged);
+    // storagePerWallpaper / storageScreen (we-manager localstorage patch).
+    // m_lsClearToken: the wallpaper's clear token (LocalStorageLayout.hpp)
+    // as it was when the scopes were read.  we-manager's Clear saved
+    // wallpaper data writes a new one, deletes the files and has the
+    // wallpaper loaded again; until the new scene has drawn, this one lives
+    // on with the old values in its script.  m_lsStale: a flush found another
+    // token, so this instance was running when its data was cleared.  It has
+    // dropped both scopes and writes nothing more, whatever the files look
+    // like by then (another screen's new scene may have made them again).
+    // The scene loaded next reads the new token and saves as always.
+    bool       m_lsPerWallpaper { false };
+    QString    m_lsScreenKey;
+    QByteArray m_lsClearToken;
+    bool       m_lsStale { false };
+    // True once this instance must not write: checks the token now.
+    bool localStorageClearedOutside();
+    // lsSet with storagePerWallpaper on: the scope's exact size against
+    // LocalStorageLayout.hpp's cap.
+    void lsSetPerWallpaper(int loc, const QString& key, const QJsonValue& value);
+    // Writes what is pending and forgets the loaded scopes, so the next
+    // access reads them from where the properties now point.
+    void moveLocalStorage();
 
 protected:
     QSGNode* updatePaintNode(QSGNode*, UpdatePaintNodeData*) override;

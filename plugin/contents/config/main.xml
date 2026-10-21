@@ -315,5 +315,9 @@
       <default>500</default>
       <min>0</min>
     </entry>
+    <entry name="LocalStoragePerWallpaper" type="Bool">
+      <label>What a scene's scripts save (SceneScript localStorage: a high score, a layout) is kept per wallpaper, and its per-screen part per screen, in ~/.config/wekde/localstorage, at most 100 KiB per file; off, the renderer's two cache files hold it, one of them shared by every wallpaper (we-manager localstorage patch)</label>
+      <default>false</default>
+    </entry>
   </group>
 </kcfg>

@@ -160,6 +160,16 @@ Item{
             // ShareRenderer (clone patch): when this screen renders for
             // others too, its CloneLink names the frame this viewer publishes.
             if (background.cloneLink) background.cloneLink.sourceCreated(player);
+            // SceneScript localStorage per wallpaper and per screen
+            // (localstorage patch, LocalStoragePerWallpaper).  Off, both keep
+            // their defaults and the renderer's cache files are used as before.
+            Common.setIfSupported(player, "SceneViewer", "storageScreen",
+                                  Qt.binding(function() {
+                                      return background.localStoragePerWallpaper === true
+                                          ? (background.storageScreen || "") : "";
+                                  }));
+            Common.setIfSupported(player, "SceneViewer", "storagePerWallpaper",
+                                  Qt.binding(function() { return background.localStoragePerWallpaper === true; }));
         }
 
         Connections {

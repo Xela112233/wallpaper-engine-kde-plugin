@@ -84,6 +84,12 @@ Rectangle {
     // TextureQuality): Scene.qml hands it to SceneViewer.sceneQuality, which
     // reloads the scene when it changes.
     property int    textureQuality: wallpaper.configuration.TextureQuality ?? 0
+    // SceneScript localStorage per wallpaper and per screen (localstorage
+    // patch, main.xml LocalStoragePerWallpaper): Scene.qml hands both to
+    // SceneViewer.  storageScreen is the screen whose LOCATION_SCREEN values
+    // the scene on this screen reads and writes: this screen's connector.
+    readonly property bool localStoragePerWallpaper: wallpaper.configuration.LocalStoragePerWallpaper ?? false
+    property string storageScreen: background.Screen.name || ""
     // What this screen's scene said it holds after its first frame
     // (SceneViewer.vramMiB), for VramSampler's footprint estimate.  Kept
     // through a stop (the estimate is what a reload will need again); 0 once a
