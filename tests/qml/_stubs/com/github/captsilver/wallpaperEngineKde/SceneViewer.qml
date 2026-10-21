@@ -27,6 +27,7 @@ Item {
     property bool   pixelArt:       false  // true: nearest-neighbour textures and output
     property real   renderScale:    1.0  // fraction of native resolution to render at
     property bool   systemAudioCapture: false
+    property string language:       ""   // applyGeneralSettings' language (we-manager's language patch)
     property int    presentMode:    0    // Swapchain present-mode policy (Auto=0)
     property int    outputRefreshMillihertz: 0      // 0 = no screen rate yet; C++ fills it from QScreen
     property real   nativeAspectRatio:  0  // 0 = scene not loaded yet (real type's sentinel)

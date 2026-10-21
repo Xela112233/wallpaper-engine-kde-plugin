@@ -13,7 +13,45 @@ import {
     formatPropertyLabel,
     badgeUpdated,
     evaluateCondition,
+    weLanguage,
+    localizedText,
+    WE_LANGUAGES,
 } from '../../plugin/contents/ui/js/utils.mjs';
+
+// we-manager's language patch: Wallpaper Engine language codes and
+// project.json general.localization lookups.
+test('weLanguage: Qt locale names become Wallpaper Engine codes', () => {
+    const cases = {
+        de_DE: 'de-de', 'de-DE': 'de-de', de_AT: 'de-de', en_GB: 'en-us', 'en_US.UTF-8': 'en-us',
+        zh_CN: 'zh-chs', zh_TW: 'zh-cht', zh_HK: 'zh-cht', zh_Hant_HK: 'zh-cht', zh_Hans_HK: 'zh-chs',
+        pt_BR: 'pt-br', pt: 'pt-pt', nn_NO: 'nb-no', fa: 'fa-ir', 'sr_RS@latin': 'sr-rs', ga: 'ga',
+        C: 'en-us', POSIX: 'en-us', '': 'en-us',
+    };
+    for (const [name, code] of Object.entries(cases)) assert.equal(weLanguage(name), code, name);
+    assert.equal(weLanguage(undefined), 'en-us');
+    assert.equal(WE_LANGUAGES.length, 36);
+    for (const [code] of WE_LANGUAGES) assert.equal(weLanguage(code), code);
+});
+
+test('localizedText: the language, then en-us, codes and tokens without case', () => {
+    const loc = { 'en-us': { ui_clock: 'Clock', ui_mode: 'Mode' }, 'DE-DE': { UI_Clock: 'Uhr' }, x: 'junk' };
+    assert.equal(localizedText(loc, 'de-de', 'ui_clock'), 'Uhr');
+    assert.equal(localizedText(loc, 'de-de', 'ui_mode'), 'Mode');
+    assert.equal(localizedText(loc, 'fr-fr', 'ui_clock'), 'Clock');
+    assert.equal(localizedText(loc, 'de-de', 'ui_missing'), '');
+    assert.equal(localizedText(null, 'de-de', 'ui_clock'), '');
+});
+
+test('formatPropertyLabel: ui_ tokens from the localization table first', () => {
+    const loc = { 'en-us': { ui_bg: '<b>Background</b>  colour', ui_browse_properties_x: 'Own X' },
+                  'de-de': { ui_bg: 'Hintergrund' } };
+    assert.equal(formatPropertyLabel('ui_bg', 'k', loc, 'de-de'), 'Hintergrund');
+    assert.equal(formatPropertyLabel('ui_bg', 'k', loc, 'ja-jp'), 'Background colour');
+    assert.equal(formatPropertyLabel('ui_browse_properties_x', 'k', loc, 'de-de'), 'Own X');
+    assert.equal(formatPropertyLabel('ui_browse_properties_scheme_color', 'k', loc, 'de-de'), 'Scheme Color');
+    assert.equal(formatPropertyLabel('Plain ui_bg', 'k', loc, 'de-de'), 'Plain ui_bg');
+    assert.equal(formatPropertyLabel('', 'k', loc, 'de-de'), 'k');
+});
 
 test('parseJson: valid JSON shapes', () => {
     assert.deepEqual(parseJson('{"a":1}'), { a: 1 });

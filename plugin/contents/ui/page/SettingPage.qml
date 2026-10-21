@@ -391,6 +391,28 @@ Flickable {
             }
 
             OptionItem {
+                text: i18nc("@label settings option", "Wallpaper Language")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: ComboBox {
+                    id: cbWallpaperLanguage
+                    model: [{ text: i18nc("@item:inlistbox wallpaper language", "Plasma's language"), value: "" }]
+                           .concat(Utils.WE_LANGUAGES.map(l => ({ text: l[1], value: l[0] })))
+                    textRole: "text"
+                    onActivated: cfg_WallpaperLanguage = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_WallpaperLanguage))
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info wallpaper language help text", "The language wallpapers are given, as Wallpaper Engine's Language setting: scenes get it through SceneScript's applyGeneralSettings (localised clocks and calendars), web wallpapers as their 'language' property, and the wallpaper page shows property labels in it when the wallpaper ships translations.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+
+            OptionItem {
                 // Only meaningful in Keep Aspect Ratio mode — Crop/Scale fill
                 // the screen edge-to-edge so the backdrop is never visible.
                 visible: cfg_DisplayMode == Common.DisplayMode.Aspect

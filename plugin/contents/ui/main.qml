@@ -3,6 +3,7 @@ import com.github.captsilver.wallpaperEngineKde
 import QtQuick.Window
 import org.kde.plasma.plasmoid
 import org.kde.kirigami as Kirigami
+import "js/utils.mjs" as Utils
 
 WallpaperItem {
 Rectangle {
@@ -19,6 +20,11 @@ Rectangle {
     property string source: Qt.resolvedUrl(wallpaper.configuration.WallpaperSource).toString()
 
     property string filterStr: wallpaper.configuration.FilterStr
+    // Wallpaper Engine's language code for the wallpaper (applyGeneralSettings
+    // for scenes, the 'language' general property for web pages): the
+    // configured one, else Plasma's (we-manager's language patch).
+    readonly property string wallpaperLanguage: Utils.weLanguage(wallpaper.configuration.WallpaperLanguage
+                                                                 || Qt.locale().name)
 
     property int    videoBackend: wallpaper.configuration.VideoBackend
     property int    switchTimer: wallpaper.configuration.SwitchTimer

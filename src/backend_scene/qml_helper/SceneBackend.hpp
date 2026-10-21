@@ -59,6 +59,10 @@ class SceneObject : public QQuickItem {
                    userPropertiesChanged)
     Q_PROPERTY(bool hdrOutput READ hdrOutput WRITE setHdrOutput)
     Q_PROPERTY(bool systemAudioCapture READ systemAudioCapture WRITE setSystemAudioCapture)
+    // Wallpaper Engine's language code ("en-us", "de-de", "zh-chs"), handed to
+    // SceneScript as applyGeneralSettings({language}): at load and on each
+    // change.  Empty leaves `language` out (we-manager's language patch).
+    Q_PROPERTY(QString language READ language WRITE setLanguage NOTIFY languageChanged)
     // Override scene.general.orthogonalprojection.postprocessing.  Empty string
     // means "use the scene's own value".  Common values: "low", "medium",
     // "ultra" (HDR mip-chain bloom), "displayhdr".  Effective when scene also
@@ -126,6 +130,7 @@ public:
     bool    muted() const;
     bool    hdrOutput() const;
     bool    systemAudioCapture() const;
+    QString language() const;
     QString userProperties() const;
     QString postprocessingOverride() const;
     int     msaaMode() const;
@@ -143,6 +148,7 @@ public:
     void setUserProperties(const QString&);
     void setHdrOutput(bool);
     void setSystemAudioCapture(bool);
+    void setLanguage(const QString&);
     void setPostprocessingOverride(const QString&);
     void setMsaaMode(int);
     void setCameraParallax(bool);
@@ -346,6 +352,7 @@ private slots:
 signals:
     void sourceChanged();
     void fpsChanged();
+    void languageChanged();
     void presentModeChanged();
     void outputRefreshMillihertzChanged();
     void fillModeChanged();
@@ -398,6 +405,7 @@ private:
     bool        m_deterministic { false };
     std::string m_cache_path_override; // empty = use GetDefaultCachePath()
     bool        m_systemAudioCapture { false };
+    QString     m_language;
     QString     m_postprocessingOverride;
     int         m_msaaMode { 0 };
     bool        m_cameraParallax { true };
@@ -561,6 +569,10 @@ private:
     // once during setup so scripts can key off it for init-time app-level
     // state, and is safe to call again later if plugin-wide settings change.
     void fireApplyGeneralSettings();
+public:
+    // Test hook: dispatch applyGeneralSettings to the seeded scripts.
+    void fireApplyGeneralSettingsForTesting() { fireApplyGeneralSettings(); }
+private:
     // Populates engine.scriptId / scriptName / getScriptHash() from a
     // stable fingerprint of the loaded property scripts.  Must be called
     // AFTER m_propertyScriptStates is populated; the init-time stub writes
@@ -652,6 +664,7 @@ private:
         int32_t  id;
         QJSValue updateFn;
         QJSValue applyUserPropertiesFn;
+        QJSValue applyGeneralSettingsFn; // exported applyGeneralSettings(settings)
         QString  currentText;
         // Media-event handlers (see PropertyScriptState's siblings below).  A
         // text-property script — the idiom Wallpaper Engine's own "Now
@@ -712,6 +725,7 @@ private:
         QJSValue cursorDownFn;
         QJSValue cursorClickFn;
         QJSValue cursorMoveFn;
+        QJSValue applyGeneralSettingsFn; // exported applyGeneralSettings(settings)
         // Media-event handlers — a layer's color script (e.g. an accent tint
         // keyed on the current track's album art) exports these the same way
         // a property script does.
@@ -755,6 +769,7 @@ private:
         QJSValue    cursorUpFn;
         QJSValue    cursorMoveFn;
         QJSValue    applyUserPropertiesFn; // optional applyUserProperties handler
+        QJSValue    applyGeneralSettingsFn; // optional exported applyGeneralSettings handler
         QJSValue    destroyFn;             // optional destroy handler
         QJSValue    resizeScreenFn;        // optional resizeScreen handler
         QJSValue    mediaPlaybackChangedFn;
@@ -804,6 +819,7 @@ private:
         int32_t              index;
         QJSValue             updateFn;
         QJSValue             applyUserPropertiesFn;
+        QJSValue             applyGeneralSettingsFn;
         QJSValue             thisLayerProxy;
         std::string          layerName;
         float                currentVolume { 1.0f };

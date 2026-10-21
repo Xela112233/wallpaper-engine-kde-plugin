@@ -655,6 +655,17 @@ void SceneObject::setSystemAudioCapture(bool value) {
     SET_PROPERTY(Bool, wallpaper::PROPERTY_SYSTEM_AUDIO_CAPTURE, value);
 }
 
+QString SceneObject::language() const { return m_language; }
+
+void SceneObject::setLanguage(const QString& value) {
+    if (m_language == value) return;
+    m_language = value;
+    Q_EMIT languageChanged();
+    // A running scene hears the change as Wallpaper Engine sends it: another
+    // applyGeneralSettings carrying the setting that changed.
+    if (m_jsEngine) fireApplyGeneralSettings();
+}
+
 QString SceneObject::postprocessingOverride() const { return m_postprocessingOverride; }
 
 void SceneObject::setPostprocessingOverride(const QString& value) {
@@ -821,7 +832,72 @@ void SceneObject::fireApplyUserProperties() {
 
 void SceneObject::fireApplyGeneralSettings() {
     if (! m_jsEngine) return;
+    // Wallpaper Engine's general settings: the app's language, as the code
+    // its SceneScript docs list ("en-us", "de-de", "zh-chs").  Left out while
+    // QML has not set one, so a scene keeps its own default.
     QJSValue settingsArg = m_jsEngine->newObject();
+    if (! m_language.isEmpty()) settingsArg.setProperty("language", m_language);
+
+    // `export function applyGeneralSettings(settings)` in a layer script, the
+    // form Wallpaper Engine documents, besides scene.on('applyGeneralSettings').
+    for (auto& state : m_propertyScriptStates) {
+        if (! state.applyGeneralSettingsFn.isCallable()) continue;
+        if (! state.layerName.empty()) {
+            m_globalObj.setProperty("thisLayer", state.thisLayerProxy);
+            m_globalObj.setProperty("thisObject", state.thisObjectProxy);
+        }
+        QJSValue result = callJsGuarded([&] {
+            return state.applyGeneralSettingsFn.call({ settingsArg });
+        });
+        if (result.isError()) {
+            LOG_INFO("applyGeneralSettings error id=%d prop=%s: %s",
+                     state.id,
+                     state.property.c_str(),
+                     qPrintable(result.toString()));
+        }
+    }
+    for (auto& svState : m_soundVolumeScriptStates) {
+        if (! svState.applyGeneralSettingsFn.isCallable()) continue;
+        if (! svState.layerName.empty()) {
+            m_globalObj.setProperty("thisLayer", svState.thisLayerProxy);
+            m_globalObj.setProperty("thisObject", svState.thisLayerProxy);
+        }
+        QJSValue result = callJsGuarded([&] {
+            return svState.applyGeneralSettingsFn.call({ settingsArg });
+        });
+        if (result.isError()) {
+            LOG_INFO("applyGeneralSettings error vol index=%d: %s",
+                     svState.index,
+                     qPrintable(result.toString()));
+        }
+    }
+    // Text scripts bind thisLayer in their wrapper; color scripts get theirs
+    // set as for their update ticks.
+    for (auto& tState : m_textScriptStates) {
+        if (! tState.applyGeneralSettingsFn.isCallable()) continue;
+        QJSValue result = callJsGuarded([&] {
+            return tState.applyGeneralSettingsFn.call({ settingsArg });
+        });
+        if (result.isError()) {
+            LOG_INFO("applyGeneralSettings error text id=%d: %s",
+                     tState.id,
+                     qPrintable(result.toString()));
+        }
+    }
+    for (auto& cState : m_colorScriptStates) {
+        if (! cState.applyGeneralSettingsFn.isCallable()) continue;
+        m_globalObj.setProperty("thisLayer", cState.thisLayerProxy);
+        m_globalObj.setProperty("thisObject", cState.thisObjectProxy);
+        QJSValue result = callJsGuarded([&] {
+            return cState.applyGeneralSettingsFn.call({ settingsArg });
+        });
+        if (result.isError()) {
+            LOG_INFO("applyGeneralSettings error color id=%d: %s",
+                     cState.id,
+                     qPrintable(result.toString()));
+        }
+    }
+
     fireSceneEventListeners("applyGeneralSettings", { settingsArg });
 }
 
@@ -2447,13 +2523,19 @@ static const char kMediaHandlerExtractJs[] =
     "null);\n"
     "  var _mstc = typeof exports.mediaStatusChanged === 'function' ? "
     "exports.mediaStatusChanged :\n"
-    "              (typeof mediaStatusChanged === 'function' ? mediaStatusChanged : null);\n";
+    "              (typeof mediaStatusChanged === 'function' ? mediaStatusChanged : null);\n"
+    // Not a media event, but exported the same way (we-manager's language
+    // patch): Wallpaper Engine's applyGeneralSettings(settings).
+    "  var _ags  = typeof exports.applyGeneralSettings === 'function' ? "
+    "exports.applyGeneralSettings :\n"
+    "              (typeof applyGeneralSettings === 'function' ? applyGeneralSettings : "
+    "null);\n";
 // The five extracted locals, as object-literal fields, for a wrapper's
 // `return {...}` (shared verbatim so every wrapper exposes the same names).
 static const char kMediaHandlerReturnFieldsJs[] =
     "mediaPlaybackChanged: _mpbc, mediaPropertiesChanged: _mprc,\n"
     "           mediaThumbnailChanged: _mtbc, mediaTimelineChanged: _mtlc,\n"
-    "           mediaStatusChanged: _mstc";
+    "           mediaStatusChanged: _mstc, applyGeneralSettings: _ags";
 
 // Text-property script IIFE wrapper.  Used both by setupTextScripts()'s real
 // compile loop and by seedTextScriptFromSourceForTesting(), so a test and
@@ -2716,6 +2798,10 @@ static QString buildPropertyScriptWrapperJs(const QString& propsInit, const QStr
                "  var _anim = typeof exports.animationEvent === 'function' ? "
                "exports.animationEvent :\n"
                "              (typeof animationEvent === 'function' ? animationEvent : null);\n"
+               "  var _ags  = typeof exports.applyGeneralSettings === 'function' ? "
+               "exports.applyGeneralSettings :\n"
+               "              (typeof applyGeneralSettings === 'function' ? applyGeneralSettings : "
+               "null);\n"
                "  var _animSafe = _anim ? function(ev, v) {\n"
                "    try { return _anim(ev, v); }\n"
                "    catch(e) { console.log('SceneScript animationEvent error: ' + e.message); "
@@ -2729,6 +2815,7 @@ static QString buildPropertyScriptWrapperJs(const QString& propsInit, const QStr
                "           mediaPlaybackChanged: _mpbc, mediaPropertiesChanged: _mprc,\n"
                "           mediaThumbnailChanged: _mtbc, mediaTimelineChanged: _mtlc,\n"
                "           mediaStatusChanged: _mstc,\n"
+               "           applyGeneralSettings: _ags,\n"
                "           animationEvent: _animSafe };\n"
                "})(thisLayer)\n")
         .arg(propsInit, body);
@@ -2930,6 +3017,7 @@ void SceneObject::setupTextScripts() {
         state.cursorDownFn             = result.property("cursorDown");
         state.cursorClickFn            = result.property("cursorClick");
         state.cursorMoveFn             = result.property("cursorMove");
+        state.applyGeneralSettingsFn   = result.property("applyGeneralSettings");
         state.mediaPlaybackChangedFn   = result.property("mediaPlaybackChanged");
         state.mediaPropertiesChangedFn = result.property("mediaPropertiesChanged");
         state.mediaThumbnailChangedFn  = result.property("mediaThumbnailChanged");
@@ -3130,6 +3218,7 @@ void SceneObject::setupTextScripts() {
         QJSValue cursorUpFn               = result.property("cursorUp");
         QJSValue cursorMoveFn             = result.property("cursorMove");
         QJSValue applyUserPropertiesFn    = result.property("applyUserProperties");
+        QJSValue applyGeneralSettingsFn   = result.property("applyGeneralSettings");
         QJSValue destroyFn                = result.property("destroy");
         QJSValue resizeScreenFn           = result.property("resizeScreen");
         QJSValue mediaPlaybackChangedFn   = result.property("mediaPlaybackChanged");
@@ -3147,7 +3236,8 @@ void SceneObject::setupTextScripts() {
             ! destroyFn.isCallable() && ! resizeScreenFn.isCallable() &&
             ! mediaPlaybackChangedFn.isCallable() && ! mediaPropertiesChangedFn.isCallable() &&
             ! mediaThumbnailChangedFn.isCallable() && ! mediaTimelineChangedFn.isCallable() &&
-            ! mediaStatusChangedFn.isCallable() && ! animationEventFn.isCallable()) {
+            ! mediaStatusChangedFn.isCallable() && ! animationEventFn.isCallable() &&
+            ! applyGeneralSettingsFn.isCallable()) {
             continue;
         }
 
@@ -3169,6 +3259,7 @@ void SceneObject::setupTextScripts() {
         state.cursorUpFn    = cursorUpFn;
         state.cursorMoveFn  = cursorMoveFn;
         state.applyUserPropertiesFn    = applyUserPropertiesFn;
+        state.applyGeneralSettingsFn   = applyGeneralSettingsFn;
         state.destroyFn                = destroyFn;
         state.resizeScreenFn           = resizeScreenFn;
         state.mediaPlaybackChangedFn   = mediaPlaybackChangedFn;
@@ -3494,13 +3585,17 @@ void SceneObject::setupTextScripts() {
                     "exports.applyUserProperties :\n"
                     "              (typeof applyUserProperties === 'function' ? "
                     "applyUserProperties : null);\n"
+                    "  var _ags  = typeof exports.applyGeneralSettings === 'function' ? "
+                    "exports.applyGeneralSettings :\n"
+                    "              (typeof applyGeneralSettings === 'function' ? "
+                    "applyGeneralSettings : null);\n"
                     "  if (!_upd) return null;\n"
                     "  try { if (_init) _init(%3); } catch(e) { console.log('vol init error: ' + "
                     "e); }\n"
                     "  try { if (_aup && engine && engine.userProperties) "
                     "_aup(engine.userProperties); }\n"
                     "  catch(e) { console.log('vol applyUserProperties error: ' + e); }\n"
-                    "  return { update: _upd, applyUserProperties: _aup };\n"
+                    "  return { update: _upd, applyUserProperties: _aup, applyGeneralSettings: _ags };\n"
                     "})(thisLayer)\n")
                 .arg(propsInit, scriptSrc)
                 .arg((double)svsi.initialVolume);
@@ -3538,6 +3633,7 @@ void SceneObject::setupTextScripts() {
         if (applyFn.isCallable()) {
             state.applyUserPropertiesFn = applyFn;
         }
+        state.applyGeneralSettingsFn = result.property("applyGeneralSettings");
 
         // Initialize volume animation if present
         if (svsi.hasAnimation && ! svsi.animation.keyframes.empty()) {
@@ -3624,6 +3720,7 @@ void SceneObject::setupTextScripts() {
         state.id                       = tsi.id;
         state.updateFn                 = updateFn;
         state.applyUserPropertiesFn    = result.property("applyUserProperties");
+        state.applyGeneralSettingsFn   = result.property("applyGeneralSettings");
         state.currentText              = QString::fromStdString(tsi.initialValue);
         state.mediaPlaybackChangedFn   = result.property("mediaPlaybackChanged");
         state.mediaPropertiesChangedFn = result.property("mediaPropertiesChanged");
@@ -3673,6 +3770,12 @@ void SceneObject::setupTextScripts() {
     // Check if scene.on("update") listeners were registered during script compilation
     bool hasUpdateListeners = m_hasSceneListenersFn.isCallable() &&
                               m_hasSceneListenersFn.call({ QJSValue("update") }).toBool();
+
+    // Every script exists now: the general settings (the language) reach
+    // their exported applyGeneralSettings and the scene.on listeners they
+    // registered, before their first update.  The call in
+    // refreshJsUserProperties ran before any script was compiled.
+    fireApplyGeneralSettings();
 
     // Property scripts must run first — they populate shared.* that text/color scripts depend on
     if (! m_propertyScriptStates.empty() || ! m_soundVolumeScriptStates.empty() ||
@@ -6372,6 +6475,7 @@ void SceneObject::seedTextScriptFromSourceForTesting(int32_t id, const std::stri
     state.id                       = id;
     state.updateFn                 = result.property("update");
     state.applyUserPropertiesFn    = result.property("applyUserProperties");
+    state.applyGeneralSettingsFn   = result.property("applyGeneralSettings");
     state.mediaPlaybackChangedFn   = result.property("mediaPlaybackChanged");
     state.mediaPropertiesChangedFn = result.property("mediaPropertiesChanged");
     state.mediaThumbnailChangedFn  = result.property("mediaThumbnailChanged");
@@ -6392,6 +6496,7 @@ void SceneObject::seedColorScriptFromSourceForTesting(int32_t id, const std::str
     state.updateFn                 = result.property("update");
     state.thisLayerProxy           = m_jsEngine->globalObject().property("thisLayer");
     state.thisObjectProxy          = state.thisLayerProxy;
+    state.applyGeneralSettingsFn   = result.property("applyGeneralSettings");
     state.mediaPlaybackChangedFn   = result.property("mediaPlaybackChanged");
     state.mediaPropertiesChangedFn = result.property("mediaPropertiesChanged");
     state.mediaThumbnailChangedFn  = result.property("mediaThumbnailChanged");

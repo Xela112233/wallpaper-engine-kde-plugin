@@ -30,6 +30,7 @@ QtObject {
     property string wallpaperPath: ""
     property string wallpaperType: ""
     property string workshopid:  ""
+    property string wallpaperLanguage: "en-us"  // main.qml's weLanguage(WallpaperLanguage || Qt.locale().name)
     property string steamlibrary: ""
     property string filterStr:   ""
     property bool   randomizeWallpaper: false

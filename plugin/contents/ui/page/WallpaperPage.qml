@@ -1185,6 +1185,12 @@ RowLayout {
                                                           'file', 'directory']
 
                     property var userProperties: []
+                    // project.json general.localization, and the language
+                    // its ui_ labels are shown in: the screen's Wallpaper
+                    // Language, else Plasma's (we-manager's language patch)
+                    property var propLocalization: ({})
+                    readonly property string propLanguage: Utils.weLanguage(
+                        (typeof cfg_WallpaperLanguage === 'string' && cfg_WallpaperLanguage) || Qt.locale().name)
                     property var propConfig: wallpaperPageRoot.activeConfig
                     property var propChanges: ({})
                     property var activeBindings: []
@@ -1204,6 +1210,11 @@ RowLayout {
                                 const project = Utils.parseJson(value);
                                 if (project && project.general && project.general.properties) {
                                     const props = project.general.properties;
+                                    const loc = (project.general.localization
+                                                 && typeof project.general.localization === 'object')
+                                                ? project.general.localization : {};
+                                    user_props_group.propLocalization = loc;
+                                    const lang = user_props_group.propLanguage;
                                     const arr = [];
                                     // Pulled into Utils.formatPropertyLabel so the
                                     // transform is unit-testable. Behavior unchanged.
@@ -1221,7 +1232,7 @@ RowLayout {
                                             continue;
                                         arr.push({
                                             key: key,
-                                            text: formatLabel(prop.text, key),
+                                            text: formatLabel(prop.text, key, loc, lang),
                                             type: type,
                                             value: prop.value,
                                             min: prop.min,
@@ -1541,7 +1552,9 @@ RowLayout {
                                                     // formatPropertyLabel.
                                                     const rawLabel = (typeof opt.label === 'string') ? opt.label : '';
                                                     comboModel.push({
-                                                        text: Utils.formatPropertyLabel(rawLabel, String(opt.value)),
+                                                        text: Utils.formatPropertyLabel(rawLabel, String(opt.value),
+                                                                                        user_props_group.propLocalization,
+                                                                                        user_props_group.propLanguage),
                                                         value: opt.value
                                                     });
                                                 }

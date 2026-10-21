@@ -62,15 +62,89 @@ export function intArrayToStr(arr) {
     return arr.reduce((acc, e) => acc + e.toString(), "");
 }
 
+// Wallpaper Engine's languages (we-manager): the codes SceneScript's
+// applyGeneralSettings passes as `language`, and the keys of a project.json
+// general.localization block, with the language's own name.
+export const WE_LANGUAGES = [
+    ['ar-sa', 'العربية'], ['be-by', 'Беларуская'], ['bg-bg', 'Български'], ['cs-cz', 'Čeština'],
+    ['da-dk', 'Dansk'], ['de-de', 'Deutsch'], ['el-gr', 'Ελληνικά'], ['en-us', 'English'],
+    ['es-es', 'Español'], ['eu-es', 'Euskara'], ['fa-ir', 'فارسی'], ['fi-fi', 'Suomi'],
+    ['fr-fr', 'Français'], ['he-il', 'עברית'], ['hu-hu', 'Magyar'], ['id-id', 'Bahasa Indonesia'],
+    ['it-it', 'Italiano'], ['ja-jp', '日本語'], ['ko-kr', '한국어'], ['lt-lt', 'Lietuvių'],
+    ['nb-no', 'Norsk bokmål'], ['nl-nl', 'Nederlands'], ['pl-pl', 'Polski'], ['pt-br', 'Português (Brasil)'],
+    ['pt-pt', 'Português'], ['ro-ro', 'Română'], ['ru-ru', 'Русский'], ['sk-sk', 'Slovenčina'],
+    ['sl-si', 'Slovenščina'], ['sv-se', 'Svenska'], ['th-th', 'ไทย'], ['tr-tr', 'Türkçe'],
+    ['uk-ua', 'Українська'], ['vi-vn', 'Tiếng Việt'], ['zh-chs', '简体中文'], ['zh-cht', '繁體中文'],
+];
+const WE_LANGUAGE_CODES = WE_LANGUAGES.map(l => l[0]);
+
+// A Qt locale name (Qt.locale().name: "de_DE", "zh_CN", "pt_BR"; also
+// "de-DE", "zh_Hant_TW", "de_DE.UTF-8", "C") as a Wallpaper Engine language
+// code ("de-de", "zh-chs", "pt-br", "en-us").  A language Wallpaper Engine
+// has in one country only gets that code whatever the region (de_AT ->
+// de-de, en_GB -> en-us): scenes compare the code exactly.  Other languages
+// come out as language-country in lower case.  we-manager's
+// properties.we_language is the same function.
+export function weLanguage(name) {
+    let n = (typeof name === 'string') ? name.trim() : '';
+    n = n.split('.')[0].split('@')[0];
+    if (!n || n === 'C' || n === 'POSIX') return 'en-us';
+    const parts = n.split(/[-_]/).filter(p => p);
+    const lang = parts[0].toLowerCase();
+    const rest = parts.slice(1);
+    const script = (rest.find(p => p.length === 4 && /^[A-Za-z]+$/.test(p)) || '').toLowerCase();
+    const region = (rest.find(p => p.length === 2 || p.length === 3) || '').toLowerCase();
+    if (lang === 'zh') {
+        const hant = script === 'hant' || (!script && ['tw', 'hk', 'mo', 'cht'].indexOf(region) >= 0);
+        return hant ? 'zh-cht' : 'zh-chs';
+    }
+    if (lang === 'nb' || lang === 'nn' || lang === 'no') return 'nb-no';
+    const code = region ? `${lang}-${region}` : lang;
+    if (WE_LANGUAGE_CODES.indexOf(code) >= 0) return code;
+    const same = WE_LANGUAGE_CODES.filter(c => c.split('-')[0] === lang);
+    if (same.length === 1) return same[0];
+    if (same.length > 1) return same.indexOf(`${lang}-${lang}`) >= 0 ? `${lang}-${lang}` : same[0];
+    return code;
+}
+
+// A ui_ token's text in a project.json general.localization block (`loc`,
+// {language code: {token: text}}): the `lang` table, then en-us, as
+// Wallpaper Engine falls back.  Language codes and tokens are compared
+// without case.  Returns '' when neither table has a text for it.
+export function localizedText(loc, lang, token) {
+    if (!loc || typeof loc !== 'object' || typeof token !== 'string' || !token.trim()) return '';
+    const t = token.trim().toLowerCase();
+    const tables = {};
+    for (const code in loc) {
+        if (loc[code] && typeof loc[code] === 'object') tables[String(code).toLowerCase()] = loc[code];
+    }
+    const order = [String(lang || '').toLowerCase(), 'en-us'];
+    for (const code of order) {
+        const table = tables[code];
+        if (!table) continue;
+        for (const k in table) {
+            const v = table[k];
+            if (k.toLowerCase() === t && typeof v === 'string' && v.trim()) return v;
+        }
+    }
+    return '';
+}
+
 // Converts a wallpaper user-property `text` field into a human-readable
 // label, with fallback to the property `key`.
+//   • a `ui_` token the wallpaper translates (`loc`, its general.localization)
+//     → its text in `lang`, else in en-us (we-manager)
 //   • `ui_browse_properties_foo_bar` → "Foo Bar" (WE localization keys)
 //   • "<b>Cool prop</b>" → "Cool prop" (HTML strips, whitespace collapses)
 //   • empty / whitespace-only / falsy → returns `key`
 // Pulled out of WallpaperPage.qml so it can be unit-tested directly —
 // the underscore-split + regex are easy mutation targets.
-export function formatPropertyLabel(text, key) {
+export function formatPropertyLabel(text, key, loc, lang) {
     if (!text) return key;
+    if (loc && typeof text === 'string' && /^ui_/i.test(text.trim())) {
+        const found = localizedText(loc, lang, text);
+        if (found) text = found;
+    }
     if (text.startsWith('ui_browse_properties_')) {
         const suffix = text.replace('ui_browse_properties_', '');
         return suffix.split('_').map(w =>

@@ -152,6 +152,21 @@ Item {
         }
     }
 
+    // Wallpaper Engine's language code ("de-de"), the 'language' general
+    // property web pages read in applyGeneralProperties (we-manager's
+    // language patch); a change reaches a running page as fps does.
+    readonly property string language: background.wallpaperLanguage
+    function generalPropertiesNow() {
+        return {fps: webItem.fps, language: webItem.language};
+    }
+    onLanguageChanged: {
+        if (webobj.loaded) {
+            var g = JSON.parse(JSON.stringify(webobj.generalProperties || {}));
+            g.language = webItem.language;
+            webobjCtl.pushGeneralProperties(g);
+        }
+    }
+
     Image {
         id: pauseImage
         anchors.fill: parent
@@ -181,7 +196,7 @@ Item {
             // The page gets the configured Fps from the start (Wallpaper
             // Engine's applyGeneralProperties); onFpsChanged keeps it current.
             if (!webobj.generalProperties || Object.keys(webobj.generalProperties).length === 0)
-                webobjCtl.pushGeneralProperties({fps: webItem.fps});
+                webobjCtl.pushGeneralProperties(webItem.generalPropertiesNow());
             var wpDir = Common.urlNative(webItem.source.toString());
             wpDir = wpDir.substring(0, wpDir.lastIndexOf('/'));
             // Load user properties from project.json BEFORE signaling,
@@ -203,7 +218,7 @@ Item {
                 // pushUserProperties + pushGeneralProperties each fire their
                 // matching sig* signal automatically — no explicit emit needed.
                 webobjCtl.pushUserProperties(userProps);
-                webobjCtl.pushGeneralProperties(webobj.generalProperties || {fps: webItem.fps});
+                webobjCtl.pushGeneralProperties(webobj.generalProperties || webItem.generalPropertiesNow());
             });
         }
     }

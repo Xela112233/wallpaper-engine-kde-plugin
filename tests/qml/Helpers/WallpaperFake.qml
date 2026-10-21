@@ -61,6 +61,7 @@ Item {
         "Volume":              50,
         "Speed":               1.0,
         "FilterStr":           "",
+        "WallpaperLanguage":   "",
         "PerOptChanged":       0,
         "CustomConf":          "",
         "HdrOutput":           false,

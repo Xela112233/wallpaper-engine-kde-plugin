@@ -166,6 +166,10 @@
       <label>FilterStr</label>
       <default></default>
     </entry>
+    <entry name="WallpaperLanguage" type="String">
+      <label>Language handed to wallpapers (Wallpaper Engine code such as de-de or zh-chs); empty: Plasma's language</label>
+      <default></default>
+    </entry>
     <entry name="PerOptChanged" type="Int">
       <label>PerOptChanged</label>
       <default>0</default>

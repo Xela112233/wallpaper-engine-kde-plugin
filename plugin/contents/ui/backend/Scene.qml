@@ -118,6 +118,8 @@ Item{
         pixelArt: background.pixelArt
         renderScale: background.renderScale
         systemAudioCapture: background.systemAudioCapture
+        // SceneScript's applyGeneralSettings({language}) (we-manager's language patch)
+        language: background.wallpaperLanguage
         Component.onCompleted: {
             player.setAcceptMouse(true);
             player.setAcceptHover(true);

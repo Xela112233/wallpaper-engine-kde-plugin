@@ -11907,3 +11907,51 @@ TEST_SUITE("LocalStorageQuota") {
         CHECK(SerializedSize(v) == expected);
     }
 } // TEST_SUITE LocalStorageQuota
+
+// ------------------------------------------------------------------
+// applyGeneralSettings carries Wallpaper Engine's language (we-manager's
+// language patch): a script's own applyGeneralSettings, compiled through the
+// production text-script wrapper, is called with {language} from the
+// SceneViewer's `language` property, and again when it changes.
+// ------------------------------------------------------------------
+TEST_SUITE("applyGeneralSettings language") {
+    // `export function` reaches the wrapper as a plain function (the
+    // normaliser strips `export`); the wrapper also takes exports.NAME.
+    static const char kLanguageTextScript[] = R"JS(
+var lang = 'none';
+function applyGeneralSettings(settings) {
+    lang = settings.hasOwnProperty('language') ? settings.language : 'absent';
+}
+function update(value) { return lang; }
+)JS";
+
+    TEST_CASE("a text script's applyGeneralSettings gets the language, and each change") {
+        scenebackend::SceneObject obj;
+        auto                      sink    = std::make_unique<MediaDispatchTestSink>();
+        auto*                     sinkPtr = sink.get();
+        obj.setDispatchSinkForTesting(std::move(sink));
+        obj.setLanguage(QStringLiteral("de-de"));
+        obj.seedTextScriptFromSourceForTesting(7, kLanguageTextScript);
+        obj.fireApplyGeneralSettingsForTesting();
+        obj.evaluateTextScriptsForTesting();
+        REQUIRE(sinkPtr->textCalls.size() == 1);
+        CHECK(sinkPtr->textCalls[0].text == "de-de");
+
+        obj.setLanguage(QStringLiteral("zh-chs")); // a running scene hears the change
+        obj.evaluateTextScriptsForTesting();
+        REQUIRE(sinkPtr->textCalls.size() == 2);
+        CHECK(sinkPtr->textCalls[1].text == "zh-chs");
+    }
+
+    TEST_CASE("without a language the field is left out") {
+        scenebackend::SceneObject obj;
+        auto                      sink    = std::make_unique<MediaDispatchTestSink>();
+        auto*                     sinkPtr = sink.get();
+        obj.setDispatchSinkForTesting(std::move(sink));
+        obj.seedTextScriptFromSourceForTesting(9, kLanguageTextScript);
+        obj.fireApplyGeneralSettingsForTesting();
+        obj.evaluateTextScriptsForTesting();
+        REQUIRE(sinkPtr->textCalls.size() == 1);
+        CHECK(sinkPtr->textCalls[0].text == "absent");
+    }
+} // TEST_SUITE applyGeneralSettings language
