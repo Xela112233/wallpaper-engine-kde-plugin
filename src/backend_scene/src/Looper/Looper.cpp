@@ -5,6 +5,7 @@
 
 #include "Core/Visitors.hpp"
 #include "Utils/Logging.h"
+#include "Utils/ThreadPriority.hpp"
 
 #include <cassert>
 
@@ -13,6 +14,11 @@ using namespace wallpaper::looper;
 using Lock = std::unique_lock<std::mutex>;
 
 void Looper::setName(std::string_view name) { m_name.assign(name); }
+
+void Looper::setThreadGroup(std::shared_ptr<RenderThreadGroup> group) {
+    Lock lock(m_mutex);
+    m_thread_group = std::move(group);
+}
 
 const std::string_view Looper::name() const { return m_name; }
 
@@ -66,8 +72,10 @@ status_t Looper::start() {
     // The worker holds only a weak_ptr so the owner can drop its last reference
     // while the thread runs; each iteration below re-locks it and exits when that fails.
     std::weak_ptr<Looper> wlooper = shared_from_this();
+    // Held by the worker itself: the group outlives the looper if need be.
+    std::shared_ptr<RenderThreadGroup> group = m_thread_group;
     m_thread                      = std::thread(
-        [](std::weak_ptr<Looper> wlooper) {
+        [group](std::weak_ptr<Looper> wlooper) {
             std::string name;
             {
                 // lock() returns null when the owner dropped its last reference
@@ -79,6 +87,7 @@ status_t Looper::start() {
                 if (! self) return;
                 name = self->name();
                 pthread_setname_np(pthread_self(), WorkerThreadName(name).c_str());
+                if (group) group->Join();     // ProcessPriority; threads it starts inherit it
                 LOG_INFO("%s looper started", name.c_str());
                 if (testHook_workerLockedRef) testHook_workerLockedRef();
             }
@@ -111,6 +120,7 @@ status_t Looper::start() {
                 LOG_ERROR("%s looper thread threw (non-std exception)", name.c_str());
             }
             LOG_INFO("%s looper stopped", name.c_str());
+            if (group) group->Leave();
             // Last statement before the OS thread function returns. On the
             // self-stop path (stop() detaches this same thread, above) this
             // is the only way anything else finds out the thread is truly

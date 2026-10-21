@@ -181,6 +181,7 @@ add_executable(backend_scene_tests
     test_WPImageObject.cpp
     test_ParticleEmitter.cpp
     test_Looper.cpp
+    test_ThreadPriority.cpp
     test_Determinism.cpp
     test_WPSoundObject.cpp
     test_WPScene.cpp

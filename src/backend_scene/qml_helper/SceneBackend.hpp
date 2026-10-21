@@ -74,6 +74,11 @@ class SceneObject : public QQuickItem {
     // drawing), 1 = off, 2 or 4 = pinned.  The sample count is baked into the
     // render passes at scene load, so a change reloads the scene.
     Q_PROPERTY(int msaaMode READ msaaMode WRITE setMsaaMode)
+    // ProcessPriority (main.xml): 0 normal, 1 below normal, 2 low.  This
+    // scene's renderer threads run at that nice level (its RenderThreadGroup,
+    // Utils/ThreadPriority.hpp), those already running included; going back
+    // up needs CAP_SYS_NICE, else it applies when the scene is loaded again.
+    Q_PROPERTY(int processPriority READ processPriority WRITE setProcessPriority)
     // Per-wallpaper switches (main.qml: mouse_parallax and pixel_art in the
     // wallpaper's <id>.json).  cameraParallax false keeps the scene's
     // cursor-driven camera parallax off; the cursor still reaches the scene.
@@ -134,6 +139,7 @@ public:
     QString userProperties() const;
     QString postprocessingOverride() const;
     int     msaaMode() const;
+    int     processPriority() const;
     bool    cameraParallax() const;
     bool    pixelArt() const;
     qreal   nativeAspectRatio() const;
@@ -151,6 +157,7 @@ public:
     void setLanguage(const QString&);
     void setPostprocessingOverride(const QString&);
     void setMsaaMode(int);
+    void setProcessPriority(int);
     void setCameraParallax(bool);
     void setPixelArt(bool);
 
@@ -408,6 +415,7 @@ private:
     QString     m_language;
     QString     m_postprocessingOverride;
     int         m_msaaMode { 0 };
+    int         m_processPriority { 0 };
     bool        m_cameraParallax { true };
     bool        m_pixelArt { false };
     qreal       m_renderScale { 1.0 };

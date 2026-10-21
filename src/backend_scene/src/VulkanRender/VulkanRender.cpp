@@ -95,6 +95,8 @@ constexpr std::array base_inst_exts {
 };
 constexpr std::array base_device_exts {
     Extension { false, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME },
+    // ProcessPriority Low: a low-priority queue (Device::ChooseDeviceQueue)
+    Extension { false, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME },
     Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME },

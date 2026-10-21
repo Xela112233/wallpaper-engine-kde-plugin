@@ -1,4 +1,5 @@
 #include "SceneBackend.hpp"
+#include "Utils/ThreadPriority.hpp"
 #include "SceneGraphApi.hpp"
 #include "Scene/RenderExtent.h"
 #include "Timer/FramePacing.hpp"
@@ -672,6 +673,19 @@ void SceneObject::setPostprocessingOverride(const QString& value) {
     if (m_postprocessingOverride == value) return;
     m_postprocessingOverride = value;
     SET_PROPERTY(String, wallpaper::PROPERTY_POSTPROCESSING_OVERRIDE, value.toStdString());
+}
+
+int SceneObject::processPriority() const { return m_processPriority; }
+
+void SceneObject::setProcessPriority(int value) {
+    if (m_processPriority == value) return;
+    m_processPriority = value;
+    // This scene's threads only, the ones running included: the constructor
+    // has already started them (m_scene->init()) when QML sets this.
+    if (m_scene && ! m_scene->setRenderNice(wallpaper::RenderNiceForLevel(value)))
+        qInfo().noquote() << "SceneViewer.processPriority" << value
+                          << ": a renderer thread kept its higher nice value (raising the priority again needs "
+                             "CAP_SYS_NICE); it applies when the wallpaper is loaded again";
 }
 
 int SceneObject::msaaMode() const { return m_msaaMode; }

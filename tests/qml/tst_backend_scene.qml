@@ -335,6 +335,25 @@ TestCase {
         verify(! wd.running);
     }
 
+    // ── renderer priority (ProcessPriority) ─────────────────────────────────
+    // Scene.qml hands background.processPriority to the renderer, which
+    // starts its threads at that nice level.
+    Component { id: prioritySceneComp; Backend.Scene { source: "stub://priority.pkg" } }
+    function test_processPriority_followsBackground() {
+        const own = prioritySceneComp.createObject(tc);
+        verify(own !== null);
+        let p = null;
+        for (const c of (own.children || []).concat(own.data || []))
+            if (c && typeof c.setAcceptMouse === "function") p = c;
+        verify(p !== null);
+        compare(p.processPriority, 0);
+        background.processPriority = 2;
+        compare(p.processPriority, 2);
+        background.processPriority = 0;
+        compare(p.processPriority, 0);
+        own.destroy();
+    }
+
     // ── per-wallpaper scene options (mouse_parallax, pixel_art) ─────────────
     // Scene.qml hands background.cameraParallax / pixelArt to the renderer,
     // which reloads the scene on a change; a backend that has become the

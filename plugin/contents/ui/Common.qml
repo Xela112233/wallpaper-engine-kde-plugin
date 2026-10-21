@@ -447,6 +447,24 @@ QtObject {
             console.error(p, ":", item[p]);
     }
     
+    // A property of the plugin library (SceneViewer, Mpv) that only a newer
+    // build has (we-manager patches).  After an RPM upgrade inside a session,
+    // plasmashell keeps the library it started with, while a QML file it had
+    // not loaded yet comes from disk; a declaration naming a property that
+    // library lacks fails the whole file, and the wallpaper with it.  So the
+    // backends set such properties through here: on an older library the
+    // property is named in the log and the wallpaper loads without it.
+    // `value` may be a Qt.binding.  Returns whether the property was set.
+    function setIfSupported(obj, typeName, name, value) {
+        if (!obj || !(name in obj)) {
+            console.warn("[WEK] " + typeName + "." + name + " is missing (the plugin library plasmashell "
+                         + "runs is older than this QML; log out and in again): left at the library's own value");
+            return false;
+        }
+        obj[name] = value;
+        return true;
+    }
+
     function urlNative(url) {
         const str = url.toString();
         if(str.startsWith('file://')) {

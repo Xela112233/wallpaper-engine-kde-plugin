@@ -160,6 +160,15 @@ public:
     bool init();
     bool inited() const;
 
+    // ProcessPriority (we-manager patch): the nice value of this scene's
+    // renderer threads, given at once to those running and to those that
+    // start later.  False when a running thread could not take it (raising
+    // the priority again needs CAP_SYS_NICE); it keeps its own until the
+    // scene is loaded again.
+    bool setRenderNice(int nice);
+    // The thread ids of those threads now (tests, diagnostics).
+    std::vector<int> renderThreadIds() const;
+
     void initVulkan(const RenderInitInfo&);
 
     void play();

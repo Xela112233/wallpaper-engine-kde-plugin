@@ -50,6 +50,10 @@ Rectangle {
     // 0 = automatic (the renderer tiers it by output size, pass count and how
     // many screens are drawing), 1 = off, 2 or 4 = pinned by the user.
     property int    msaaMode: wallpaper.configuration.MsaaMode
+    // CPU priority of this screen's scene renderer threads (0 normal, 1 below
+    // normal, 2 low): those running take a lower priority at once; a higher
+    // one again (it needs a privilege) when the wallpaper is loaded again.
+    property int    processPriority: wallpaper.configuration.ProcessPriority
     // Fraction of the display resolution the wallpaper is rendered at, with Qt
     // upscaling the result.  Nearly all of a scene's cost is per-pixel and
     // per-pass, so 50% is roughly a quarter of the GPU work.  The Vulkan

@@ -76,6 +76,7 @@ Item {
         "PlaylistsReloadSeq":  0,
         "CacheQuotaMB":        500,
         "PlaylistNotifyOnAdvance": false,
-        "MsaaMode":            0
+        "MsaaMode":            0,
+        "ProcessPriority":     0
     })
 }

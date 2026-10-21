@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <pthread.h>
+#include "Utils/ThreadPriority.hpp"
 
 using namespace wallpaper;
 
@@ -11,6 +12,11 @@ ThreadTimer::ThreadTimer(std::function<Clock::time_point(Clock::time_point)> on_
 ThreadTimer::~ThreadTimer() { Stop(); }
 
 bool ThreadTimer::Running() const { return m_running; }
+
+void ThreadTimer::SetThreadGroup(std::shared_ptr<RenderThreadGroup> group) {
+    std::unique_lock<std::mutex> lock(m_op_mutex);
+    m_thread_group = std::move(group);
+}
 
 void ThreadTimer::Start() {
     std::unique_lock<std::mutex> lock(m_op_mutex);
@@ -23,8 +29,18 @@ void ThreadTimer::Start() {
     // Set before spawning: the thread's exit check must never observe a
     // stale false and quit before the first tick.
     m_running = true;
-    m_timer_thread = std::thread([this]() {
+    m_timer_thread = std::thread([this, group = m_thread_group]() {
         pthread_setname_np(pthread_self(), "wek:timer");
+        // ProcessPriority: this thread's nice follows the scene's.
+        struct Membership {
+            RenderThreadGroup* g;
+            explicit Membership(RenderThreadGroup* group): g(group) {
+                if (g) g->Join();
+            }
+            ~Membership() {
+                if (g) g->Leave();
+            }
+        } membership(group.get());
         // First wake immediate — init/play/resume rely on a prompt frame.
         auto deadline = Clock::now();
         // seen carries ACROSS iterations and only advances under the lock,

@@ -10,9 +10,11 @@
 
 #include <functional>
 #include <chrono>
+#include <memory>
 
 namespace wallpaper
 {
+class RenderThreadGroup;
 
 // Absolute-deadline wait loop.  on_wake(now) runs on the timer thread on
 // every wake — deadline reached, Nudge(), or spurious — and returns the
@@ -31,6 +33,9 @@ public:
 
     bool Running() const;
 
+    // ProcessPriority: each timer thread joins `group` when it starts.
+    void SetThreadGroup(std::shared_ptr<RenderThreadGroup> group);
+
 private:
     std::function<Clock::time_point(Clock::time_point)> m_on_wake;
 
@@ -44,6 +49,8 @@ private:
     bool m_stop_req { false }; // guarded by m_cond_mutex
 
     std::atomic<bool> m_running { false };
+
+    std::shared_ptr<RenderThreadGroup> m_thread_group; // under m_op_mutex
 };
 
 } // namespace wallpaper

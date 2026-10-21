@@ -1,4 +1,5 @@
 #include "Device.hpp"
+#include "Utils/ThreadPriority.hpp"
 
 #include "Utils/Logging.h"
 #include "GraphicsPipeline.hpp"
@@ -121,8 +122,24 @@ std::vector<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surf
     }
     m_graphics_queue.timestamp_valid_bits = props[m_graphics_queue.family_index].timestampValidBits;
     const static float      defaultQueuePriority = 0.0f;
+    // ProcessPriority Low (nice 10): ask the driver to schedule this queue's
+    // work after other programs'.  LOW never needs a privilege (only HIGH
+    // and REALTIME may answer VK_ERROR_NOT_PERMITTED); the extension is
+    // enabled only where the device offers it (VulkanRender's
+    // base_device_exts), so a driver without it gets the plain queue.
+    static VkDeviceQueueGlobalPriorityCreateInfoEXT lowPriority {
+        .sType          = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
+        .pNext          = nullptr,
+        .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_EXT,
+    };
+    // The render thread makes the device: its scene's value, as set then
+    // (a later change takes the queue when the wallpaper is loaded again).
+    const RenderThreadGroup* group = RenderThreadGroup::Current();
+    const bool low = group && group->Nice() >= 10 && supportExt(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME);
+    if (low) LOG_INFO("renderer priority low: low-priority GPU queue");
     VkDeviceQueueCreateInfo gi {
         .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .pNext            = low ? &lowPriority : nullptr,
         .queueFamilyIndex = m_graphics_queue.family_index,
         .queueCount       = 1,
         .pQueuePriorities = &defaultQueuePriority,

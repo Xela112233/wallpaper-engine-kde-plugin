@@ -365,6 +365,30 @@ Flickable {
                 }
             }
             OptionItem {
+                text: i18nc("@label settings option", "Renderer priority")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/tuning.svg'
+                actor: ComboBox {
+                    id: cbProcessPriority
+                    model: [
+                        { text: i18nc("@item:inlistbox renderer priority", "Normal"),       value: 0 },
+                        { text: i18nc("@item:inlistbox renderer priority", "Below normal"), value: 1 },
+                        { text: i18nc("@item:inlistbox renderer priority", "Low"),          value: 2 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_ProcessPriority = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Common.cbIndexOfValue(this, cfg_ProcessPriority)
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info renderer priority help text", "The scene renderer runs inside plasmashell. Below normal and Low give its threads less CPU time when a game or another program needs it; the panels and the rest of the desktop keep theirs. Low also asks the graphics driver to schedule the wallpaper's GPU work after other programs', where the driver supports it, from the next time the wallpaper is loaded. Below normal and Low apply at once; going back to a higher priority applies when the wallpaper is next loaded.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
                 text: i18nc("@label settings option", "Display")
                 text_color: Kirigami.Theme.textColor
                 icon: '../../images/window.svg'

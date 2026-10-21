@@ -20,6 +20,9 @@ public:
     void Run();
     void Stop();
 
+    // ProcessPriority: the timer thread joins `group` (call before Run()).
+    void SetThreadGroup(std::shared_ptr<RenderThreadGroup> group) { m_timer.SetThreadGroup(std::move(group)); }
+
     u16    RequiredFps() const;
     bool   Running() const;
     double FrameTime() const;

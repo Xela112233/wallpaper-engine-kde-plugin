@@ -123,6 +123,10 @@ Item{
         Component.onCompleted: {
             player.setAcceptMouse(true);
             player.setAcceptHover(true);
+            // Set here, not declared above: a library from before the
+            // priority patch has no processPriority (Common.setIfSupported).
+            Common.setIfSupported(player, "SceneViewer", "processPriority",
+                                  Qt.binding(function() { return background.processPriority; }));
         }
 
         Connections {

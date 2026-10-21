@@ -8,6 +8,7 @@
 #include "Looper/Looper.hpp"
 
 #include "Timer/FrameTimer.hpp"
+#include "Utils/ThreadPriority.hpp"
 #include "Utils/FpsCounter.h"
 #include "WPJson.hpp"
 #include "AttachmentLinkOrder.hpp"
@@ -158,6 +159,9 @@ public:
     bool init();
     auto renderHandler() const { return m_render_handler; }
     bool inited() const { return m_inited; }
+    // ProcessPriority: this scene's renderer threads (the two loopers and
+    // the frame timer) and the nice value they run at.
+    const std::shared_ptr<RenderThreadGroup>& renderThreads() const { return m_render_threads; }
 
 public:
     void onMessageReceived(const std::shared_ptr<looper::Message>& msg) override {
@@ -415,6 +419,7 @@ private:
     WPUserProperties     m_user_props_resolved; // for runtime re-resolution
 
 private:
+    std::shared_ptr<RenderThreadGroup> m_render_threads { std::make_shared<RenderThreadGroup>() };
     std::shared_ptr<looper::Looper> m_main_loop;
     std::shared_ptr<looper::Looper> m_render_loop;
     std::shared_ptr<RenderHandler>  m_render_handler;
@@ -2363,6 +2368,13 @@ bool SceneWallpaper::inited() const { return m_main_handler->inited(); }
 
 bool SceneWallpaper::init() { return m_main_handler->init(); }
 
+bool SceneWallpaper::setRenderNice(int nice) { return m_main_handler->renderThreads()->Set(nice); }
+
+std::vector<int> SceneWallpaper::renderThreadIds() const {
+    const auto tids = m_main_handler->renderThreads()->Threads();
+    return std::vector<int>(tids.begin(), tids.end());
+}
+
 void SceneWallpaper::initVulkan(const RenderInitInfo& info) {
     std::shared_ptr<RenderInitInfo> sp_info = std::make_shared<RenderInitInfo>(info);
     auto                            msg =
@@ -3633,6 +3645,9 @@ bool MainHandler::init() {
     if (m_inited) return true;
     m_main_loop->setName("main");
     m_render_loop->setName("render");
+    m_main_loop->setThreadGroup(m_render_threads);
+    m_render_loop->setThreadGroup(m_render_threads);
+    m_render_handler->frame_timer.SetThreadGroup(m_render_threads);
 
     m_main_loop->start();
     m_render_loop->start();

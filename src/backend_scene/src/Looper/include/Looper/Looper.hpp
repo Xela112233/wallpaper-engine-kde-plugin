@@ -18,6 +18,7 @@
 
 namespace wallpaper
 {
+class RenderThreadGroup;
 namespace looper
 {
 
@@ -55,6 +56,9 @@ public:
     void                   post(const std::shared_ptr<Message>&);
     const std::string_view name() const;
     void                   setName(std::string_view);
+    // ProcessPriority: the worker joins `group` when it starts (call before
+    // start()), so it runs at the group's nice and follows its changes.
+    void setThreadGroup(std::shared_ptr<RenderThreadGroup> group);
 
     // Test-only synchronization seam. The worker thread calls this (if set)
     // right after it has locked its own strong reference to `this`, before
@@ -85,6 +89,7 @@ private:
     // visibility problem.
     std::atomic<bool>       m_running { false };
     std::string             m_name { "unknown" };
+    std::shared_ptr<RenderThreadGroup> m_thread_group;
     std::mutex              m_mutex;
     std::condition_variable m_condition;
 

@@ -25,6 +25,7 @@ QtObject {
     property bool   mediaIntegration: true   // matches main.xml default
     property bool   cameraParallax: true  // per-wallpaper mouse_parallax (main.qml)
     property bool   pixelArt:    false    // per-wallpaper pixel_art (main.qml)
+    property int    processPriority: 0    // ProcessPriority (main.qml), matches main.xml default
     property bool   hasLib:      true
     property string source:      ""
     property string wallpaperPath: ""
