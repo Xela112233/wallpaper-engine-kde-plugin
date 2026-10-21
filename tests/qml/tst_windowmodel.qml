@@ -526,6 +526,44 @@ TestCase {
         compare(wm.reqPause, false);
     }
 
+    // ── we-manager's own window (mini mode) ──────────────────────────────────
+    function test_weManagersFocusedWindow_pausesAndStopsNothing() {
+        // Mini mode: the small we-manager window is the focused one while you
+        // watch the wallpaper you tune in it.
+        _actions(3, 2, 2);
+        const mini = {
+            isWindow: true, isActive: true, isMaximized: false, isFullScreen: false,
+            isMinimized: false, activities: [], appName: "we-manager", appId: "io.github.wemanager",
+        };
+        for (const mode of [Plugin.Common.PauseMode.Focus, Plugin.Common.PauseMode.FocusOrMax,
+                            Plugin.Common.PauseMode.Any]) {
+            wm.modePlay = mode;
+            _setWindows([mini]);
+            _runUpdate();
+            _settlePlay();
+            compare(wm.reqStop, false, "mode " + mode);
+            compare(wm.reqPause, false, "mode " + mode);
+        }
+        // another application focused still stops it
+        wm.modePlay = Plugin.Common.PauseMode.Focus;
+        _setWindows([Object.assign({}, mini, { isActive: false }), {
+            isWindow: true, isActive: true, isMaximized: false, isFullScreen: false,
+            isMinimized: false, activities: [], appName: "Dolphin", appId: "org.kde.dolphin",
+        }]);
+        _runUpdate();
+        compare(wm.reqStop, true);
+    }
+
+    function test_weManagerMaximized_stillHidesTheDesktop() {
+        wm.modePlay = Plugin.Common.PauseMode.Max;
+        _setWindows([{
+            isWindow: true, isActive: true, isMaximized: true, isFullScreen: false,
+            isMinimized: false, activities: [], appName: "we-manager", appId: "io.github.wemanager",
+        }]);
+        _runUpdate();
+        compare(wm.reqPause, true);
+    }
+
     function test_actionChange_schedulesRedecision() {
         const tt = _findTriggerTimer();
         verify(tt !== null);

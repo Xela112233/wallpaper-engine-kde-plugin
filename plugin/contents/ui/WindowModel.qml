@@ -244,6 +244,8 @@ Item {
                 isFullScreen: tasksModel.data(idx, TaskManager.AbstractTasksModel.IsFullScreen) === true,
                 isActive:     tasksModel.data(idx, TaskManager.AbstractTasksModel.IsActive)     === true,
                 geometry:     tasksModel.data(idx, TaskManager.AbstractTasksModel.Geometry),
+                // we-manager's window (mini mode): open or focused, it is not "another application"
+                own:          WindowPlay.isOwnApp(tasksModel.data(idx, TaskManager.AbstractTasksModel.AppId)),
             });
         }
 

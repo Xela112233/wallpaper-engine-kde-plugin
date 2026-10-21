@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PauseMode, Action, countWindows, shouldPlay, coversScreen, windowRequests }
+import { PauseMode, Action, countWindows, shouldPlay, coversScreen, windowRequests, isOwnApp }
     from '../../plugin/contents/ui/js/windowplay.mjs';
 
 // Window descriptor helper: defaults everything false, override per case.
@@ -210,4 +210,28 @@ test('windowRequests: Never and minimized windows request nothing; unknown value
     assert.deepEqual(windowRequests([w({ isFullScreen: true, isMinimized: true })], PauseMode.Max, screen,
                                     { fullscreen: 3 }), none);
     assert.equal(windowRequests([w({ isFullScreen: true })], PauseMode.Max, screen, { fullscreen: 7 }).pause, true);
+});
+test('isOwnApp: we-manager by its desktop file id or its X11 class, nothing else', () => {
+    assert.equal(isOwnApp('io.github.wemanager'), true);
+    assert.equal(isOwnApp('io.github.wemanager.desktop'), true);
+    assert.equal(isOwnApp('we-manager'), true);
+    for (const other of ['org.kde.dolphin', 'firefox', 'io.github.wemanager2', '', undefined, null])
+        assert.equal(isOwnApp(other), false, String(other));
+});
+test('windowRequests: we-manager\'s own window, open or focused, pauses and stops nothing', () => {
+    // mini mode: the small window you tune the wallpaper in is the focused one
+    const acts = { focus: Action.Stop, maximized: Action.Pause, fullscreen: Action.Pause };
+    const none = { pause: false, mute: false, stop: false };
+    const mini = w({ isActive: true, own: true });
+    for (const mode of [PauseMode.Any, PauseMode.Focus, PauseMode.FocusOrMax, PauseMode.Max])
+        assert.deepEqual(windowRequests([mini], mode, screen, acts), none, String(mode));
+    // another application focused still counts
+    assert.deepEqual(windowRequests([mini, w({ isActive: true })], PauseMode.Focus, screen, acts),
+                     { pause: false, mute: false, stop: true });
+    assert.equal(windowRequests([mini, w()], PauseMode.Any, screen, acts).pause, true);
+    // maximized or fullscreen it hides the desktop like any window
+    assert.equal(windowRequests([w({ own: true, isMaximized: true })], PauseMode.Max, screen, acts).pause, true);
+    assert.equal(windowRequests([w({ own: true, isMaximized: true })], PauseMode.Any, screen, acts).pause, true);
+    assert.equal(windowRequests([w({ own: true, isFullScreen: true })], PauseMode.FullScreen, screen, acts).pause,
+                 true);
 });

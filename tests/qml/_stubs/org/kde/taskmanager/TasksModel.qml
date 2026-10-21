@@ -7,7 +7,7 @@
 // in a loop; the stub returns a configurable canned dataset.
 import QtQuick
 QtObject {
-    // Test fixtures: array of window dicts {appName, isActive, isMaximized,
+    // Test fixtures: array of window dicts {appName, appId, isActive, isMaximized,
     //   isFullScreen, isOnAllVirtualDesktops, virtualDesktops, activities, screenGeometry, geometry}
     property var _windows: []
 
@@ -46,6 +46,7 @@ QtObject {
             case 267: return !!w.skipPager;
             case 268: return !!w.isWindow;
             case 269: return w.geometry;                    // Geometry
+            case 270: return w.appId || "";                 // AppId
         }
         return undefined;
     }

@@ -22,7 +22,8 @@ QtObject {
         SkipTaskbar            = 266,
         SkipPager              = 267,
         IsWindow               = 268,
-        Geometry               = 269
+        Geometry               = 269,
+        AppId                  = 270
     }
 
     // Production code reads `TaskManager.AbstractTasksModel.AppName`.
@@ -41,4 +42,5 @@ QtObject {
     readonly property int isMinimized:            AbstractTasksModel.IsMinimized
     readonly property int isWindow:               AbstractTasksModel.IsWindow
     readonly property int geometry:               AbstractTasksModel.Geometry
+    readonly property int appId:                  AbstractTasksModel.AppId
 }

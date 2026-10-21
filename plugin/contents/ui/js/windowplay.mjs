@@ -64,6 +64,18 @@ function watched(mode) {
     }
 }
 
+// we-manager's own windows (TasksModel's AppId: the desktop file id on
+// Wayland, and on X11 too when KWin matched its class to the desktop file).
+// You tune the wallpaper there while you watch it, mini mode above all, and
+// Wallpaper Engine's rules only count other applications: open or focused,
+// such a window never pauses or stops the wallpaper.  Maximized or
+// fullscreen it hides the desktop, and counts as any window does.
+export const OWN_APP_IDS = Object.freeze(['io.github.wemanager', 'we-manager']);
+export function isOwnApp(appId) {
+    const id = String(appId || '').replace(/\.desktop$/, '');
+    return OWN_APP_IDS.indexOf(id) >= 0;
+}
+
 function actionOf(value) {
     return (value === Action.Keep || value === Action.Mute || value === Action.Stop) ? value : Action.Pause;
 }
@@ -85,11 +97,12 @@ export function windowRequests(windows, mode, screenGeometry, actions) {
         if (win.isMinimized === true) continue;
         const isFull = win.isFullScreen === true || coversScreen(win.geometry, screenGeometry);
         const isMax = win.isMaximized === true || isFull;
+        const own = win.own === true;                // we-manager's window (isOwnApp)
         let act = null;
         if (w.full && isFull)                      act = actionOf(a.fullscreen);
         else if (w.max && isMax)                   act = actionOf(a.maximized);
-        else if (w.focus && win.isActive === true) act = actionOf(a.focus);
-        else if (w.any)                            act = Action.Pause;
+        else if (w.focus && win.isActive === true && !own) act = actionOf(a.focus);
+        else if (w.any && (!own || isMax))         act = Action.Pause;
         if (act === Action.Pause) out.pause = true;
         else if (act === Action.Mute) out.mute = true;
         else if (act === Action.Stop) out.stop = true;
