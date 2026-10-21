@@ -143,6 +143,9 @@ constexpr std::string_view G_TEXELSIZEHALF { "g_TexelSizeHalf" };
 constexpr std::string_view G_BONES { "g_Bones" };
 constexpr std::string_view G_SCREEN { "g_Screen" };
 constexpr std::string_view G_PARALLAXPOSITION { "g_ParallaxPosition" };
+// Effect feedback (fluid-targets patch): supplied only with it on.
+constexpr std::string_view G_POINTERPOSITIONLAST { "g_PointerPositionLast" };
+constexpr std::string_view G_FRAMETIME { "g_Frametime" };
 constexpr std::string_view G_EYEPOSITION { "g_EyePosition" };
 
 // Audio spectrum uniforms (std140 float arrays with vec4 stride)

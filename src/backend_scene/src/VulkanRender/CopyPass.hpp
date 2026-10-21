@@ -17,6 +17,10 @@ public:
         std::string src;
         std::string dst;
         bool        flipY { false };
+        // Effect feedback (fluid-targets patch): the copy is a command of a
+        // feedback effect (sceneToRenderGraph sets it, and only with the
+        // setting on).  Only such a copy can join two formats.
+        bool feedback { false };
 
         ImageParameters vk_src;
         ImageParameters vk_dst;
@@ -47,6 +51,17 @@ private:
     Desc       m_desc;
     BoundImage m_src_bound, m_dst_bound;
 };
+
+// Effect feedback (fluid-targets patch): whether a copy has to convert,
+// because it is a feedback effect's command and its two render targets differ
+// in format.  vkCmdCopyImage copies bytes and wants formats of one texel
+// size; a float target of a feedback effect copied onto an 8-bit one (or the
+// other way round) is a blit instead.  For every other copy, which is every
+// copy with the setting off, the formats are not looked at and the answer is
+// no, as before the patch.
+inline bool CopyConverts(bool feedback_copy, const RtSlot* src, const RtSlot* dst) {
+    return feedback_copy && src != nullptr && dst != nullptr && src->key.format != dst->key.format;
+}
 
 // The image barriers before a copy wait for the last readers and writers of
 // both images; the previous TOP_OF_PIPE source waited for nothing, and the

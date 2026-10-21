@@ -232,6 +232,15 @@ public:
 
     void MarkShareReady(std::string_view key);
 
+    // Effect feedback (fluid-targets patch): render target names whose slot
+    // is theirs alone from the first query on.  A name queried for the first
+    // time otherwise takes over a slot of the same key that its last reader
+    // has released, and that slot is still what an earlier pass draws into
+    // every frame: a target that has to keep its picture between frames
+    // would get that pass's picture instead.  Empty (the default) changes
+    // nothing; Clear() empties it.
+    void SetUnsharedKeys(const Set<std::string>& keys) { m_unshared_keys = keys; }
+
     void RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParameters& image) const;
 
     // Lazily creates and caches the NEAREST/CLAMP/no-compare sampler that
@@ -288,6 +297,7 @@ private:
     RetireRing<RetiredImage>             m_retired;
     std::vector<std::unique_ptr<RtSlot>> m_query_texs;
     Map<std::string, RtSlot*>            m_query_map;
+    Set<std::string>                     m_unshared_keys;
     SlotId                               m_next_slot_id { 0 };
 
     // Monotonic per-Query-call counter; assigned to RtSlot::lru_tick on hit

@@ -1012,6 +1012,7 @@ void TextureCache::Clear() {
     m_reupload_fail_streak.clear();
     m_query_texs.clear();
     m_query_map.clear();
+    m_unshared_keys.clear();
     m_next_slot_id = 0;
     // Clear the sampler cache LAST.  Samplers must be destroyed AFTER the
     // images that reference them (or after vkDeviceWaitIdle); the m_tex_map
@@ -1035,7 +1036,11 @@ RtSlot* TextureCache::QuerySlot(std::string_view key, TextureKey content_hash, b
     };
 
     TexHash tex_hash = TextureKey::HashValue(content_hash);
+    // Effect feedback (fluid-targets patch): a name in m_unshared_keys never
+    // takes over a released slot.
+    const bool unshared = detail::keyIsUnshared(m_unshared_keys, key);
     for (auto& query : m_query_texs) {
+        if (unshared) break;
         if (! (query->share_ready)) continue;
         if (query->content_hash != tex_hash) continue;
 

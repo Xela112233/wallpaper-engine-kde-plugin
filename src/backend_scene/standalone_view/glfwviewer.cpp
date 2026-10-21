@@ -179,6 +179,12 @@ int main(int argc, char** argv) {
     // without re-parsing argv.
     g_assets = program.get<std::string>(ARG_ASSETS);
     g_scene  = program.get<std::string>(ARG_SCENE);
+    // --scene-quality goes in before the scene is set, so the first load uses
+    // it; without the option nothing is sent.
+    if (const auto quality = program.get<std::string>("--scene-quality"); ! quality.empty()) {
+        std::cout << "--scene-quality: " << quality << std::endl;
+        psw->setPropertyString(wallpaper::PROPERTY_SCENE_QUALITY, quality);
+    }
     psw->setPropertyString(wallpaper::PROPERTY_ASSETS, g_assets);
     psw->setPropertyString(wallpaper::PROPERTY_SOURCE, g_scene);
     // Print a one-line discoverability hint so new users find the help

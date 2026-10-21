@@ -831,6 +831,8 @@ void SceneObject::sendSceneQuality() {
     if (switched("volumetrics", 0)) text += ";volumetrics=0";
     if (switched("reflections", 0)) text += ";reflections=0";
     if (switched("flatMsaa", 1)) text += ";flatMsaa=1";
+    // Effect feedback (fluid-targets patch): named only when the map has it on.
+    if (switched("feedback", 1)) text += ";feedback=1";
     SET_PROPERTY(String, wallpaper::PROPERTY_SCENE_QUALITY, text);
 }
 

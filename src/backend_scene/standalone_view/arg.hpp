@@ -247,6 +247,13 @@ void setAndParseArg(argparse::ArgumentParser& arg, int argc, char** argv) {
         .nargs(1)
         .scan<'g', double>();
 
+    arg.add_argument("--scene-quality")
+        .help("the scene quality switches as the plugin sends them, 'key=value;...' "
+              "(SceneQuality.hpp), e.g. 'feedback=1' for effects that carry over between "
+              "frames; empty sends nothing")
+        .default_value(std::string())
+        .nargs(1);
+
     arg.add_argument("--hide-pattern")
         .help("debug: hide any scene object whose name contains any of the "
               "comma-separated substrings (e.g. 'hair' or 'hair c1,hair top')")

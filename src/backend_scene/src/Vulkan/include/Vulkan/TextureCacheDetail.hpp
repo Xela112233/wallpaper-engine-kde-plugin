@@ -269,6 +269,14 @@ inline std::vector<std::uint8_t> effectiveEvictionPersist(std::span<const std::u
     return out;
 }
 
+// Whether a render target name must get a slot of its own on its first query
+// (TextureCache::SetUnsharedKeys).  With no such names, which is every scene
+// without an effect that carries over between frames, nothing is looked up.
+template<typename KeySet>
+bool keyIsUnshared(const KeySet& unshared, std::string_view key) {
+    return ! unshared.empty() && unshared.count(key) != 0;
+}
+
 // Slot ids come from a counter, never from a position in the slot vector:
 // evictColdQueryTexs erases entries, and every pass analysis keys on the id.
 inline std::uint32_t AllocateSlotId(std::uint32_t& next) { return next++; }

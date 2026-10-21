@@ -222,6 +222,10 @@
       <label>Percentage of the display resolution web wallpapers are drawn at (100 or 50); the page keeps its layout and Qt upscales the result</label>
       <default>100</default>
     </entry>
+    <entry name="EffectFeedback" type="Bool">
+      <label>Scene effects that carry a picture over from frame to frame (cursor trails, fluids): on, the render targets such an effect reads before it has drawn into them keep their image between frames and change places instead of being copied, and shaders get the pointer's last position (g_PointerPositionLast) and the frame time (g_Frametime); off, scenes are drawn as before</label>
+      <default>false</default>
+    </entry>
     <entry name="ProcessPriority" type="Int">
       <label>CPU priority of the scene renderer's threads: 0 = normal, 1 = below normal (nice 5), 2 = low (nice 10); low also asks the GPU for a low-priority queue where the driver offers one</label>
       <default>0</default>

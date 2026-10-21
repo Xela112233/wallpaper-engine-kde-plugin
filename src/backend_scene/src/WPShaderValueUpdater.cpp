@@ -15,6 +15,7 @@
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+#include <algorithm>
 #include <iostream>
 #include <chrono>
 #include <ctime>
@@ -64,6 +65,13 @@ void WPShaderValueUpdater::FrameBegin() {
             (((cTime->tm_hour * 60) + cTime->tm_min) * 60 + cTime->tm_sec) / (24.0f * 60.0f
        * 60.0f);
     */
+    if (m_pointerFeedback) {
+        // Before the pointer moves on: where the shaders saw it last frame,
+        // and the scene time this frame starts at (the frame's ticks come
+        // after FrameBegin, its draws after them).
+        m_mousePosLast   = m_mousePos;
+        m_frameStartTime = m_scene->elapsingTime;
+    }
     double new_time    = m_mouseDelayedTime + m_scene->frameTime;
     new_time           = new_time > m_parallax.delay ? m_parallax.delay : new_time;
     m_mouseDelayedTime = new_time;
@@ -166,6 +174,10 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_LP                 = existsOp(G_LP);
     info.has_LCR                = existsOp(G_LCR);
     info.has_EYEPOSITION        = existsOp(G_EYEPOSITION);
+    if (m_pointerFeedback) {
+        info.has_POINTERPOSITIONLAST = existsOp(G_POINTERPOSITIONLAST);
+        info.has_FRAMETIME           = existsOp(G_FRAMETIME);
+    }
 
     info.has_AUDIOSPECTRUM16LEFT  = existsOp(G_AUDIOSPECTRUM16LEFT);
     info.has_AUDIOSPECTRUM16RIGHT = existsOp(G_AUDIOSPECTRUM16RIGHT);
@@ -590,6 +602,11 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (info.has_DAYTIME) updateOp(G_DAYTIME, (float)m_dayTime);
 
     if (info.has_POINTERPOSITION) updateOp(G_POINTERPOSITION, m_mousePos);
+
+    if (info.has_POINTERPOSITIONLAST) updateOp(G_POINTERPOSITIONLAST, m_mousePosLast);
+
+    if (info.has_FRAMETIME)
+        updateOp(G_FRAMETIME, (float)std::max(0.0, m_scene->elapsingTime - m_frameStartTime));
 
     if (info.has_TEXELSIZE) updateOp(G_TEXELSIZE, m_texelSize);
 

@@ -179,6 +179,15 @@ target_compile_features(tst_scenequality PRIVATE cxx_std_20)
 target_link_libraries(tst_scenequality PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME tst_scenequality COMMAND tst_scenequality -v2)
 
+# ── Effect feedback (we-manager fluid-targets patch) ─────────────────────────
+# The plan for effects that carry over between frames and the image moves:
+# header-only, in the scene renderer's source; no Vulkan.
+add_executable(tst_effectfeedback tst_effectfeedback.cpp)
+target_include_directories(tst_effectfeedback PRIVATE ${CMAKE_SOURCE_DIR}/src/backend_scene/src)
+target_compile_features(tst_effectfeedback PRIVATE cxx_std_20)
+target_link_libraries(tst_effectfeedback PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME tst_effectfeedback COMMAND tst_effectfeedback -v2)
+
 # ── WebUrlInterceptor unit tests ──────────────────────────────────────────────
 # Pure-predicate tests for the file:// allow/block gate.  The QtWebEngineCore
 # component ships in qt6-qtwebengine on Fedora / Bazzite; gated so a build

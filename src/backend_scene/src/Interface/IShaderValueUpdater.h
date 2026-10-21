@@ -44,6 +44,10 @@ public:
     }
     virtual void FrameEnd() = 0;
 
+    // Effect feedback (fluid-targets patch): whether g_PointerPositionLast
+    // and g_Frametime are supplied (WPShaderValueUpdater::SetPointerFeedback).
+    virtual bool SuppliesFrameUniforms() const { return false; }
+
     virtual void MouseInput(double x, double y) = 0;
     virtual void SetScreenSize(i32 w, i32 h)    = 0;
 };

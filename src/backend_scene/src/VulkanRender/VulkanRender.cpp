@@ -15,6 +15,8 @@
 #include "WPTexImageParser.hpp"
 #include "SpecTexs.hpp"
 #include <unordered_set>
+#include <unordered_map>
+#include <optional>
 #include <chrono>
 #include <thread>
 #include <cstdio>
@@ -40,6 +42,7 @@
 #include "Resource.hpp"
 #include "VulkanRender/PassCacheAlias.hpp"
 #include "VulkanRender/PassMerge.hpp"
+#include "VulkanRender/FeedbackMoves.hpp"
 #include "VulkanRender/FenceWaitRetry.hpp"
 #include "FrameFenceCycle.hpp"
 
@@ -237,6 +240,15 @@ struct VulkanRender::Impl {
     bool          m_rt_ts_recorded { false };
     // Counts and step cost since the last DIAG line; reset there.
     ResidencyWindow m_rt_window;
+
+    // Effect feedback (fluid-targets patch; empty unless the scene has a
+    // feedback effect, Scene::feedbackMoves).  Per effect, the slots whose
+    // images change places once a frame's passes are recorded: first takes
+    // second's.  Resolved at compile from the passes that use the targets.
+    std::vector<std::vector<std::pair<RtSlot*, RtSlot*>>> m_feedback_moves;
+    std::vector<std::optional<VmaImageParameters>>        m_feedback_scratch;
+    void                                                  resolveFeedbackMoves(Scene& scene);
+    void                                                  moveFeedbackImages();
 
     void              buildResidencyTables();
     const std::vector<bool>& computeDemand();
@@ -1310,6 +1322,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
                     skipped_count++;
                 }
             }
+            if (! m_feedback_moves.empty()) moveFeedbackImages();
             if (! _dumped) {
                 LOG_INFO("render frame: %d passes executed, %d skipped (not prepared), %zu total",
                          prepared_count,
@@ -1472,6 +1485,7 @@ void VulkanRender::Impl::drawFrameOffscreen() {
                 skipped_count++;
             }
         }
+        if (! m_feedback_moves.empty()) moveFeedbackImages();
         if (! _dumped) {
             LOG_INFO("render frame (offscreen): %d passes executed, %d skipped (not prepared), %zu "
                      "total",
@@ -1677,6 +1691,8 @@ void VulkanRender::Impl::clearLastRenderGraph(Scene* scene) {
     m_eager_all_resident = false;
     m_rt_ts_recorded     = false;
     m_slot_clear_on_attach.clear();
+    m_feedback_moves.clear();
+    m_feedback_scratch.clear();
 
     // (Removed: g_msaa_color_inited.clear() — the MSAA first-use latch now
     // lives on VmaImageParameters as initial_layout_transitioned and dies
@@ -1817,6 +1833,13 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
         PrefetchTextures(*tex_parser, names, worker_count);
     }
 
+    // Effect feedback (fluid-targets patch): the targets that keep their
+    // picture between frames get slots no other target ever had.
+    if (! scene.feedbackTargets.empty()) {
+        Set<std::string> unshared(scene.feedbackTargets.begin(), scene.feedbackTargets.end());
+        m_device->tex_cache().SetUnsharedKeys(unshared);
+    }
+
     // Prepare-time writes to dyn_buf (UBO defaults, fillBuf zero-init)
     // must land in every slot so that after the first slot switch we
     // still see the seeded state.  We turn broadcast on for the duration
@@ -1853,6 +1876,9 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
                  failed_count,
                  nodes.size());
     }
+
+    m_feedback_moves.clear();
+    if (! scene.feedbackTargets.empty()) resolveFeedbackMoves(scene);
 
     // Pass-output cache gating: skip-on-reexec is safe ONLY when the
     // pass's cached output bytes remain valid at the moment downstream
@@ -2097,6 +2123,72 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
     }
     m_pass_loaded = true;
 };
+
+// Effect feedback (fluid-targets patch).  The scene names, per feedback
+// effect, which render target takes which one's image after each frame; here
+// the names become the slots the prepared passes hold.  A set of moves is
+// left out whole when one of its targets has no slot (the effect's passes did
+// not prepare), a slot is not persistent or has no image, or two of them
+// differ in size or format: the effect then does not carry over, and nothing
+// else is affected.
+void VulkanRender::Impl::resolveFeedbackMoves(Scene& scene) {
+    std::unordered_map<std::string, RtSlot*> by_name;
+    auto                                     note = [&](const std::string& name, RtSlot* slot) {
+        if (slot != nullptr && scene.feedbackTargets.count(name) != 0) by_name[name] = slot;
+    };
+    for (auto* p : m_passes) {
+        if (! p->prepared()) continue;
+        if (auto* csp = dynamic_cast<CustomShaderPass*>(p)) {
+            const auto& d = csp->desc();
+            note(d.output, d.out_slot);
+            for (usize i = 0; i < d.textures.size() && i < d.in_slots.size(); i++)
+                note(d.textures[i], d.in_slots[i]);
+        } else if (auto* cp = dynamic_cast<CopyPass*>(p)) {
+            note(cp->desc().src, cp->desc().src_slot);
+            note(cp->desc().dst, cp->desc().dst_slot);
+        }
+    }
+    for (const auto& named : scene.feedbackMoves) {
+        std::vector<std::pair<RtSlot*, RtSlot*>> moves;
+        bool                                     ok = ! named.empty();
+        for (const auto& [taker, giver] : named) {
+            auto t = by_name.find(taker), g = by_name.find(giver);
+            if (t == by_name.end() || g == by_name.end()) {
+                ok = false;
+                break;
+            }
+            RtSlot* a = t->second;
+            RtSlot* b = g->second;
+            ok = ok && ! a->managed() && ! b->managed() && a->resident() && b->resident() &&
+                 a->content_hash == b->content_hash;
+            moves.emplace_back(a, b);
+        }
+        ok = ok && MovesArePermutation<RtSlot>(moves);
+        if (! ok) {
+            LOG_ERROR("effect feedback: the targets of '%s' cannot change places; the effect "
+                      "will not carry over between frames",
+                      named.empty() ? "?" : named.front().first.c_str());
+            continue;
+        }
+        m_feedback_moves.push_back(std::move(moves));
+    }
+    // What the targets kept cost, for the journal (always written: only a
+    // scene with a feedback effect, with the setting on, gets here).
+    std::uint64_t bytes = 0;
+    for (const auto& [name, slot] : by_name)
+        bytes += (std::uint64_t)slot->key.width * (std::uint64_t)slot->key.height *
+                 (slot->key.format == TextureFormat::RGBA16F ? 8u : 4u);
+    LOG_NOTICE("effect feedback: %zu target(s) kept between frames (%.1f MiB), %zu effect(s) "
+               "exchange images each frame",
+               by_name.size(),
+               (double)bytes / (1024.0 * 1024.0),
+               m_feedback_moves.size());
+}
+
+void VulkanRender::Impl::moveFeedbackImages() {
+    for (const auto& moves : m_feedback_moves)
+        MoveSlotImages<RtSlot, std::optional<VmaImageParameters>>(moves, m_feedback_scratch);
+}
 
 void VulkanRender::Impl::buildResidencyTables() {
     auto& cache = m_device->tex_cache();

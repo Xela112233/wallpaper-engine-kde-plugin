@@ -540,6 +540,11 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             auto&   rt   = scene.renderTargets.at(tex_name);
             RtSlot* slot = device.tex_cache().QuerySlot(tex_name, ToTexKey(rt), ! rt.allowReuse);
             if (slot == nullptr) continue;
+            // Effect feedback (fluid-targets patch): the image under this
+            // name changes between frames outside the render graph, so the
+            // pass redraws every frame.
+            if (TouchesFeedbackTarget(scene.feedbackTargets, tex_name))
+                m_samples_mutable_texture = true;
             m_desc.in_slots[i] = slot;
             if (auto p = slot->params(); p.has_value()) img_slots.slots = { *p };
             m_in_bound[i] = { slot->generation, slot->resident() };
@@ -629,6 +634,13 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         }
         m_desc.vk_output = m_desc.out_slot->paramsOrAbsent();
         m_out_bound = { m_desc.out_slot->generation, m_desc.out_slot->resident() };
+        // Effect feedback (fluid-targets patch): drawing into a target whose
+        // image changes places with another's every frame.  Never cached,
+        // and the framebuffer over each of the two images is kept.
+        if (TouchesFeedbackTarget(scene.feedbackTargets, tex_name)) {
+            m_samples_mutable_texture = true;
+            m_feedback_output         = true;
+        }
     }
 
     SceneMesh& mesh = *(m_desc.node->Mesh());
@@ -681,6 +693,11 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         // Check if shader uses time-based uniforms (for caching optimization)
         if (! ref.blocks.empty()) {
             m_uses_time_uniforms = UsesTimeUniforms(ref.blocks.front());
+            // Effect feedback (fluid-targets patch): with it on, two more
+            // globals change every frame.
+            if (scene.shaderValueUpdater && scene.shaderValueUpdater->SuppliesFrameUniforms())
+                m_uses_time_uniforms =
+                    m_uses_time_uniforms || UsesFeedbackFrameUniforms(ref.blocks.front());
         }
 
         auto& bindings = descriptor_info.bindings;
@@ -1414,6 +1431,19 @@ bool CustomShaderPass::ensureFramebuffer(const Device& device, PassMergeRole rol
     case FbStep::Fail: return false;
     case FbStep::Build: break;
     }
+    // Effect feedback (fluid-targets patch): the output's two images change
+    // places every frame, and the framebuffer built over the other one is
+    // still there.  (One other: a group whose images went round three slots
+    // would build one a frame, which is correct and slow.)
+    if (m_feedback_output &&
+        FeedbackFramebufferFits(*m_fb_other != VK_NULL_HANDLE,
+                                m_fb_other_view,
+                                m_desc.vk_output.mip0_view)) {
+        std::swap(m_desc.fb, m_fb_other);
+        std::swap(m_fb_view, m_fb_other_view);
+        m_desc.fb_generation = m_desc.out_slot->generation;
+        return true;
+    }
     // mip0_view aliases view for single-mip images.
     const FbAttachments     att = FramebufferAttachments(m_desc.msaaSamples,
                                                          m_desc.hasDepth,
@@ -1435,7 +1465,14 @@ bool CustomShaderPass::ensureFramebuffer(const Device& device, PassMergeRole rol
     auto             res = device.handle().CreateFramebuffer(info, fb);
     if (ShouldLogFramebufferFailure(res != VK_SUCCESS, m_fb_failure_logged)) VVK_CHECK(res);
     if (res != VK_SUCCESS) return false;
-    RetireOldFramebuffer(m_desc.fb, m_fb_retirer);
+    if (m_feedback_output) {
+        // Keep the one over the other image; a third is retired.
+        RetireOldFramebuffer(m_fb_other, m_fb_retirer);
+        m_fb_other      = std::move(m_desc.fb);
+        m_fb_other_view = m_fb_view;
+        m_fb_view       = m_desc.vk_output.mip0_view;
+    } else
+        RetireOldFramebuffer(m_desc.fb, m_fb_retirer);
     m_desc.fb            = std::move(fb);
     m_desc.fb_generation = m_desc.out_slot->generation;
     return true;

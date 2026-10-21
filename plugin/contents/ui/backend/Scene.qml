@@ -161,6 +161,10 @@ Item{
                                       if (background.volumetrics === false) q.volumetrics = 0;
                                       if (background.reflections === false) q.reflections = 0;
                                       if (background.msaaOffForFlatScenes === true) q.flatMsaa = 1;
+                                      // Effect feedback (fluid-targets patch,
+                                      // EffectFeedback): in the map only when
+                                      // on, like the switches above.
+                                      if (background.effectFeedback === true) q.feedback = 1;
                                       return q;
                                   }));
             // Audio output (mute patch, AudioOutput): off, the scene opens no

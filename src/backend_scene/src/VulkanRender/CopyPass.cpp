@@ -67,7 +67,8 @@ void CopyPass::prepare(Scene& scene, const Device& device,
              m_desc.vk_dst.extent.width,
              m_desc.vk_dst.extent.height,
              (! m_desc.flipY && m_desc.vk_src.extent.width == m_desc.vk_dst.extent.width &&
-              m_desc.vk_src.extent.height == m_desc.vk_dst.extent.height)
+              m_desc.vk_src.extent.height == m_desc.vk_dst.extent.height &&
+              ! CopyConverts(m_desc.feedback, m_desc.src_slot, m_desc.dst_slot))
                  ? "copy"
                  : "blit",
              m_desc.flipY ? ", flipY" : "");
@@ -132,6 +133,9 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
     // flipY requires the blit path (VkImageCopy can't flip)
     bool size_match = ! m_desc.flipY && src.extent.width == dst.extent.width &&
                       src.extent.height == dst.extent.height;
+    // A feedback effect's copy between two formats (its float target and an
+    // 8-bit one): the blit converts, a copy would be invalid.
+    if (CopyConverts(m_desc.feedback, m_desc.src_slot, m_desc.dst_slot)) size_match = false;
 
     VkImageSubresourceLayers subresource {
         .aspectMask     = srang.aspectMask,

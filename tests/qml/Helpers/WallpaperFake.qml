@@ -97,6 +97,7 @@ Item {
         "Volumetrics":         true,      // matches main.xml default (scene-quality patch)
         "Reflections":         true,      // matches main.xml default (scene-quality patch)
         "WebRenderScale":      100,       // matches main.xml default (scene-quality patch)
+        "EffectFeedback":      false,     // matches main.xml default (fluid-targets patch)
         "ReloadAfterSleep":    true,
         "ProcessPriority":     0,
         "ShareRenderer":       0,        // matches main.xml default (we-manager clone patch)

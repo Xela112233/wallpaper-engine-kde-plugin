@@ -76,6 +76,14 @@ struct SceneQuality {
     Volumetrics  volumetrics { Volumetrics::Scene };
     Reflections  reflections { Reflections::Scene };
     FlatMsaa     flatMsaa { FlatMsaa::AsSet };
+    // Effect feedback (fluid-targets patch, main.xml EffectFeedback), key
+    // "feedback": off, the scene is parsed and drawn as before the patch.
+    // On, an effect that samples one of its own targets before drawing into
+    // it in the same frame keeps those targets from frame to frame
+    // (EffectFeedback.hpp), and shaders that declare g_PointerPositionLast or
+    // g_Frametime get them.  Named in the text only when on, like the
+    // switches above.
+    bool         feedback { false };
 
     bool operator==(const SceneQuality&) const = default;
 
@@ -105,6 +113,8 @@ struct SceneQuality {
                 q.reflections = static_cast<Reflections>(v);
             else if (key == "flatMsaa" && v >= 0 && v <= 1)
                 q.flatMsaa = static_cast<FlatMsaa>(v);
+            else if (key == "feedback" && v >= 0 && v <= 1)
+                q.feedback = v == 1;
         }
         return q;
     }
@@ -117,6 +127,7 @@ struct SceneQuality {
         if (volumetrics != Volumetrics::Scene) text += ";volumetrics=" + std::to_string((int)volumetrics);
         if (reflections != Reflections::Scene) text += ";reflections=" + std::to_string((int)reflections);
         if (flatMsaa != FlatMsaa::AsSet) text += ";flatMsaa=" + std::to_string((int)flatMsaa);
+        if (feedback) text += ";feedback=1";
         return text;
     }
 

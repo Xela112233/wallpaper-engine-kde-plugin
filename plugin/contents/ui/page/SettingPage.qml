@@ -521,6 +521,23 @@ Flickable {
                 }
             }
             OptionItem {
+                text: i18nc("@label settings option", "Effects that carry over between frames")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: Switch {
+                    checked: cfg_EffectFeedback
+                    onToggled: cfg_EffectFeedback = checked
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info effect feedback help text", "For scene effects that build on their own last frame, such as cursor trails and fluids: their render targets keep their image between frames, and shaders get the pointer's last position and the frame time. Off, scenes are drawn as before. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
                 text: i18nc("@label settings option", "Anti-aliasing")
                 text_color: Kirigami.Theme.textColor
                 icon: '../../images/window.svg'

@@ -70,6 +70,9 @@ struct WPUniformInfo {
     bool has_LP { false };
     bool has_LCR { false };
     bool has_EYEPOSITION { false };
+    // Effect feedback (fluid-targets patch): asked for only with it on.
+    bool has_POINTERPOSITIONLAST { false };
+    bool has_FRAMETIME { false };
 
     bool has_AUDIOSPECTRUM16LEFT { false };
     bool has_AUDIOSPECTRUM16RIGHT { false };
@@ -255,6 +258,21 @@ public:
     // Get interpolated mouse position in normalized coordinates (0-1)
     std::array<float, 2> GetMousePosition() const { return m_mousePos; }
 
+    // Effect feedback (fluid-targets patch, SceneQuality::feedback).  On, a
+    // shader that declares Wallpaper Engine's g_PointerPositionLast or
+    // g_Frametime gets them every frame:
+    // * g_PointerPositionLast is what g_PointerPosition was in the frame
+    //   before, so the difference of the two is the way the pointer the
+    //   shaders see went in this frame.  The first frame, a pointer that does
+    //   not move and one that left the wallpaper give no difference.
+    // * g_Frametime is the scene time this frame added, in seconds (0 while
+    //   the scene's clock stands).  The pointer's velocity is the difference
+    //   over it; Wallpaper Engine has no uniform for the velocity itself.
+    // Off, neither name is looked for and nothing more is kept.
+    void SetPointerFeedback(bool on) { m_pointerFeedback = on; }
+    bool SuppliesFrameUniforms() const override { return m_pointerFeedback; }
+    std::array<float, 2> GetMousePositionLast() const { return m_mousePosLast; }
+
 private:
     Scene*               m_scene;
     WPCameraParallax     m_parallax;
@@ -265,6 +283,9 @@ private:
 
     std::array<float, 2> m_mousePos { 0.5f, 0.5f };
     std::array<float, 2> m_mousePosInput { 0.5f, 0.5f };
+    bool                 m_pointerFeedback { false };
+    std::array<float, 2> m_mousePosLast { 0.5f, 0.5f };
+    double               m_frameStartTime { 0.0 };
     double               m_mouseDelayedTime { 0.0f };
 
     std::chrono::time_point<std::chrono::steady_clock> m_last_mouse_input_time;

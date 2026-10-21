@@ -95,6 +95,10 @@ Rectangle {
     // (scene-quality patch, main.xml WebRenderScale): QtWebView.qml lays the
     // view out smaller and scales it up below 100; 100 leaves it as it is.
     property int    webRenderScale: wallpaper.configuration.WebRenderScale ?? 100
+    // Effects that carry a picture over between frames (fluid-targets patch,
+    // main.xml EffectFeedback): Scene.qml adds it to SceneViewer.sceneQuality
+    // only when on, so off the scene gets what it got before the patch.
+    property bool   effectFeedback: wallpaper.configuration.EffectFeedback === true
     // SceneScript localStorage per wallpaper and per screen (localstorage
     // patch, main.xml LocalStoragePerWallpaper): Scene.qml hands both to
     // SceneViewer.  storageScreen is the screen whose LOCATION_SCREEN values

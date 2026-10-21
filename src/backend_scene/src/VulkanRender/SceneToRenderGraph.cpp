@@ -64,6 +64,23 @@ TexNode* addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode::Desc* out_desc =
     return copy;
 }
 
+// Effect feedback (fluid-targets patch): a command of a feedback effect.  As
+// the copy above, but a source nothing has drawn into yet in this frame (it
+// holds what the frame before left) is marked as written before the frame, so
+// a pass that draws into it later in the frame is ordered after this copy.
+void addFeedbackCopyPass(RenderGraph& rgraph, const TexNode::Desc& in, const TexNode::Desc& out) {
+    rgraph.addPass<vulkan::CopyPass>(
+        "copy",
+        PassNode::Type::Copy,
+        [&in, &out](RenderGraphBuilder& builder, vulkan::CopyPass::Desc& desc) {
+            auto* in_node = builder.createTexNode(in);
+            builder.markVirtualWrite(in_node);
+            auto* out_node = builder.createTexNode(out, true);
+            desc.feedback  = true; // the one kind of copy that may join two formats
+            doCopy(builder, desc, in_node, out_node);
+        });
+}
+
 static TexNode::Desc createTexDesc(std::string path) {
     return TexNode::Desc { .name = path,
                            .key  = path,
@@ -289,7 +306,12 @@ static void LoadEffectChain(SceneNode* node, SceneImageEffectLayer* effs, ExtraI
                      i);
         }
         for (auto& n : eff->nodes) {
-            if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
+            if (eff->feedback) {
+                // Every command placed before this pass, in file order.
+                for (; cmdItor != cmdEnd && cmdItor->afterpos <= nodePos; cmdItor++)
+                    rg::addFeedbackCopyPass(
+                        rgraph, rg::createTexDesc(cmdItor->src), rg::createTexDesc(cmdItor->dst));
+            } else if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
                 rg::addCopyPass(
                     rgraph, rg::createTexDesc(cmdItor->src), rg::createTexDesc(cmdItor->dst));
                 cmdItor++;
@@ -337,6 +359,12 @@ static void LoadEffectChain(SceneNode* node, SceneImageEffectLayer* effs, ExtraI
             }
             ToGraphPass(n.sceneNode.get(), name, node->ID(), extra, infoPtr);
             nodePos++;
+        }
+        if (eff->feedback) {
+            // And those after the last pass.
+            for (; cmdItor != cmdEnd; cmdItor++)
+                rg::addFeedbackCopyPass(
+                    rgraph, rg::createTexDesc(cmdItor->src), rg::createTexDesc(cmdItor->dst));
         }
     }
 }

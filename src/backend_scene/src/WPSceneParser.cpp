@@ -1,5 +1,6 @@
 #include "WPSceneParser.hpp"
 #include "ColorBlendOverride.hpp"
+#include "EffectFeedback.hpp"
 #include "TextCanvasSize.hpp"
 #include "CardMesh.hpp"
 #include "CameraLayer.hpp"
@@ -2373,6 +2374,118 @@ AttachmentProxyWorld attachmentProxyWorld(const ParseContext& context, i32 paren
     return { pworld * offset, offset };
 }
 
+// Effect feedback (fluid-targets patch, SceneQuality::feedback, see
+// EffectFeedback.hpp).  For an effect that samples one of its own targets
+// before drawing into it in the same frame, the effect as assembleEffects
+// should build it: every bind, target and command names the image it means
+// at that point of the frame, a swap of two targets is gone (the names took
+// it), a target sampled and drawn by one pass has its twin as a target of
+// its own, and the targets that keep their image carry a name no other
+// effect of the layer shares.  nullopt for any other effect, which is then
+// built from the authored one exactly as before.
+struct FeedbackEffect {
+    wpscene::WPImageEffect effect;
+    // Names in effect.fbos.
+    std::vector<std::string>                         persistent;
+    std::vector<std::pair<std::string, std::string>> moves; // first takes second's image
+};
+
+std::optional<FeedbackEffect> rewriteFeedbackEffect(const wpscene::WPImageEffect& authored,
+                                                    usize                         index) {
+    using feedback::Step;
+    std::vector<feedback::Fbo> fbos;
+    {
+        // Two targets can change places when size divisor and format agree.
+        std::vector<std::pair<uint32_t, std::string>> shapes;
+        for (const auto& f : authored.fbos) {
+            const std::pair<uint32_t, std::string> shape { f.scale, f.format };
+            auto it = std::find(shapes.begin(), shapes.end(), shape);
+            if (it == shapes.end()) it = shapes.insert(shapes.end(), shape);
+            fbos.push_back({ f.name, (uint32_t)(it - shapes.begin()) });
+        }
+    }
+    // The pass list in file order: a command's afterpos is the number of
+    // material passes before it.
+    constexpr usize    kNoStep = std::numeric_limits<usize>::max();
+    std::vector<Step>  steps;
+    std::vector<usize> stepOfPass(authored.passes.size()), stepOfCommand(authored.commands.size());
+    {
+        usize c = 0;
+        auto  commandsUpTo = [&](usize pos) {
+            for (; c < authored.commands.size() && (usize)authored.commands[c].afterpos <= pos; c++) {
+                const auto& cmd  = authored.commands[c];
+                stepOfCommand[c] = kNoStep;
+                // Any other command is refused by assembleEffects.
+                if (cmd.command != "copy" && cmd.command != "swap") continue;
+                stepOfCommand[c] = steps.size();
+                steps.push_back({ cmd.command == "swap" ? Step::Kind::Swap : Step::Kind::Copy,
+                                  { cmd.source },
+                                  cmd.target });
+            }
+        };
+        for (usize p = 0; p < authored.passes.size(); p++) {
+            commandsUpTo(p);
+            Step s;
+            for (const auto& b : authored.passes[p].bind) s.reads.push_back(b.name);
+            s.target      = authored.passes[p].target;
+            stepOfPass[p] = steps.size();
+            steps.push_back(std::move(s));
+        }
+        commandsUpTo(kNoStep);
+    }
+
+    const feedback::Plan plan = feedback::Analyse(fbos, steps);
+    if (! plan.feedback) return std::nullopt;
+
+    // A name of the effect's own for the targets that keep their image, and
+    // for those whose "fbos" entry asks for a float format: the layer's other
+    // effects may declare the same name, and theirs stays what it was.
+    std::map<std::string, bool> floats;
+    for (const auto& f : authored.fbos) floats.emplace(f.name, feedback::IsFloatFormat(f.format));
+    const std::string tag    = "_fb" + std::to_string(index);
+    auto              nameOf = [&](const feedback::Image& img) {
+        const bool own = plan.persistent.count(img) != 0 || floats.at(img.fbo);
+        return img.fbo + (own ? tag : std::string()) + (img.twin ? "_twin" : "");
+    };
+    auto refName = [&](const feedback::Plan::Ref& r) {
+        return r.image ? nameOf(r.img) : r.name;
+    };
+
+    FeedbackEffect out;
+    out.effect = authored;
+    out.effect.fbos.clear();
+    for (const auto& f : authored.fbos) {
+        for (bool twin : { false, true }) {
+            const feedback::Image img { f.name, twin };
+            if (twin && plan.twins.count(img) == 0) continue;
+            auto fbo = f;
+            fbo.name = nameOf(img);
+            if (plan.persistent.count(img) != 0) out.persistent.push_back(fbo.name);
+            out.effect.fbos.push_back(std::move(fbo));
+        }
+    }
+    for (usize p = 0; p < authored.passes.size(); p++) {
+        const auto& r    = plan.steps[stepOfPass[p]];
+        auto&       pass = out.effect.passes[p];
+        for (usize b = 0; b < pass.bind.size(); b++) pass.bind[b].name = refName(r.reads[b]);
+        if (r.target.image) pass.target = nameOf(r.target.img);
+    }
+    out.effect.commands.clear();
+    for (usize c = 0; c < authored.commands.size(); c++) {
+        auto cmd = authored.commands[c];
+        if (stepOfCommand[c] != kNoStep) {
+            const auto& r = plan.steps[stepOfCommand[c]];
+            if (r.dropped) continue;
+            cmd.source = refName(r.reads[0]);
+            cmd.target = refName(r.target);
+        }
+        out.effect.commands.push_back(std::move(cmd));
+    }
+    for (const auto& [taker, giver] : plan.moves)
+        out.moves.emplace_back(nameOf(taker), nameOf(giver));
+    return out;
+}
+
 // The parts of an effect chain that genuinely differ between an image layer
 // and a text layer.  Everything else about assembling one is identical, so
 // both go through assembleEffects below.
@@ -2420,7 +2533,7 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
 
     int32_t i_eff   = -1;
     usize   raw_idx = 0;
-    for (const auto& wpeffobj : effects) {
+    for (const auto& wpeffobj_authored : effects) {
         i_eff++;
         bool build = plan.wouldBuild[raw_idx];
         raw_idx++;
@@ -2428,6 +2541,15 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
             i_eff--;
             continue;
         }
+        // Effect feedback (fluid-targets patch): off, or an effect that
+        // carries nothing over between frames, and wpeffobj is the authored
+        // effect; else it is the effect rewriteFeedbackEffect made of it.
+        std::optional<FeedbackEffect> feedback_effect;
+        if (context.quality.feedback)
+            feedback_effect = rewriteFeedbackEffect(wpeffobj_authored, raw_idx - 1);
+        const wpscene::WPImageEffect& wpeffobj =
+            feedback_effect ? feedback_effect->effect : wpeffobj_authored;
+
         auto imgEffect = std::make_shared<SceneImageEffect>();
 
         // this will be replace when resolve, use here to get rt info
@@ -2459,6 +2581,21 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
                 }
                 fboMap[wpfbo.name] = rtname;
             }
+        }
+        if (feedback_effect) {
+            // The targets that keep their image: never shared with another
+            // target, never released.
+            for (const auto& name : feedback_effect->persistent)
+                scene.renderTargets.at(fboMap.at(name)).allowReuse = false;
+            // Every target of the effect is float where its "fbos" entry asks
+            // for it, kept or not: a value below 0 or above 1 has to get
+            // through the passes in between as well, and a copy between two
+            // targets declared alike stays a copy of one format.
+            for (const auto& wpfbo : wpeffobj.fbos) {
+                if (feedback::IsFloatFormat(wpfbo.format))
+                    scene.renderTargets.at(fboMap.at(wpfbo.name)).format = TextureFormat::RGBA16F;
+            }
+            imgEffect->feedback = true;
         }
         // load! effect commands
         {
@@ -2606,6 +2743,24 @@ void assembleEffects(ParseContext& context, const std::vector<wpscene::WPImageEf
             for (auto& anim : effUniformAnims) scene.effectUniformAnimations.push_back(anim);
             imgEffect->name = wpeffobj.name;
             layer.AddEffect(imgEffect);
+            if (feedback_effect) {
+                // Only for an effect that loaded: the renderer finds these
+                // targets through the passes that use them.
+                std::vector<std::pair<std::string, std::string>> moves;
+                for (const auto& name : feedback_effect->persistent)
+                    scene.feedbackTargets.insert(fboMap.at(name));
+                for (const auto& [taker, giver] : feedback_effect->moves)
+                    moves.emplace_back(fboMap.at(taker), fboMap.at(giver));
+                if (! moves.empty()) scene.feedbackMoves.push_back(std::move(moves));
+                // Always in the journal: it is only written with the setting
+                // on, and it is what tells which effects the setting found.
+                LOG_NOTICE("effect feedback: effect '%s' of layer %d carries over between frames: "
+                           "%zu target(s) kept, %zu of them change places each frame",
+                           wpeffobj.name.c_str(),
+                           opts.layer_id,
+                           feedback_effect->persistent.size(),
+                           feedback_effect->moves.size());
+            }
             // Every built-hidden effect starts hidden, bound or not: a script-targeted
             // layer builds literal-hidden effects that have no binding at all.
             if (! wpeffobj.visible) {
@@ -6152,6 +6307,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     computeAutoOrthoSize(sc, wp_objs, *imageParser);
 
     InitContext(context, vfs, sc, std::move(imageParser));
+    if (context.quality.feedback) context.shader_updater->SetPointerFeedback(true);
     ParseCamera(context, sc, json);
 
     prescanDependencies(context, wp_objs);
@@ -6281,6 +6437,9 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             attachVolumetricMaterials(context);
         }
     }
+
+    if (context.quality.feedback && context.scene->feedbackTargets.empty())
+        LOG_NOTICE("effect feedback: on, and no effect of this scene carries over between frames");
 
     // finalizeParse LAST: it tears glslang down (FinalGlslang), so every
     // CompileToSpv of this parse — the volumetric chain's included — has to

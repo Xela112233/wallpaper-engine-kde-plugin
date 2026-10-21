@@ -372,6 +372,28 @@ inline bool UsesTimeUniforms(const ShaderReflected::Block& block) {
            exists(block.member_map, G_AUDIOSPECTRUM64RIGHT);
 }
 
+// Effect feedback (fluid-targets patch).  The two globals the renderer
+// supplies only with the setting on; a pass whose block declares one must
+// re-upload its uniforms every frame like the nine above.
+inline bool UsesFeedbackFrameUniforms(const ShaderReflected::Block& block) {
+    return exists(block.member_map, G_POINTERPOSITIONLAST) || exists(block.member_map, G_FRAMETIME);
+}
+
+// Whether `name` is one of the scene's feedback targets (Scene::feedbackTargets,
+// empty without the setting or without a feedback effect).
+inline bool TouchesFeedbackTarget(const std::unordered_set<std::string>& targets,
+                                  const std::string&                     name) {
+    return ! targets.empty() && targets.count(name) != 0;
+}
+
+// A pass drawing into a feedback target finds a different image under its
+// output every frame, one of two.  The framebuffer built over the other image
+// is kept and taken back when the output's attachment view is that image's
+// again, instead of building one a frame.
+inline bool FeedbackFramebufferFits(bool has_other, VkImageView other_view, VkImageView out_view) {
+    return has_other && other_view != VK_NULL_HANDLE && other_view == out_view;
+}
+
 // Any shader-declared texture binding (bindings[i] >= 0) with no image slots
 // wired needs the 1x1 dummy fallback so the descriptor set has something
 // bound for every sampler the shader compiled against.  bindings[i] == -1
@@ -813,6 +835,14 @@ private:
     bool                              m_samples_mutable_texture { false };
     bool                              m_fb_failure_logged { false };
     FramebufferRetirer                m_fb_retirer;
+    // Effect feedback (fluid-targets patch): set in prepare() for a pass that
+    // draws into a feedback target; then m_fb_other is the framebuffer over
+    // the image the output had before its last change, and the two views say
+    // which image m_desc.fb and m_fb_other were built over.
+    bool                              m_feedback_output { false };
+    vvk::Framebuffer                  m_fb_other;
+    VkImageView                       m_fb_view { VK_NULL_HANDLE };
+    VkImageView                       m_fb_other_view { VK_NULL_HANDLE };
 
     // Per-pass scratch storage reused across execute() calls.
     //

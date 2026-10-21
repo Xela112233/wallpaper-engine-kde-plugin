@@ -747,6 +747,16 @@ public:
     // Scene.cpp to keep nlohmann/json out of this header.
     std::string SerializeLayerInitialStates() const;
 
+    // Effect feedback (fluid-targets patch; both empty unless the screen's
+    // EffectFeedback is on and the scene has a feedback effect, see
+    // EffectFeedback.hpp).  feedbackTargets: the render targets that keep
+    // their image from frame to frame; a pass that samples or draws into one
+    // is never cached.  feedbackMoves: per feedback effect, which target
+    // takes which target's image once a frame's passes are recorded (first
+    // takes second's, all of one effect at once).
+    std::unordered_set<std::string>                               feedbackTargets;
+    std::vector<std::vector<std::pair<std::string, std::string>>> feedbackMoves;
+
     // Non-throwing render-target lookup.  Returns nullptr when `name` is
     // absent instead of throwing std::out_of_range like renderTargets.at().
     // Used by the render passes (CustomShaderPass / CopyPass) so a malformed

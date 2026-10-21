@@ -125,6 +125,8 @@ ColumnLayout {
     // Web wallpaper resolution (scene-quality patch): SettingPage's combo box
     // writes it unqualified, like cfg_TextureQuality.
     property int    cfg_WebRenderScale
+    // Effect feedback (fluid-targets patch): SettingPage's switch.
+    property bool   cfg_EffectFeedback
     property int    cfg_ProcessPriority
     property int    cfg_ShareRenderer
     property int    cfg_SpanGroup

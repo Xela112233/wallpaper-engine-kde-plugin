@@ -41,6 +41,12 @@ struct SceneImageEffect {
     // chain_input is the chain buffer it copies.
     SceneNode*  chain_writer { nullptr };
     std::string chain_input;
+
+    // Effect feedback (fluid-targets patch): set by the parser for an effect
+    // that carries a picture over between frames.  sceneToRenderGraph then
+    // runs every command of the effect where the effect file has it, also
+    // several at one place and those after the last pass.
+    bool feedback { false };
 };
 
 class SceneImageEffectLayer {
