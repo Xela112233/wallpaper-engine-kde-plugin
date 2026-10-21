@@ -18,6 +18,20 @@
 //   process (radeonsi's GL contexts for mpv, Chromium's GPU process for web
 //   wallpapers, possibly NVIDIA's), so a wallpaper the usage cannot see is
 //   still measured.  kDefaultFootprint only when both are under kMinFreed.
+// * The estimate (texture-quality patch): what the scenes say they hold, each
+//   scene's allocator after its first frame, summed over the screens
+//   (setEstimate).  Before a stop has measured the footprint it is
+//   max(kDefaultFootprint, estimate), so a scene known to be large is not
+//   taken for 512 MiB.  After a measurement, a change of the estimate (a
+//   lower or higher texture resolution, another wallpaper) moves the
+//   measured footprint by the same amount, measured + (estimate - estimate
+//   at the measurement), at least kMinFreed and at most the larger of the
+//   two, until the next stop measures again: only the scenes' part of what
+//   was measured changes, and the video and web wallpapers' part (which
+//   report nothing) stays.  Never while a stop holds: what loads meanwhile
+//   (a wallpaper picked by hand) is not what the stopped screens free, so a
+//   stop keeps the footprint it measured, and the change counts once the
+//   wallpapers have loaded again.
 // * stopWanted turns off once the headroom has stayed at least
 //   footprint * 1.25 + margin() for kOffMs, and the back-off has passed.
 // * Back-off: a stop within kRelapseMs of the last reload waits
@@ -92,8 +106,10 @@ public:
             const std::uint64_t freed  = m_usageAtStop > s.usage ? m_usageAtStop - s.usage : 0;
             const std::uint64_t gained = s.headroom() > m_headroomAtStop ? s.headroom() - m_headroomAtStop : 0;
             const std::uint64_t seen   = std::max(freed, gained);
-            m_footprint                = seen >= kMinFreed ? seen : kDefaultFootprint;
+            m_measured                 = seen >= kMinFreed ? seen : 0;
+            m_estimateAtMeasure        = m_estimate;
             m_footprintDone            = true;
+            m_footprint                = m_measured ? m_measured : std::max(kDefaultFootprint, m_estimate);
         }
         if (! m_footprintDone || s.headroom() < required(s.heapSize)) {
             m_highSince = kUnset;
@@ -105,8 +121,17 @@ public:
         m_lowSince   = kUnset;
         m_highSince  = kUnset;
         m_reloadedAt = s.tMs;
+        refreshFootprint();                  // an estimate that changed during the stop counts now
         return true;
     }
+
+    // The scenes' own count, summed (0: none reported).
+    void setEstimate(std::uint64_t bytes) {
+        if (bytes == m_estimate) return;
+        m_estimate = bytes;
+        refreshFootprint();
+    }
+    std::uint64_t estimate() const { return m_estimate; }
 
     bool          stopWanted() const { return m_stop; }
     std::uint64_t footprint() const { return m_footprint; }
@@ -136,6 +161,22 @@ private:
         m_highSince     = kUnset;
     }
 
+    void refreshFootprint() {
+        if (m_stop) return;                  // a stop keeps the footprint it measured
+        if (m_measured == 0) {
+            m_footprint = std::max(kDefaultFootprint, m_estimate);
+        } else if (m_estimateAtMeasure == 0 || m_estimate == 0) {
+            m_footprint = m_measured;
+        } else {
+            // The scenes' part of the measurement moves with them; the rest stays.
+            const std::int64_t moved = static_cast<std::int64_t>(m_measured) + static_cast<std::int64_t>(m_estimate)
+                                     - static_cast<std::int64_t>(m_estimateAtMeasure);
+            const std::int64_t most  = static_cast<std::int64_t>(std::max(m_measured, m_estimate));
+            m_footprint = static_cast<std::uint64_t>(std::clamp<std::int64_t>(
+                moved, static_cast<std::int64_t>(kMinFreed), most));
+        }
+    }
+
     // Move every remembered time by `d` (a jump in the caller's clock).
     void shift(std::int64_t d) {
         if (m_lowSince != kUnset) m_lowSince += d;
@@ -156,6 +197,9 @@ private:
     std::uint64_t m_headroomAtStop { 0 };
     std::uint64_t m_footprint { kDefaultFootprint };
     bool          m_footprintDone { true };
+    std::uint64_t m_measured { 0 };           // what the last stop gave back (0: none worth the name)
+    std::uint64_t m_estimate { 0 };
+    std::uint64_t m_estimateAtMeasure { 0 };
 };
 
 // One GPU as Vulkan describes it, without Vulkan's types.

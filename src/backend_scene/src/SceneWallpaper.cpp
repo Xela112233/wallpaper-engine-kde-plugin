@@ -17,6 +17,7 @@
 #include "EffectUniformAnimation.hpp"
 #include "UserPropScriptReference.hpp"
 #include "WPSceneParser.hpp"
+#include "WPTexImageParser.hpp"
 #include "Scene/Scene.h"
 #include "Scene/SceneImageEffectLayer.h"
 #include "Scene/SubTickPlan.hpp"
@@ -180,7 +181,7 @@ public:
     }
 
     void sendCmdLoadScene();
-    void sendFirstFrameOk();
+    void sendFirstFrameOk(int32_t vram_mib);
     void sendVideoDecodeFailed(const std::string& summary);
     bool isGenGraphviz() const { return m_gen_graphviz; }
 
@@ -348,6 +349,7 @@ private:
     int32_t     m_msaa_mode { 0 };
     bool        m_camera_parallax { true };
     bool        m_pixel_art { false };
+    SceneQuality m_quality;
     bool        m_video_hwdec { true };
     // Last present-mode policy + refresh-hz seen from QML.  Cached so the
     // PROPERTY_FPS path (which mirrors fps into the swapchain) can re-issue
@@ -1721,7 +1723,22 @@ private:
 
             if (! scene->first_frame_ok) {
                 scene->first_frame_ok = true;
-                main_handler.sendFirstFrameOk();
+                // What this wallpaper holds now, for VramSampler's footprint
+                // estimate, and what the texture resolution kept of it.
+                const auto vram_mib =
+                    (int32_t)std::min<std::uint64_t>(m_render->deviceLocalBytes() / (1024 * 1024), INT32_MAX);
+                if (auto* tex = dynamic_cast<WPTexImageParser*>(scene->imageParser.get())) {
+                    const auto st = tex->QualityStatsNow();
+                    LOG_INFO("texture resolution %s: %lld of %lld textures smaller, %.1f MiB of their levels "
+                             "loaded of %.1f MiB; the wallpaper holds %d MiB of device-local memory",
+                             SceneQuality::TexturesName(tex->Quality().textures),
+                             (long long)st.smaller,
+                             (long long)st.textures,
+                             st.keptBytes / (1024.0 * 1024.0),
+                             st.fullBytes / (1024.0 * 1024.0),
+                             vram_mib);
+                }
+                main_handler.sendFirstFrameOk(vram_mib);
             }
 
             // Bump after a frame is actually drawn (i.e. not the device-lost
@@ -2931,6 +2948,20 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                     CALL_MHANDLER_CMD(LOAD_SCENE, msg);
                 }
             }
+        } else if (property == PROPERTY_SCENE_QUALITY) {
+            std::string value;
+            msg->findString("value", &value);
+            const SceneQuality q = SceneQuality::FromString(value);
+            if (! (q == m_quality)) {
+                m_quality = q;
+                m_scene_parser.SetQuality(q);
+                LOG_INFO("Scene quality: %s", q.ToString().c_str());
+                // Textures are decoded and uploaded once, at load: a change
+                // reloads the scene.
+                if (! m_source.empty() && ! m_assets.empty()) {
+                    CALL_MHANDLER_CMD(LOAD_SCENE, msg);
+                }
+            }
         } else if (property == PROPERTY_CAMERA_PARALLAX || property == PROPERTY_PIXEL_ART) {
             bool value { property == PROPERTY_CAMERA_PARALLAX };
             msg->findBool("value", &value);
@@ -2965,7 +2996,9 @@ MHANDLER_CMD_IMPL(MainHandler, STOP) {
 }
 
 MHANDLER_CMD_IMPL(MainHandler, FIRST_FRAME) {
-    if (m_first_frame_callback) m_first_frame_callback();
+    int32_t vram_mib = 0;
+    msg->findInt32("vram_mib", &vram_mib);
+    if (m_first_frame_callback) m_first_frame_callback(vram_mib);
 }
 
 MHANDLER_CMD_IMPL(MainHandler, VIDEO_DECODE_FAILED) {
@@ -3655,8 +3688,9 @@ void MainHandler::sendVideoDecodeFailed(const std::string& summary) {
     msg->post();
 }
 
-void MainHandler::sendFirstFrameOk() {
+void MainHandler::sendFirstFrameOk(int32_t vram_mib) {
     auto msg = CreateMsgWithCmd(shared_from_this(), MainHandler::CMD::CMD_FIRST_FRAME);
+    msg->setInt32("vram_mib", vram_mib);
     msg->post();
 }
 

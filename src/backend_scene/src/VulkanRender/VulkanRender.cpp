@@ -776,6 +776,9 @@ void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
 void VulkanRender::logMemoryStats(const char* when) const {
     if (pImpl->m_device) pImpl->m_device->LogMemoryStats(when);
 }
+std::uint64_t VulkanRender::deviceLocalBytes() const {
+    return pImpl->m_device ? (std::uint64_t)pImpl->m_device->AllocatedDeviceLocalBytes() : 0;
+}
 void VulkanRender::UpdateCameraFillMode(Scene& scene, wallpaper::FillMode fill) {
     pImpl->UpdateCameraFillMode(scene, fill);
 };

@@ -41,6 +41,12 @@ private slots:
     void aClockJumpNeitherCutsNorStretchesAWait();
     void theDeviceIsTheScenesThenTheOutputsThenTheDiscreteOne();
     void softwareAndPreVulkan11DevicesAreNeverPicked();
+    // texture-quality patch: the scenes' own estimate of what they hold.
+    void beforeAStopTheEstimateStandsForALargeFootprint();
+    void aLowerTextureResolutionTakesItsShareOffTheMeasurement();
+    void aWallpaperPickedDuringTheStopDoesNotMoveItsFootprint();
+    void aSmallerSceneBesideAVideoKeepsTheVideosShare();
+    void aMeasurementSmallerThanTheScenesSayIsNeverBelowTheMinimum();
 };
 
 void TestVramPolicy::aShortDipDoesNotStop() {
@@ -250,6 +256,97 @@ void TestVramPolicy::softwareAndPreVulkan11DevicesAreNeverPicked() {
     old.apiVersion      = (1u << 22);                // Vulkan 1.0
     QCOMPARE(chooseDevice({ llvmpipe, old }, nullptr, {}), -1);
     QCOMPARE(chooseDevice({ llvmpipe, old }, old.uuid.data(), {}), -1);
+}
+
+void TestVramPolicy::beforeAStopTheEstimateStandsForALargeFootprint() {
+    // No stop has measured anything: a scene known to hold 1.5 GiB is not
+    // taken for the 512 MiB default (which a small one keeps).
+    VramPolicy p;
+    QCOMPARE(p.footprint(), VramPolicy::kDefaultFootprint);
+    p.setEstimate(1536 * MiB);
+    QCOMPARE(p.footprint(), 1536 * MiB);
+    p.setEstimate(200 * MiB);
+    QCOMPARE(p.footprint(), VramPolicy::kDefaultFootprint);
+    std::int64_t t = 0;                              // and so a tight card counts the large one
+    p.setEstimate(1536 * MiB);
+    run(p, t, 2, 1600, 1200);
+    QVERIFY(p.tight());                              // 1200 free < 1536 + floor
+}
+
+void TestVramPolicy::aLowerTextureResolutionTakesItsShareOffTheMeasurement() {
+    // The stop measured 1200 MiB while the scenes said 1600 MiB; once loaded
+    // again the texture resolution goes down and the scenes say 800 MiB: the
+    // footprint is the measurement less those 800, and a later stop's reload
+    // waits for that, not for the old 1200.
+    VramPolicy   p;
+    std::int64_t t = 0;
+    p.setEstimate(1600 * MiB);
+    run(p, t, 4, 1500, 100);
+    QVERIFY(p.stopWanted());
+    run(p, t, 6, 300, 1300);                         // 1200 MiB given back
+    QCOMPARE(p.footprint(), 1200 * MiB);
+    QVERIFY(run(p, t, 11, 300, 3000));               // room again: reloaded
+    QVERIFY(! p.stopWanted());
+    p.setEstimate(800 * MiB);
+    QCOMPARE(p.footprint(), 400 * MiB);
+    p.setEstimate(2400 * MiB);                       // larger than measured: by as much, at most the estimate
+    QCOMPARE(p.footprint(), 2000 * MiB);
+    p.setEstimate(1600 * MiB);                       // back where it was measured
+    QCOMPARE(p.footprint(), 1200 * MiB);
+    p.setEstimate(0);                                // a video now: the measurement stands
+    QCOMPARE(p.footprint(), 1200 * MiB);
+}
+
+void TestVramPolicy::aWallpaperPickedDuringTheStopDoesNotMoveItsFootprint() {
+    // The review's case, an 8 GiB card: the stop measures 700 MiB while the
+    // scenes say 20 (a small scene and a video); a 2000 MiB scene picked by
+    // hand loads during the stop and reports.  The stop keeps its 700 MiB, so
+    // the stopped screens load again once 700 * 1.25 + 682 MiB is free (it
+    // used to need 89 GiB); then the estimate counts, at most its own size.
+    VramPolicy   p;
+    std::int64_t t = 0;
+    p.setEstimate(20 * MiB);
+    run(p, t, 4, 800, 100);
+    QVERIFY(p.stopWanted());
+    run(p, t, 6, 100, 800);                          // 700 MiB given back
+    QCOMPARE(p.footprint(), 700 * MiB);
+    p.setEstimate(2020 * MiB);
+    QCOMPARE(p.footprint(), 700 * MiB);
+    QVERIFY(! run(p, t, 9, 2100, 7800));
+    QVERIFY(run(p, t, 2, 2100, 7800));               // the 10th second with room: reloaded
+    QVERIFY(! p.stopWanted());
+    QCOMPARE(p.footprint(), 2020 * MiB);             // 700 + 2000, at most the estimate
+    QVERIFY(! p.tight());                            // 7800 free is room for 2020 + the floor
+}
+
+void TestVramPolicy::aSmallerSceneBesideAVideoKeepsTheVideosShare() {
+    // A 400 MiB scene and a video, measured together at 700 MiB; the scene
+    // then says 200 MiB: 500 MiB, not the 350 a ratio gave.
+    VramPolicy   p;
+    std::int64_t t = 0;
+    p.setEstimate(400 * MiB);
+    run(p, t, 4, 800, 100);
+    run(p, t, 6, 100, 800);
+    QCOMPARE(p.footprint(), 700 * MiB);
+    QVERIFY(run(p, t, 11, 100, 3000));
+    p.setEstimate(200 * MiB);
+    QCOMPARE(p.footprint(), 500 * MiB);
+    p.setEstimate(1 * MiB);                          // the video's 300 MiB stay whatever the scene says
+    QCOMPARE(p.footprint(), 301 * MiB);
+}
+
+void TestVramPolicy::aMeasurementSmallerThanTheScenesSayIsNeverBelowTheMinimum() {
+    // A driver that saw little freed (100 MiB) while the scenes said 400: a
+    // scene of 1 MiB then leaves no less than kMinFreed.
+    VramPolicy   p;
+    std::int64_t t = 0;
+    p.setEstimate(400 * MiB);
+    run(p, t, 4, 500, 100);
+    run(p, t, 6, 400, 200);                          // 100 MiB given back
+    QCOMPARE(p.footprint(), 100 * MiB);
+    QVERIFY(run(p, t, 11, 400, 3000));
+    p.setEstimate(1 * MiB);
+    QCOMPARE(p.footprint(), VramPolicy::kMinFreed);
 }
 
 QTEST_GUILESS_MAIN(TestVramPolicy)

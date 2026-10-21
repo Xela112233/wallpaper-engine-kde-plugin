@@ -302,6 +302,16 @@ bool Device::Create(Instance& inst, std::span<const Extension> exts, VkExtent2D 
     return true;
 }
 
+VkDeviceSize Device::AllocatedDeviceLocalBytes() const {
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+    vmaGetHeapBudgets(*m_allocator, budgets);
+    const auto&  mem   = m_gpu.GetMemoryProperties().memoryProperties;
+    VkDeviceSize total = 0;
+    for (uint32_t i = 0; i < mem.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; ++i)
+        if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) total += budgets[i].blockBytes;
+    return total;
+}
+
 VkDeviceSize Device::GetUsage() const {
     VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
     vmaGetHeapBudgets(*m_allocator, budgets);

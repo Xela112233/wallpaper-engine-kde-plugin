@@ -20,7 +20,11 @@ class AudioAnalyzer;
 namespace wallpaper
 {
 
-using FirstFrameCallback = std::function<void()>;
+// The argument: the device-local memory this wallpaper's renderer holds
+// once its first frame is drawn (its textures, render targets and buffers,
+// as its allocator counts them), in MiB; 0 when it cannot tell.  The KDE
+// plugin's VramSampler takes it as the wallpaper's footprint estimate.
+using FirstFrameCallback = std::function<void(std::int32_t vramMiB)>;
 // Bundled per-load summary of video-texture decoder failures.  Fires once per
 // SET_SCENE when at least one videoTexture's open() returned false for BOTH
 // HW and SW decoders.  The string is a multi-line human-readable summary
@@ -138,6 +142,10 @@ constexpr std::string_view PROPERTY_MSAA_MODE                   = "msaa_mode";
 // the output nearest-neighbour instead of bilinear.
 constexpr std::string_view PROPERTY_CAMERA_PARALLAX             = "camera_parallax";
 constexpr std::string_view PROPERTY_PIXEL_ART                   = "pixel_art";
+// Scene quality switches (SceneQuality.hpp), "key=value;..." as
+// SceneQuality::FromString reads it: texture resolution now.  Read while the
+// scene is parsed, so a change reloads it.
+constexpr std::string_view PROPERTY_SCENE_QUALITY               = "scene_quality";
 // Hardware decoding for video layers (the KDE plugin's MpvHwdec).  true
 // (default): the EGL/VA-API decoder first, as before; false: only the
 // software decoder, with mpv's hwdec=no.  Applied when the decoders are made

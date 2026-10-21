@@ -107,6 +107,9 @@ ColumnLayout {
     // unqualified, like cfg_RenderScale).
     property string cfg_PostProcessing
     property int    cfg_MsaaMode
+    // Texture resolution (texture-quality patch): SettingPage's combo box
+    // writes it unqualified, like cfg_RenderScale.
+    property int    cfg_TextureQuality
     property int    cfg_ProcessPriority
     // The Wallpaper language combo on SettingPage reads and writes it
     // unqualified, as the two above (we-manager's language patch).

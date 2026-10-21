@@ -133,6 +133,14 @@ target_include_directories(tst_vramsampler PRIVATE ${WEKDE_SRC_DIR})
 target_link_libraries(tst_vramsampler PRIVATE Qt6::Core Qt6::Test ${CMAKE_DL_LIBS})
 add_test(NAME tst_vramsampler COMMAND tst_vramsampler -v2)
 
+# ── SceneQuality (texture resolution, we-manager texture-quality patch) ──────
+# Header-only, in the scene renderer's source; no Vulkan.
+add_executable(tst_scenequality tst_scenequality.cpp)
+target_include_directories(tst_scenequality PRIVATE ${CMAKE_SOURCE_DIR}/src/backend_scene/src)
+target_compile_features(tst_scenequality PRIVATE cxx_std_20)
+target_link_libraries(tst_scenequality PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME tst_scenequality COMMAND tst_scenequality -v2)
+
 # ── WebUrlInterceptor unit tests ──────────────────────────────────────────────
 # Pure-predicate tests for the file:// allow/block gate.  The QtWebEngineCore
 # component ships in qt6-qtwebengine on Fedora / Bazzite; gated so a build

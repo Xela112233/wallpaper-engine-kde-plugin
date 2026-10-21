@@ -7,6 +7,7 @@
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QJsonObject>
 #include <QtCore/QSet>
+#include <QtCore/QVariantMap>
 #include <QtGui/QImage>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QHoverEvent>
@@ -92,6 +93,16 @@ class SceneObject : public QQuickItem {
     // scene is parsed, so a change reloads it.
     Q_PROPERTY(bool cameraParallax READ cameraParallax WRITE setCameraParallax)
     Q_PROPERTY(bool pixelArt READ pixelArt WRITE setPixelArt)
+    // Scene quality switches (texture-quality patch, SceneQuality.hpp):
+    // {textures: 0 full | 1 performance | 2 automatic}; unit 18's switches
+    // are more keys of the same map.  For Automatic the render target size
+    // (item size x dpr x renderScale, as the Vulkan target is made) is added
+    // here.  Read while the scene is parsed, so a change reloads it.
+    Q_PROPERTY(QVariantMap sceneQuality READ sceneQuality WRITE setSceneQuality NOTIFY sceneQualityChanged)
+    // The device-local memory the scene's renderer holds after its first
+    // frame (textures, render targets, buffers), in MiB; 0 before.  The KDE
+    // plugin hands it to VramSampler as the footprint's estimate.
+    Q_PROPERTY(int vramMiB READ vramMiB NOTIFY vramMiBChanged)
     // Fraction of the display's native resolution to render at, 1.0 = native.
     // Almost everything the renderer does is per-pixel and per-pass, so
     // rendering below native and letting Qt upscale is the largest single
@@ -148,6 +159,8 @@ public:
     int     processPriority() const;
     bool    cameraParallax() const;
     bool    pixelArt() const;
+    QVariantMap sceneQuality() const { return m_sceneQuality; }
+    int         vramMiB() const { return m_vramMiB; }
     qreal   nativeAspectRatio() const;
 
     void setFps(int);
@@ -167,6 +180,7 @@ public:
     void setProcessPriority(int);
     void setCameraParallax(bool);
     void setPixelArt(bool);
+    void setSceneQuality(const QVariantMap&);
 
     // debug
     bool vulkanValid() const;
@@ -381,6 +395,8 @@ signals:
     void userPropertiesChanged();
     void nativeAspectRatioChanged();
     void firstFrame();
+    void sceneQualityChanged();
+    void vramMiBChanged();
     // saveFrame's outcome: ok, or why not (the path in both).
     void frameSaved(const QString& path, bool ok, const QString& error);
     // Emitted when SceneScript calls engine.openUserShortcut(name).  The main
@@ -434,6 +450,13 @@ private:
     int         m_processPriority { 0 };
     bool        m_cameraParallax { true };
     bool        m_pixelArt { false };
+    QVariantMap m_sceneQuality;
+    // The Vulkan target size updatePaintNode made (0 x 0 before): Automatic's target.
+    int         m_targetWidth { 0 };
+    int         m_targetHeight { 0 };
+    int         m_vramMiB { 0 };
+    void        sendSceneQuality();
+    void        setVramMiB(int);
     qreal       m_renderScale { 1.0 };
     QString     m_userProperties;
     int         m_renderPixelWidth { 0 };

@@ -380,6 +380,30 @@ Flickable {
                 }
             }
             OptionItem {
+                text: i18nc("@label settings option", "Texture resolution")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: ComboBox {
+                    id: cbTextureQuality
+                    model: [
+                        { text: i18nc("@item:inlistbox texture resolution", "Full"),                                 value: 0 },
+                        { text: i18nc("@item:inlistbox texture resolution", "Performance (half size)"),              value: 1 },
+                        { text: i18nc("@item:inlistbox texture resolution", "Automatic (no larger than the screen)"), value: 2 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_TextureQuality = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_TextureQuality))
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info texture resolution help text", "Loads scene textures one mip level smaller: half the size, a quarter of the video memory. Automatic does that only while the texture is still at least as large as the screen. Textures without mipmaps, sprite sheets and video textures stay as they are. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
                 text: i18nc("@label settings option", "Anti-aliasing")
                 text_color: Kirigami.Theme.textColor
                 icon: '../../images/window.svg'

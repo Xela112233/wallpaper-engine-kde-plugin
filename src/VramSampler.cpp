@@ -16,10 +16,12 @@
 #include <QMetaObject>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QHash>
 #include <QSet>
 #include <QtDebug>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -52,6 +54,7 @@ struct Snapshot {
     bool       stopWanted { false };
     bool       tight { false };
     quint64    footprint { 0 };
+    quint64    estimate { 0 };
     qint64     backoffMs { 0 };
 };
 
@@ -97,6 +100,18 @@ public:
     void removeUser(VramSampler* s) {
         if (! m_users.remove(s)) return;
         if (m_users.isEmpty()) setActive(false);
+    }
+
+    // GUI thread: one screen's scene estimate (VramSampler::estimateMiB);
+    // the worker reads the sum over the screens at each sample.
+    void setEstimate(VramSampler* s, std::uint64_t bytes) {
+        if (bytes)
+            m_estimates.insert(s, bytes);
+        else
+            m_estimates.remove(s);
+        std::uint64_t sum = 0;
+        for (auto v : std::as_const(m_estimates)) sum += v;
+        m_estimateSum.store(sum);
     }
 
     Snapshot snapshot() const {
@@ -195,6 +210,7 @@ private:
             const bool ok = (m_instance != VK_NULL_HANDLE || openVulkan(why)) && pickDevice(s, why)
                             && takeSample(sample, why);
             if (ok) {
+                policy.setEstimate(m_estimateSum.load());
                 const bool changed = policy.feed(sample);
                 s.available        = true;
                 s.reason.clear();
@@ -202,6 +218,7 @@ private:
                 s.stopWanted = policy.stopWanted();
                 s.tight      = policy.tight();
                 s.footprint  = policy.footprint();
+                s.estimate   = policy.estimate();
                 s.backoffMs  = policy.backoffMs();
                 if (changed) logChange(s, policy);
             } else {
@@ -451,6 +468,8 @@ private:
     }
 
     QSet<VramSampler*>      m_users;     // GUI thread only
+    QHash<VramSampler*, std::uint64_t> m_estimates;   // GUI thread only
+    std::atomic<std::uint64_t>         m_estimateSum { 0 };
     std::mutex              m_mx;
     std::condition_variable m_cv;
     bool                    m_active { false };
@@ -481,6 +500,7 @@ VramSampler::VramSampler(QObject* parent): QObject(parent) {}
 
 VramSampler::~VramSampler() {
     if (m_enabled) Monitor::get().removeUser(this);
+    Monitor::get().setEstimate(this, 0);
 }
 
 void VramSampler::setEnabled(bool on) {
@@ -491,6 +511,7 @@ void VramSampler::setEnabled(bool on) {
     } else {
         Monitor::get().removeUser(this);
     }
+    Monitor::get().setEstimate(this, on ? m_estimateBytes : 0);
     emit enabledChanged();
     emit changed();
 }
@@ -519,6 +540,7 @@ QVariantMap VramSampler::processStatus() {
         { QStringLiteral("heapMiB"), mib(s.sample.heapSize) },
         { QStringLiteral("freeMiB"), mib(s.sample.headroom()) },
         { QStringLiteral("footprintMiB"), mib(s.footprint) },
+        { QStringLiteral("estimateMiB"), mib(s.estimate) },
         { QStringLiteral("backoffMs"), s.backoffMs },
         { QStringLiteral("stopWanted"), s.stopWanted },
         { QStringLiteral("tight"), s.tight },
@@ -530,6 +552,14 @@ QString VramSampler::processStatusJson() {
 }
 
 QString VramSampler::statusJson() const { return processStatusJson(); }
+
+void VramSampler::setEstimateMiB(double mib) {
+    const std::uint64_t bytes = mib > 0 ? static_cast<std::uint64_t>(mib * kMiB) : 0;
+    if (bytes == m_estimateBytes) return;
+    m_estimateBytes = bytes;
+    Monitor::get().setEstimate(this, m_enabled ? bytes : 0);
+    emit estimateChanged();
+}
 
 void VramSampler::shutdownForExit() { Monitor::exitRoutine(); }
 

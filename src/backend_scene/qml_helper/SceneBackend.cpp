@@ -25,6 +25,7 @@
 #include "SpecTexs.hpp"
 #include "TextScriptResult.hpp"
 #include "WPMediaSystemTexture.hpp"
+#include "SceneQuality.hpp"
 
 #include <QJSValueIterator>
 #include <QtGlobal>
@@ -218,8 +219,9 @@ public:
             });
         };
 
-        auto cb = std::make_shared<wallpaper::FirstFrameCallback>([guard]() {
-            guard->invoke([](TextureNode* self) {
+        auto cb = std::make_shared<wallpaper::FirstFrameCallback>([guard](std::int32_t vram_mib) {
+            guard->invoke([vram_mib](TextureNode* self) {
+                self->m_vram_mib    = vram_mib;
                 self->m_first_frame = true;
                 Q_EMIT self->redraw();
             });
@@ -281,6 +283,8 @@ signals:
     void nodeDestroyed();
     void redraw();
     void sceneFirstFrame();
+    // With sceneFirstFrame: what the renderer holds then (FirstFrameCallback).
+    void sceneVramMiB(int mib);
     // Forwarded from the render-thread VideoDecodeFailedCallback (see
     // initVulkan).  Wired in SceneObject::updatePaintNode to the
     // SceneObject::videoDecodeFailed Q_EMIT so the QML side receives it
@@ -324,6 +328,7 @@ public slots:
             bool expected = true;
             if (m_first_frame.compare_exchange_strong(expected, false)) {
                 Q_EMIT sceneFirstFrame();
+                Q_EMIT sceneVramMiB(m_vram_mib.load());
             }
         }
     }
@@ -337,6 +342,7 @@ private:
     EatFrameOp        m_eatFrameOp;
     QQuickWindow*     m_window;
     std::atomic<bool> m_first_frame;
+    std::atomic<int>  m_vram_mib { 0 };
 
     GlExtra m_glex;
 
@@ -495,6 +501,11 @@ QSGNode* SceneObject::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
                                     m_renderScale,
                                     (uint32_t)std::max(0, m_renderPixelWidth),
                                     (uint32_t)std::max(0, m_renderPixelHeight));
+            // Automatic texture resolution compares with this target: send
+            // it before the renderer is up, so the first load has it.
+            m_targetWidth  = (int)extent.width;
+            m_targetHeight = (int)extent.height;
+            sendSceneQuality();
             node->initVulkan((int)extent.width, (int)extent.height, m_hdrOutput, m_deterministic);
 
             connect(
@@ -505,6 +516,7 @@ QSGNode* SceneObject::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
                     &TextureNode::newTexture,
                     Qt::DirectConnection);
             connect(node, &TextureNode::sceneFirstFrame, this, &SceneObject::firstFrame);
+            connect(node, &TextureNode::sceneVramMiB, this, &SceneObject::setVramMiB);
             connect(
                 node, &TextureNode::sceneVideoDecodeFailed, this, &SceneObject::videoDecodeFailed);
             connect(node, &TextureNode::nodeSceneLoadFailed, this, &SceneObject::sceneLoadFailed);
@@ -739,6 +751,29 @@ void SceneObject::setVideoHwdec(bool value) {
 }
 
 bool SceneObject::pixelArt() const { return m_pixelArt; }
+
+void SceneObject::setSceneQuality(const QVariantMap& value) {
+    if (m_sceneQuality == value) return;
+    m_sceneQuality = value;
+    Q_EMIT sceneQualityChanged();
+    sendSceneQuality();
+}
+
+// SceneQuality::FromString's form.  The target only for Automatic, so a
+// resize does not reload a scene the other modes do not change.
+void SceneObject::sendSceneQuality() {
+    const int textures = std::clamp(m_sceneQuality.value(QStringLiteral("textures")).toInt(), 0, 2);
+    std::string text   = "textures=" + std::to_string(textures);
+    if (textures == (int)wallpaper::SceneQuality::Textures::Automatic && m_targetWidth > 0 && m_targetHeight > 0)
+        text += ";targetWidth=" + std::to_string(m_targetWidth) + ";targetHeight=" + std::to_string(m_targetHeight);
+    SET_PROPERTY(String, wallpaper::PROPERTY_SCENE_QUALITY, text);
+}
+
+void SceneObject::setVramMiB(int mib) {
+    if (mib <= 0 || mib == m_vramMiB) return;
+    m_vramMiB = mib;
+    Q_EMIT vramMiBChanged();
+}
 
 void SceneObject::setPixelArt(bool value) {
     if (m_pixelArt == value) return;

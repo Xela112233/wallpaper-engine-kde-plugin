@@ -20,6 +20,8 @@
 #include <QString>
 #include <QVariantMap>
 
+#include <cstdint>
+
 namespace wekde
 {
 
@@ -38,6 +40,11 @@ class VramSampler : public QObject {
     Q_PROPERTY(bool tight READ tight NOTIFY changed)
     Q_PROPERTY(double freeMiB READ freeMiB NOTIFY changed)
     Q_PROPERTY(double heapMiB READ heapMiB NOTIFY changed)
+    // What this screen's scene says it holds (SceneViewer.vramMiB after its
+    // first frame; texture-quality patch): summed over the screens, the
+    // footprint's estimate (VramPolicy::setEstimate).  0: none (a video or
+    // web wallpaper, or no scene drawn yet).
+    Q_PROPERTY(double estimateMiB READ estimateMiB WRITE setEstimateMiB NOTIFY estimateChanged)
 
 public:
     explicit VramSampler(QObject* parent = nullptr);
@@ -52,6 +59,8 @@ public:
     bool    tight() const;
     double  freeMiB() const;
     double  heapMiB() const;
+    double  estimateMiB() const { return static_cast<double>(m_estimateBytes) / (1024.0 * 1024.0); }
+    void    setEstimateMiB(double mib);
 
     // The monitor's state as JSON (WekControl.VramStatus): available,
     // reason, device, deviceType, usage, budget, heap, free, footprint,
@@ -67,9 +76,11 @@ public:
 signals:
     void enabledChanged();
     void changed();
+    void estimateChanged();
 
 private:
-    bool m_enabled { false };
+    bool          m_enabled { false };
+    std::uint64_t m_estimateBytes { 0 };
 };
 
 } // namespace wekde

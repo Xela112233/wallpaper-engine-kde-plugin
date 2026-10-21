@@ -133,6 +133,11 @@ Item{
             // is up, so the first load already uses it.
             Common.setIfSupported(player, "SceneViewer", "videoHwdec",
                                   Qt.binding(function() { return background.mpvHwdec; }));
+            // Texture resolution (texture-quality patch); a change reloads
+            // the scene.  Set before the renderer is up, so the first load
+            // already uses it.
+            Common.setIfSupported(player, "SceneViewer", "sceneQuality",
+                                  Qt.binding(function() { return { textures: background.textureQuality }; }));
         }
 
         Connections {
@@ -165,6 +170,16 @@ Item{
             // loadInfoShow there; here a scene has other content to preserve.
             function onVideoDecodeFailed(summary) {
                 videoDecodeOverlay.show(summary);
+            }
+        }
+        // What the scene holds after its first frame (texture-quality patch),
+        // for VramStop's footprint estimate.  A library without vramMiB
+        // never sends it.
+        Connections {
+            target: player
+            ignoreUnknownSignals: true
+            function onVramMiBChanged() {
+                if (player.vramMiB > 0) background.vramEstimateMiB = player.vramMiB;
             }
         }
     }
@@ -288,6 +303,7 @@ Item{
         player.postprocessingOverride = player.postprocessingOverride;
         player.cameraParallax = player.cameraParallax;
         player.pixelArt = player.pixelArt;
+        if ("sceneQuality" in player) player.sceneQuality = player.sceneQuality;
         if ("videoHwdec" in player) player.videoHwdec = player.videoHwdec;
         player.muted = player.muted;
         volumeFade.freeze();

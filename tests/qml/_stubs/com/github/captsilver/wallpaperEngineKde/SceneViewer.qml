@@ -1,6 +1,6 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: src/plugin.cpp registers scenebackend::SceneObject (src/backend_scene/qml_helper/)
-// Last contract review: 2026-09-08
+// Last contract review: 2026-11-11
 
 // Stub for the Vulkan-backed SceneViewer plugin type. Quick3D / Vulkan can't
 // run in qmltestrunner offscreen; we just provide the QML API surface that
@@ -26,6 +26,8 @@ Item {
     property int    processPriority: 0   // 0 normal, 1 below normal, 2 low (ProcessPriority)
     property bool   cameraParallax: true   // false: the scene's camera parallax stays off
     property bool   pixelArt:       false  // true: nearest-neighbour textures and output
+    property var    sceneQuality:   ({})   // {textures: 0 full, 1 performance, 2 automatic} (texture-quality patch)
+    property int    vramMiB:        0      // what the scene holds after its first frame; tests set it
     property real   renderScale:    1.0  // fraction of native resolution to render at
     property bool   systemAudioCapture: false
     property bool   videoHwdec:     true   // false: the scene's video layers decode on the CPU

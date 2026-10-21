@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <lz4.h>
 #include <memory>
 #include <mutex>
@@ -750,6 +751,117 @@ TEST_SUITE("WPTexImageParser") {
         for (size_t i = 0; i < pixels.size(); i++) {
             CHECK(data[i] == pixels[i]);
         }
+    }
+
+    // Texture resolution (we-manager texture-quality patch, SceneQuality.hpp).
+    // A 16x8 image in a 32x16 texture with three levels: 32x16, 16x8, 8x4,
+    // each level's bytes its index, the second one LZ4-compressed.
+    std::vector<uint8_t> threeLevelTex(int texb) {
+        auto buf = makeTexHeader(1, 1, texb, 0, 0u, 32, 16, 16, 8, 1);
+        appendInt32(buf, 3);
+        for (int level = 0; level < 3; level++) {
+            const int32_t        w = 32 >> level, h = 16 >> level;
+            std::vector<uint8_t> px(static_cast<size_t>(w * h * 4), static_cast<uint8_t>(level));
+            if (texb >= 2)
+                appendMipmapV2(buf, w, h, px, /*compress=*/level == 1);
+            else
+                appendMipmapV1(buf, w, h, px);
+        }
+        return buf;
+    }
+
+    TEST_CASE("Texture resolution: performance uploads from the second level, the header stays") {
+        VFS vfs;
+        mountTex(vfs, "three", threeLevelTex(2));
+        WPTexImageParser parser(&vfs);
+        SceneQuality     q;
+        q.textures = SceneQuality::Textures::Performance;
+        parser.SetQuality(q);
+        auto img = parser.Parse("three");
+        REQUIRE(img != nullptr);
+        REQUIRE(img->slots[0].mipmaps.size() == 2);
+        CHECK(img->slots[0].width == 16);                 // the upload's extent
+        CHECK(img->slots[0].height == 8);
+        CHECK(img->slots[0].mipmaps[0].width == 16);
+        CHECK(img->slots[0].mipmaps[0].data.get()[0] == 1);   // the LZ4 level, decompressed
+        CHECK(img->slots[0].mipmaps[1].width == 8);
+        CHECK(img->slots[0].mipmaps[1].data.get()[0] == 2);
+        // As authored: the resolution uniforms and the padded image's place.
+        CHECK(img->header.width == 32);
+        CHECK(img->header.mapWidth == 16);
+        CHECK(img->header.mipmap_larger == true);
+        CHECK(parser.ParseHeader("three").mipmap_larger == true);
+        const auto st = parser.QualityStatsNow();
+        CHECK(st.textures == 1);
+        CHECK(st.smaller == 1);
+        CHECK(st.keptBytes == (16 * 8 + 8 * 4) * 4);
+        CHECK(st.fullBytes == (32 * 16 + 16 * 8 + 8 * 4) * 4);
+    }
+
+    TEST_CASE("Texture resolution: full, and a texture of one level, keep every level") {
+        SceneQuality perf;
+        perf.textures = SceneQuality::Textures::Performance;
+        {
+            VFS vfs;
+            mountTex(vfs, "three", threeLevelTex(1));
+            WPTexImageParser parser(&vfs);              // Full
+            auto             img = parser.Parse("three");
+            REQUIRE(img != nullptr);
+            CHECK(img->slots[0].mipmaps.size() == 3);
+            CHECK(img->slots[0].width == 32);
+        }
+        {
+            VFS vfs;
+            mountTex(vfs, "one", makeSimpleRGBA8Tex(8, 8));
+            WPTexImageParser parser(&vfs);
+            parser.SetQuality(perf);
+            auto img = parser.Parse("one");
+            REQUIRE(img != nullptr);
+            CHECK(img->slots[0].mipmaps.size() == 1);
+            CHECK(img->slots[0].width == 8);
+            CHECK(parser.QualityStatsNow().smaller == 0);
+        }
+    }
+
+    TEST_CASE("Texture resolution: an MP4 in the first level, LZ4-packed or not, leaves out nothing") {
+        for (bool packed : { false, true }) {
+            CAPTURE(packed);
+            auto buf = makeTexHeader(1, 1, 2, 0, 0u, 16, 16, 16, 16, 1);
+            appendInt32(buf, 2);
+            std::vector<uint8_t> mp4(16 * 16 * 4, 0);
+            const char           head[] = { 0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2' };
+            std::memcpy(mp4.data(), head, sizeof(head));
+            appendMipmapV2(buf, 16, 16, mp4, /*compress=*/packed);
+            appendMipmapV2(buf, 8, 8, std::vector<uint8_t>(8 * 8 * 4, 7));
+            VFS vfs;
+            mountTex(vfs, "video", std::move(buf));
+            WPTexImageParser parser(&vfs);
+            parser.SetCachePath(std::filesystem::temp_directory_path().string());
+            SceneQuality q;
+            q.textures = SceneQuality::Textures::Performance;
+            parser.SetQuality(q);
+            auto img = parser.Parse("video");
+            REQUIRE(img != nullptr);
+            CHECK(img->header.isVideoTexture);
+            CHECK(img->slots[0].mipmaps.size() == 2);
+            CHECK(img->slots[0].width == 16);
+            CHECK(parser.QualityStatsNow().smaller == 0);
+        }
+    }
+
+    TEST_CASE("Texture resolution: automatic keeps what the target needs") {
+        VFS vfs;
+        mountTex(vfs, "three", threeLevelTex(2));
+        WPTexImageParser parser(&vfs);
+        SceneQuality     q;
+        q.textures     = SceneQuality::Textures::Automatic;
+        q.targetWidth  = 8;                             // the image is 16x8: one level still covers 8x4
+        q.targetHeight = 4;
+        parser.SetQuality(q);
+        auto img = parser.Parse("three");
+        REQUIRE(img != nullptr);
+        CHECK(img->slots[0].mipmaps.size() == 2);
+        CHECK(img->slots[0].width == 16);
     }
 
     TEST_CASE("Oversized decompressed_size returns nullptr (OOM guard)") {

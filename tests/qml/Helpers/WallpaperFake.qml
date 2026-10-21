@@ -86,6 +86,7 @@ Item {
         "CacheQuotaMB":        500,
         "PlaylistNotifyOnAdvance": false,
         "MsaaMode":            0,
+        "TextureQuality":      0,
         "ProcessPriority":     0
     })
 }

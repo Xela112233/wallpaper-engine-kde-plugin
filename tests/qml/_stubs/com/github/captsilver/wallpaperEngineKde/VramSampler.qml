@@ -16,6 +16,7 @@ QtObject {
     property bool   tight: false
     property real   freeMiB: 4096
     property real   heapMiB: 8192
+    property real   estimateMiB: 0       // this screen's scene count (texture-quality patch)
     signal changed()
     onStopWantedChanged: changed()
     onTightChanged: changed()

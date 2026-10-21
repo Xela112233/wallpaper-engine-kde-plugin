@@ -89,6 +89,9 @@ public:
     std::array<HeapBudget, VK_MAX_MEMORY_HEAPS> GetHeapBudgets() const;
 
     VkDeviceSize GetUsage() const;
+    // What this device's allocator holds in device-local heaps (VMA's block
+    // bytes): this wallpaper's own share, unlike GetUsage's process total.
+    VkDeviceSize AllocatedDeviceLocalBytes() const;
 
     // LOG_INFO lines from vmaCalculateStats: a total, one line per memory heap and
     // per memory type that holds blocks, then a budget line per heap.  GetUsage() is the driver's

@@ -1,5 +1,6 @@
 #pragma once
 #include "Interface/ISceneParser.h"
+#include "SceneQuality.hpp"
 #include <atomic>
 #include <random>
 
@@ -31,6 +32,10 @@ public:
     // True: every texture is sampled nearest-neighbour, as if each .tex had
     // its author's no-interpolation flag (the per-wallpaper pixel_art).
     void SetPixelArt(bool on) { m_pixel_art = on; }
+    // The scene quality switches (SceneQuality.hpp): Parse() hands them to the
+    // texture parser it makes, the one copy every quality decision of the
+    // load reads.
+    void SetQuality(const SceneQuality& q) { m_quality = q; }
 
     // Plumb a cooperative-cancellation atomic flag set by the host
     // (MainHandler) when the wallpaper's display surface goes away
@@ -50,6 +55,7 @@ private:
     int               m_msaa_mode { 0 };
     bool              m_camera_parallax { true };
     bool              m_pixel_art { false };
+    SceneQuality      m_quality;
     std::atomic_bool* m_abort_flag { nullptr };
 };
 } // namespace wallpaper

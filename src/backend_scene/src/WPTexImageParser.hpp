@@ -2,6 +2,8 @@
 #include "Interface/IImageParser.h"
 #include "Fs/VFS.h"
 #include "TexVariants.hpp"
+#include "SceneQuality.hpp"
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -35,6 +37,27 @@ public:
     // first Parse()/ParseHeader(); the headers it caches carry it.
     void SetForceNearest(bool on) { m_forceNearest = on; }
 
+    // Texture resolution (SceneQuality::textures, we-manager texture-quality
+    // patch): Parse() leaves out the leading mip levels LeadingMipsToDrop
+    // names, reading past them without decoding.  The slot (what is
+    // uploaded) starts at the first level kept; the header, and so the
+    // resolution uniforms, stays as authored.  Set it before the first Parse().
+    void                SetQuality(const SceneQuality& q) { m_quality = q; }
+    const SceneQuality& Quality() const { return m_quality; }
+
+    // What Parse() kept of the textures it read with mip levels to spare:
+    // texture count, how many came out smaller, and the bytes of the levels
+    // kept against all of them (decoded sizes).  For the per-scene log line.
+    struct QualityStats {
+        i64 textures { 0 };
+        i64 smaller { 0 };
+        i64 keptBytes { 0 };
+        i64 fullBytes { 0 };
+    };
+    QualityStats QualityStatsNow() const {
+        return { m_statTextures.load(), m_statSmaller.load(), m_statKept.load(), m_statFull.load() };
+    }
+
     // Decides which conditional variant Parse() builds for a texture that has
     // them. Unset, every texture loads its base image. Set it before the first
     // Parse(); PrefetchTextures reads it from worker threads.
@@ -49,6 +72,9 @@ private:
     i64         m_maxTotalBytes;
     std::string m_cachePath;
     bool        m_forceNearest { false };
+    SceneQuality m_quality;
+    // Parse() runs on PrefetchTextures' workers too.
+    std::atomic<i64> m_statTextures { 0 }, m_statSmaller { 0 }, m_statKept { 0 }, m_statFull { 0 };
     texvariant::Selector m_variantSelector;
     // Guards m_registered only.  PrefetchTextures() (below) calls Parse()
     // for many names at once from a worker pool, and Parse() both reads

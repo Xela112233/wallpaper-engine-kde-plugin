@@ -6090,6 +6090,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     // re-opening .tex files.
     auto imageParser = std::make_unique<WPTexImageParser>(&vfs);
     imageParser->SetForceNearest(m_pixel_art);
+    imageParser->SetQuality(m_quality);
     // Textures are decoded later on the render thread; keep the selector's
     // own copy of the properties this scene was built with.
     imageParser->SetVariantSelector(

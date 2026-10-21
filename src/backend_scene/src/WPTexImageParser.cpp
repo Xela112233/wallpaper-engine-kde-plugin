@@ -241,6 +241,25 @@ void ApplyMipVariantPatch(const std::string& name, usize mip_index, TextureForma
     }
 }
 
+// Whether a level's bytes, at the stream's position, start like an MP4 (a
+// size field, then "ftyp"); of an LZ4-packed level only the first eight bytes
+// are unpacked.  The stream is left where it was.
+bool LevelIsMp4(fs::IBinaryStream& file, i32 src_size, bool lz4) {
+    if (src_size <= 8) return false;
+    const auto        at = file.Tell();
+    std::vector<char> bytes((usize)(lz4 ? src_size : 8));
+    const usize       got = file.Read(bytes.data(), bytes.size());
+    file.SeekSet(at);
+    if (got != bytes.size()) return false;
+    char head[8] {};
+    if (lz4) {
+        if (LZ4_decompress_safe_partial(bytes.data(), head, src_size, 8, 8) != 8) return false;
+    } else {
+        std::memcpy(head, bytes.data(), 8);
+    }
+    return std::memcmp(head + 4, "ftyp", 4) == 0;
+}
+
 bool LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
     header.extraHeader["texv"].val = ReadTexVesion(file);
     header.extraHeader["texi"].val = ReadTexVesion(file);
@@ -412,6 +431,10 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
     // RSS a single Parse() can request — a per-allocation cap alone leaves the
     // door open to N slots × M mips × cap accumulating without bound.
     i64 total_bytes = 0;
+    // For SceneQuality's per-scene line: the decoded bytes of the levels kept
+    // and of all of them, and whether any slot came out smaller.
+    i64  kept_bytes = 0, full_bytes = 0;
+    bool smaller    = false;
     for (usize i_image = 0; i_image < image_count; i_image++) {
         auto& img_slot = img.slots[i_image];
         auto& mipmaps  = img_slot.mipmaps;
@@ -427,15 +450,23 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
             return nullptr;
         }
         mipmaps.resize(mipmap_count);
+        // Texture resolution (SceneQuality): the leading levels left out of
+        // this slot, decided at its first level.  They are read past, not
+        // decoded, kept or counted in the budget.
+        usize skip = 0;
         // load image
         for (usize i_mipmap = 0; i_mipmap < mipmap_count; i_mipmap++) {
-            auto& mipmap  = mipmaps.at(i_mipmap);
-            mipmap.width  = file.ReadInt32();
-            mipmap.height = file.ReadInt32();
+            const i32 mip_w = file.ReadInt32();
+            const i32 mip_h = file.ReadInt32();
             if (i_mipmap == 0) {
-                img_slot.width  = mipmap.width;
-                img_slot.height = mipmap.height;
-                SetHeaderPow2(img.header, mipmap.width, mipmap.height);
+                // The header keeps the authored first level: the resolution
+                // uniforms and mipmap_larger come from it (WPSceneParser), and
+                // the image's place inside a padded texture is the same ratio
+                // at every level.  Only the slot (the upload) starts lower.
+                SetHeaderPow2(img.header, mip_w, mip_h);
+                skip = (usize)LeadingMipsToDrop(m_quality, (i32)mipmap_count, mip_w, mip_h,
+                                                img.header.mapWidth, img.header.mapHeight,
+                                                img.header.isSprite);
             }
 
             bool    LZ4_compressed    = false;
@@ -447,16 +478,16 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
             }
 
             i32 src_size = file.ReadInt32();
-            if (src_size <= 0 || mipmap.width <= 0 || mipmap.height <= 0 || decompressed_size < 0)
+            if (src_size <= 0 || mip_w <= 0 || mip_h <= 0 || decompressed_size < 0)
                 return nullptr;
 
             // Per-axis plausibility cap.  Real WP textures top out at 4K per
             // side; 16K leaves room for future engine bumps while rejecting
             // the INT32_MAX class of fuzz inputs.
-            if (mipmap.width > kMaxMipmapDim || mipmap.height > kMaxMipmapDim) {
+            if (mip_w > kMaxMipmapDim || mip_h > kMaxMipmapDim) {
                 LOG_INFO("tex '%s' mip[%zu]: dimensions %dx%d exceed plausibility cap %d",
                          name.c_str(), i_mipmap,
-                         mipmap.width, mipmap.height, kMaxMipmapDim);
+                         mip_w, mip_h, kMaxMipmapDim);
                 return nullptr;
             }
 
@@ -483,13 +514,41 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                 LOG_ERROR("tex '%s': src_size %d exceeds stream", name.c_str(), src_size);
                 return nullptr;
             }
-            std::vector<char> result((usize)src_size);
-            file.Read(result.data(), (usize)src_size);
+            // A level left out is passed over, not read.  Only the first
+            // level's start is looked at: an MP4 there (LZ4-packed or not)
+            // makes the texture a video, whose frames come at their own size,
+            // and then nothing of it is left out.
+            if (i_mipmap == 0 && skip > 0 && LevelIsMp4(file, src_size, LZ4_compressed)) skip = 0;
+            const bool        dropped = i_mipmap < skip;
+            std::vector<char> result;
+            if (dropped) {
+                if (! file.SeekCur((idx)src_size)) {
+                    LOG_ERROR("tex '%s' mip[%zu]: cannot pass over %d bytes", name.c_str(), i_mipmap, src_size);
+                    return nullptr;
+                }
+            } else {
+                result.resize((usize)src_size);
+                file.Read(result.data(), (usize)src_size);
+            }
 
             std::vector<MipVariantPatch> variant_patches;
             if (HasVariantTrailers(img.header) &&
                 ! ReadMipVariantTrailer(file, name, i_mipmap, variant, variant_patches))
                 return nullptr;
+
+            // A level left out ends here.
+            if (dropped) {
+                full_bytes += LZ4_compressed ? (i64)decompressed_size : (i64)src_size;
+                continue;
+            }
+            if (i_mipmap == skip) {
+                mipmaps.resize(mipmap_count - skip);
+                img_slot.width  = mip_w;
+                img_slot.height = mip_h;
+            }
+            auto& mipmap  = mipmaps.at(i_mipmap - skip);
+            mipmap.width  = mip_w;
+            mipmap.height = mip_h;
 
             // is LZ4 compress
             if (LZ4_compressed) {
@@ -585,6 +644,8 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                     delete[] p;
                 });
                 mipmap.size = raw_size;
+                kept_bytes += raw_size;
+                full_bytes += raw_size;
                 continue;
             }
             // is image container
@@ -688,8 +749,15 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                 });
             }
             mipmap.size = src_size;
+            kept_bytes += src_size;
+            full_bytes += src_size;
         }
+        if (skip > 0) smaller = true;
     }
+    m_statTextures += 1;
+    m_statSmaller += smaller ? 1 : 0;
+    m_statKept += kept_bytes;
+    m_statFull += full_bytes;
     // Self-cache the parsed image.  Without this every subsequent Parse(name)
     // re-opens the .tex file, re-decompresses all mipmaps, and (worst case
     // for video textures) re-writes the full MP4 payload to /tmp/video_tex/.

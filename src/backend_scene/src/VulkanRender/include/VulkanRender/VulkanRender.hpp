@@ -5,6 +5,7 @@
 #include "Swapchain/ExSwapchain.hpp"
 #include "Type.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -36,6 +37,9 @@ public:
     void compileRenderGraph(Scene&, rg::RenderGraph&);
     // Logs VMA block/allocation statistics; no-op before the device exists.
     void logMemoryStats(const char* when) const;
+    // Device-local memory this renderer's allocator holds (textures, render
+    // targets, buffers); 0 before the device exists.
+    std::uint64_t deviceLocalBytes() const;
     void UpdateCameraFillMode(Scene&, wallpaper::FillMode);
 
     ExSwapchain* exSwapchain() const;

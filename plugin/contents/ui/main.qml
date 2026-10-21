@@ -80,6 +80,15 @@ Rectangle {
     // target size is fixed when the backend item is built, hence the reload
     // below rather than a live binding.
     property real   renderScale: wallpaper.configuration.RenderScale / 100.0
+    // Texture resolution of scene wallpapers (texture-quality patch, main.xml
+    // TextureQuality): Scene.qml hands it to SceneViewer.sceneQuality, which
+    // reloads the scene when it changes.
+    property int    textureQuality: wallpaper.configuration.TextureQuality ?? 0
+    // What this screen's scene said it holds after its first frame
+    // (SceneViewer.vramMiB), for VramSampler's footprint estimate.  Kept
+    // through a stop (the estimate is what a reload will need again); 0 once a
+    // video or web wallpaper loads, which report nothing.
+    property int    vramEstimateMiB: 0
     // The post-processing level the scene renderer gets: the wallpaper's own
     // `postprocessing` ("off", "low", "medium", "ultra", or "" for the scene's
     // own setting; true from older files is "ultra", false is not set),
@@ -325,6 +334,9 @@ Rectangle {
         background.vramWatch = comp.createObject(background, {
             enabled: Qt.binding(function() { return background.vramStopOn; })
         });
+        // A library from before the texture-quality patch has no estimate.
+        Common.setIfSupported(background.vramWatch, "VramSampler", "estimateMiB",
+                              Qt.binding(function() { return background.vramEstimateMiB; }));
     }
     function updateVramStop() {
         const w = background.vramWatch;
@@ -1419,6 +1431,7 @@ Rectangle {
             background._heldSource = "";
         }
         // choose backend
+        if (background.wallpaperType !== 'scene') background.vramEstimateMiB = 0;
         switch (background.wallpaperType) {
             case 'video':
                 if(background.videoBackend == Common.VideoBackend.Mpv && background.hasLib)
