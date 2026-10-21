@@ -457,16 +457,17 @@ set_tests_properties(tst_safewallpaperbridge PROPERTIES
 # API directly) — the whole point of the controller is being QML-callable, so
 # the test has to prove that through QML or it isn't testing the thing that
 # broke. Needs Qt6::Qml, which the other bridge test avoids on purpose to stay
-# a plain Core+Test unit; keep this one separately guarded.
-find_package(Qt6 COMPONENTS Qml QUIET)
-if(Qt6Qml_FOUND)
+# a plain Core+Test unit; keep this one separately guarded. Gui too: the
+# controller turns the media player's cover (a QImage) into the page's PNG.
+find_package(Qt6 COMPONENTS Qml Gui QUIET)
+if(Qt6Qml_FOUND AND Qt6Gui_FOUND)
     add_executable(tst_safewallpaperbridgecontroller
         tst_safewallpaperbridgecontroller.cpp
         ${WEKDE_SRC_DIR}/SafeWallpaperBridge.cpp
         ${WEKDE_SRC_DIR}/SafeWallpaperBridgeController.cpp
     )
     target_include_directories(tst_safewallpaperbridgecontroller PRIVATE ${WEKDE_SRC_DIR})
-    target_link_libraries(tst_safewallpaperbridgecontroller PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+    target_link_libraries(tst_safewallpaperbridgecontroller PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Test)
     if(MUTATION_TESTING)
         target_compile_options(tst_safewallpaperbridgecontroller PRIVATE
             -fpass-plugin=${MULL_PLUGIN_PATH}
@@ -480,7 +481,7 @@ if(Qt6Qml_FOUND)
     set_tests_properties(tst_safewallpaperbridgecontroller PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 else()
-    message(STATUS "Qt6Qml not found — skipping tst_safewallpaperbridgecontroller")
+    message(STATUS "Qt6Qml or Qt6Gui not found — skipping tst_safewallpaperbridgecontroller")
 endif()
 
 # ── QML disk-cache purge tests ────────────────────────────────────────────────

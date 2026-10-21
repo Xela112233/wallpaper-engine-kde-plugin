@@ -1,12 +1,13 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: Qt 6 QtWebEngine docs (type-import placeholder)
-// Last contract review: 2026-05-27
+// Last contract review: 2026-11-06
 
 // Stub — Chromium isn't going to live in qmltestrunner. Production code
 // (backend/QtWebView.qml) creates this and listens for loadingChanged etc.
 // We provide just enough surface to instantiate and call methods.
 import QtQuick
 Item {
+    id: view
     property url url: ""
     property string html: ""
     property string title: ""
@@ -57,8 +58,13 @@ Item {
         if (callback) callback({ url: "" });
     }
 
+    // insert() records what was injected (test-only), so a test can read
+    // the WallpaperEngineInit script's source.
+    property var insertedUserScripts: []
     property var userScripts: ({
-        insert: function(scripts) {},
+        insert: function(scripts) {
+            view.insertedUserScripts = view.insertedUserScripts.concat(scripts);
+        },
         clear:  function() {},
     })
 

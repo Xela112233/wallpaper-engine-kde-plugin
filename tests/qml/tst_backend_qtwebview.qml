@@ -76,6 +76,7 @@ TestCase {
     }
 
     SignalSpy { id: userPropsSpy;    signalName: "sigUserProperties"    }
+    SignalSpy { id: pausedSpy;       signalName: "sigPaused"            }
     SignalSpy { id: generalPropsSpy; signalName: "sigGeneralProperties" }
 
     // A separate, disposable QtWebView for the empty-workshopId case below --
@@ -881,6 +882,123 @@ TestCase {
             "the registered object must be webobj");
         verify(channel.registeredObjects[0] !== ctl,
             "the controller must never be registered on the WebChannel");
+    }
+
+    // ── Media integration (we-manager) ──────────────────────────────────────
+    // QtWebView.qml's own MprisMonitor, in a Loader behind MediaIntegration,
+    // forwards the player to the bridge's READ-only media properties.
+    function _findMprisLoader() {
+        return _findInner(c => c && typeof c.sourceComponent !== "undefined" &&
+                               typeof c.active !== "undefined");
+    }
+
+    function test_mediaIntegration_monitorForwardsThePlayerToTheBridge() {
+        background.mediaIntegration = true;
+        const loader = _findMprisLoader();
+        const webobj = _findWebobj();
+        verify(loader !== null && webobj !== null);
+        const mpris = loader.item;
+        verify(mpris !== null && typeof mpris.invokeShortcut === "function");
+        verify(mpris.engageCount >= 1, "the monitor must engage the D-Bus watch");
+
+        mpris.mediaAvailableChanged(true);
+        compare(webobj.mediaStatus, true);
+        mpris.playbackStateChanged(1);
+        compare(webobj.mediaPlayback, 1);
+        mpris.propertiesChanged("Song", "Band", "Album", "Album Band", "Rock", 200.0);
+        compare(webobj.mediaProperties.title, "Song");
+        compare(webobj.mediaProperties.artist, "Band");
+        compare(webobj.mediaProperties.albumTitle, "Album");
+        compare(webobj.mediaProperties.albumArtist, "Album Band");
+        compare(webobj.mediaProperties.genres, "Rock");
+        compare(webobj.mediaProperties.contentType, "music");
+        mpris.thumbnailChanged(true, [1, 0, 0], { fake: "cover" });
+        verify(Object.keys(webobj.mediaThumbnail).length > 0);
+        mpris.timelineChanged(3, 200, 1);
+        compare(webobj.mediaTimeline.position, 3);
+        compare(webobj.mediaTimeline.duration, 200);
+        // A track without a cover drops the previous one.
+        mpris.thumbnailChanged(false, [], null);
+        compare(Object.keys(webobj.mediaThumbnail).length, 0);
+
+        // The player quits: nothing of its track stays for a page that
+        // connects later.
+        mpris.mediaAvailableChanged(false);
+        compare(webobj.mediaStatus, false);
+        compare(webobj.mediaPlayback, 0);
+        compare(Object.keys(webobj.mediaProperties).length, 0);
+        compare(Object.keys(webobj.mediaTimeline).length, 0);
+    }
+
+    function test_mediaIntegration_offDestroysTheMonitorAndClears() {
+        background.mediaIntegration = true;
+        const loader = _findMprisLoader();
+        const webobj = _findWebobj();
+        loader.item.mediaAvailableChanged(true);
+        loader.item.propertiesChanged("Song", "Band", "", "", "", 1.0);
+        compare(webobj.mediaStatus, true);
+
+        background.mediaIntegration = false;
+        compare(loader.active, false);
+        compare(loader.item, null, "MediaIntegration off must destroy the monitor");
+        compare(webobj.mediaStatus, false);
+        compare(Object.keys(webobj.mediaProperties).length, 0);
+
+        background.mediaIntegration = true;
+        verify(loader.item !== null);
+        compare(loader.item.engageCount, 1, "a new monitor engages once");
+    }
+
+    // Wallpaper Engine's wallpaperPropertyListener.setPaused: paused is set
+    // at once on pause, before the 300 ms freeze, and cleared on resume.
+    function test_pause_setsPausedBeforeTheFreeze_andResumeClearsIt() {
+        const webobj = _findWebobj();
+        const wev    = _findWebEngineView();
+        web._isDiscarded = false;
+        web.play();
+        compare(webobj.paused, false);
+        pausedSpy.target = webobj;
+        pausedSpy.clear();
+        web.pause();
+        compare(webobj.paused, true, "the page must hear about the pause before the freeze");
+        compare(wev.lifecycleState, WebEngineView.LifecycleState.Active,
+            "still running: the freeze comes 300 ms later");
+        compare(pausedSpy.count, 1);
+        web.play();
+        compare(webobj.paused, false);
+        compare(pausedSpy.count, 2);
+    }
+
+    function test_resumeFromDiscarded_clearsPausedForTheReloadedPage() {
+        const webobj    = _findWebobj();
+        const wev       = _findWebEngineView();
+        const longTimer = _findLongPauseTimer();
+        web._isDiscarded = false;
+        wev.paused = true;
+        compare(webobj.paused, true);
+        longTimer.triggered();
+        compare(web._isDiscarded, true);
+        wev.paused = false;
+        compare(webobj.paused, false, "the reloaded page must read paused=false at connect");
+    }
+
+    // The injected WallpaperEngineInit script takes over the early stubs'
+    // queue and connects the media listeners and setPaused through the
+    // bridge. (Its behaviour in a real page runs in we-manager's test suite,
+    // against Qt WebEngine.)
+    function test_initScript_registersMediaListenersAndConnectsThem() {
+        const wev = _findWebEngineView();
+        const init = wev.insertedUserScripts.find(s => s.name === "WallpaperEngineInit");
+        verify(init !== undefined, "WallpaperEngineInit must be injected");
+        const src = init.sourceCode;
+        for (const k of ["Status", "Properties", "Thumbnail", "Playback", "Timeline"])
+            verify(src.indexOf("'" + k + "'") !== -1, k);
+        verify(src.indexOf("'wallpaperRegisterMedia' + k + 'Listener'") !== -1);
+        verify(src.indexOf("window.wallpaperRegisterAudioListener") !== -1);
+        verify(src.indexOf("M.queue") !== -1, "the early stubs' queue must be taken over");
+        verify(src.indexOf("window.__wekMedia.connect(wpeQml)") !== -1);
+        verify(src.indexOf("setPaused") !== -1);
+        verify(src.indexOf("PLAYBACK_PLAYING: 1") !== -1);
     }
 
     // As the outgoing layer of a wallpaper handoff, the backend must keep its

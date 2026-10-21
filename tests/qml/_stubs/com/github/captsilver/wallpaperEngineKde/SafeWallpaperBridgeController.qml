@@ -1,6 +1,6 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: src/SafeWallpaperBridgeController.hpp + .cpp
-// Last contract review: 2026-09-15
+// Last contract review: 2026-11-06
 
 import QtQuick
 // Test stub for the C++ SafeWallpaperBridgeController — the QML-only object
@@ -24,4 +24,24 @@ QtObject {
     function pushGeneralProperties(m) {
         if (bridge) bridge.pushGeneralProperties(m);
     }
+    // Media integration: the C++ builds Wallpaper Engine's event shapes
+    // (mediaPropertiesEvent, mediaTimelineEvent); the cover's PNG encoding
+    // has no QML counterpart, so the stub's thumbnail records what it was
+    // handed instead of a data: URL.
+    function pushMediaStatus(v)   { if (bridge) bridge.setMediaStatus(v); }
+    function pushMediaPlayback(v) { if (bridge) bridge.setMediaPlayback(v); }
+    function pushMediaProperties(title, artist, albumTitle, albumArtist, genres) {
+        if (bridge) bridge.setMediaProperties({
+            title: title, artist: artist, subTitle: "", albumTitle: albumTitle,
+            albumArtist: albumArtist, genres: genres, contentType: "music" });
+    }
+    function pushMediaThumbnail(hasThumbnail, colors, image) {
+        if (bridge) bridge.setMediaThumbnail(hasThumbnail
+            ? { thumbnail: "stub:" + JSON.stringify(image), colors: colors } : {});
+    }
+    function pushMediaTimeline(position, duration) {
+        if (bridge) bridge.setMediaTimeline({ position: position, duration: duration });
+    }
+    function clearMedia()   { if (bridge) bridge.clearMedia(); }
+    function pushPaused(v)  { if (bridge) bridge.setPaused(v); }
 }

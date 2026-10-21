@@ -59,6 +59,7 @@ Item {
         "HdrOutput":           false,
         "PostProcessing":      "",
         "SystemAudioCapture":  true,      // matches main.xml default
+        "MediaIntegration":    true,      // matches main.xml default
         "VideoFolderPath":     "",
         "ActivePlaylistId":    "",
         "CurrentItemIndex":    0,

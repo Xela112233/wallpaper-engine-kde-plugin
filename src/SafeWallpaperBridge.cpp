@@ -42,4 +42,50 @@ void SafeWallpaperBridge::setLoaded(bool v) {
     }
 }
 
+void SafeWallpaperBridge::setMediaStatus(bool enabled) {
+    if (m_mediaStatus == enabled) return;
+    m_mediaStatus = enabled;
+    emit sigMediaStatus();
+}
+
+void SafeWallpaperBridge::setMediaProperties(const QVariantMap& properties) {
+    if (m_mediaProperties == properties) return;
+    m_mediaProperties = properties;
+    emit sigMediaProperties();
+}
+
+void SafeWallpaperBridge::setMediaThumbnail(const QVariantMap& thumbnail) {
+    if (m_mediaThumbnail == thumbnail) return;
+    m_mediaThumbnail = thumbnail;
+    emit sigMediaThumbnail();
+}
+
+void SafeWallpaperBridge::setMediaPlayback(int state) {
+    if (m_mediaPlayback == state) return;
+    m_mediaPlayback = state;
+    emit sigMediaPlayback();
+}
+
+void SafeWallpaperBridge::setMediaTimeline(const QVariantMap& timeline) {
+    if (m_mediaTimeline == timeline) return;
+    m_mediaTimeline = timeline;
+    emit sigMediaTimeline();
+}
+
+void SafeWallpaperBridge::setPaused(bool paused) {
+    if (m_paused == paused) return;
+    m_paused = paused;
+    emit sigPaused();
+}
+
+void SafeWallpaperBridge::clearMedia() {
+    // Status first, so a page that hides its now-playing panel on
+    // enabled=false does so before the playback state drops to stopped.
+    setMediaStatus(false);
+    setMediaPlayback(0);
+    setMediaProperties({});
+    setMediaThumbnail({});
+    setMediaTimeline({});
+}
+
 } // namespace wekde

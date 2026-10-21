@@ -61,6 +61,10 @@ Rectangle {
     readonly property bool reducedMotion: Kirigami.Settings.hasOwnProperty('hasReducedAnimations')
                                           ? Kirigami.Settings.hasReducedAnimations
                                           : false
+    // Media integration (we-manager): the media player's track, cover and
+    // playback state for scene scripts and web wallpapers (Scene.qml,
+    // QtWebView.qml); off, neither backend watches the player.
+    property bool   mediaIntegration: wallpaper.configuration.MediaIntegration
 
     
     property var curOpt: ({})

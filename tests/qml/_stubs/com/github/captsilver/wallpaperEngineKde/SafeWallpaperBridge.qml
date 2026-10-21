@@ -1,6 +1,6 @@
 // Test stub — see tests/qml/_stubs/README.md for contract.
 // Real source: src/SafeWallpaperBridge.hpp + src/SafeWallpaperBridge.cpp
-// Last contract review: 2026-05-27
+// Last contract review: 2026-11-06
 
 import QtQuick
 // Test stub for the C++ SafeWallpaperBridge. Mirrors the production surface:
@@ -16,6 +16,12 @@ import QtQuick
 //   * loadedChanged is auto-emitted by the QML engine for the `loaded`
 //     property; setLoaded routes through it + fires sigInit once per
 //     loaded document.
+//   * Media integration (we-manager): READ-only mediaStatus /
+//     mediaProperties / mediaThumbnail / mediaPlayback / mediaTimeline /
+//     paused, whose C++ NOTIFY signals are the argument-less sigMedia* /
+//     sigPaused. QML names a property's own notify <name>Changed, so the
+//     sig* signals are declared here and fired by the setters, which emit
+//     only on a change, as the C++ ones do.
 QtObject {
     id: bridge
 
@@ -34,10 +40,44 @@ QtObject {
     readonly property var  userProperties:    _userProperties
     readonly property bool loaded:            _loaded
 
+    property bool _mediaStatus:     false
+    property var  _mediaProperties: ({})
+    property var  _mediaThumbnail:  ({})
+    property int  _mediaPlayback:   0
+    property var  _mediaTimeline:   ({})
+    property bool _paused:          false
+    readonly property bool mediaStatus:     _mediaStatus
+    readonly property var  mediaProperties: _mediaProperties
+    readonly property var  mediaThumbnail:  _mediaThumbnail
+    readonly property int  mediaPlayback:   _mediaPlayback
+    readonly property var  mediaTimeline:   _mediaTimeline
+    readonly property bool paused:          _paused
+
     signal sigGeneralProperties(var properties)
     signal sigUserProperties(var properties)
     signal sigAudio(var samples)
     signal sigInit()
+    signal sigMediaStatus()
+    signal sigMediaProperties()
+    signal sigMediaThumbnail()
+    signal sigMediaPlayback()
+    signal sigMediaTimeline()
+    signal sigPaused()
+
+    function _same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+    function setMediaStatus(v)     { if (_mediaStatus !== v) { _mediaStatus = v; sigMediaStatus(); } }
+    function setMediaProperties(m) { if (!_same(_mediaProperties, m)) { _mediaProperties = m; sigMediaProperties(); } }
+    function setMediaThumbnail(m)  { if (!_same(_mediaThumbnail, m)) { _mediaThumbnail = m; sigMediaThumbnail(); } }
+    function setMediaPlayback(v)   { if (_mediaPlayback !== v) { _mediaPlayback = v; sigMediaPlayback(); } }
+    function setMediaTimeline(m)   { if (!_same(_mediaTimeline, m)) { _mediaTimeline = m; sigMediaTimeline(); } }
+    function setPaused(v)          { if (_paused !== v) { _paused = v; sigPaused(); } }
+    function clearMedia() {
+        setMediaStatus(false);
+        setMediaPlayback(0);
+        setMediaProperties({});
+        setMediaThumbnail({});
+        setMediaTimeline({});
+    }
 
     function pushGeneralProperties(m) {
         _generalProperties = m;

@@ -1,10 +1,34 @@
 #pragma once
 #include "SafeWallpaperBridge.hpp"
+#include <QImage>
 #include <QObject>
+#include <QVariantList>
 #include <QVariantMap>
 
 namespace wekde
 {
+
+// Wallpaper Engine's web media events, built from MprisMonitor's signals
+// (we-manager media integration). Pure helpers, testable without QML.
+//
+// {title, artist, subTitle, albumTitle, albumArtist, genres, contentType}:
+// MPRIS has no subtitle and no content type, so subTitle is empty and
+// contentType is "music".
+QVariantMap mediaPropertiesEvent(const QString& title, const QString& artist,
+                                 const QString& albumTitle, const QString& albumArtist,
+                                 const QString& genres);
+// {thumbnail, primaryColor, secondaryColor, tertiaryColor, textColor,
+// highContrastColor} from the cover and MprisMonitor's 15 colour floats
+// (extractDominantColors: primary, secondary, tertiary, black-or-white,
+// most distant). thumbnail is a data:image/png;base64 URL of the cover
+// scaled down to at most 256x256; colours are CSS "rgb(r, g, b)" strings.
+// highContrastColor is the black or white one, as Wallpaper Engine documents
+// it; textColor is the most distant colour when it reads on the primary
+// colour (WCAG contrast 4.5:1), else the black or white one. Empty for a
+// null image or a PNG encoding failure.
+QVariantMap mediaThumbnailEvent(const QVariantList& colors, const QImage& image);
+// {position, duration}, in seconds.
+QVariantMap mediaTimelineEvent(double position, double duration);
 
 // QML-only forwarder onto SafeWallpaperBridge's plain-public setters.
 //
@@ -41,6 +65,21 @@ public:
     Q_INVOKABLE void setLoaded(bool loaded);
     Q_INVOKABLE void pushUserProperties(const QVariantMap& properties);
     Q_INVOKABLE void pushGeneralProperties(const QVariantMap& properties);
+    // Media integration: QtWebView.qml forwards MprisMonitor's signals here,
+    // in the shapes Wallpaper Engine's web listeners take (helpers above).
+    // A thumbnail without a cover clears the bridge's, so a page that
+    // connects later is not handed the previous track's art.
+    Q_INVOKABLE void pushMediaStatus(bool enabled);
+    Q_INVOKABLE void pushMediaPlayback(int state);
+    Q_INVOKABLE void pushMediaProperties(const QString& title, const QString& artist,
+                                         const QString& albumTitle, const QString& albumArtist,
+                                         const QString& genres);
+    Q_INVOKABLE void pushMediaThumbnail(bool hasThumbnail, const QVariantList& colors,
+                                        const QImage& image);
+    Q_INVOKABLE void pushMediaTimeline(double position, double duration);
+    Q_INVOKABLE void clearMedia();
+    // Wallpaper Engine's wallpaperPropertyListener.setPaused.
+    Q_INVOKABLE void pushPaused(bool paused);
 
 signals:
     void bridgeChanged();

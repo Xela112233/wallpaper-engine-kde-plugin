@@ -40,6 +40,7 @@ Flickable {
     property alias cfg_ScreenSaverPolicy: cbScreenSaverPolicy.currentIndex
     property alias cfg_HdrOutput: ckbox_hdrOutput.checked
     property alias cfg_SystemAudioCapture: ckbox_systemAudioCapture.checked
+    property alias cfg_MediaIntegration: ckbox_mediaIntegration.checked
     // Color drawn behind the wallpaper. Visible as letterbox/pillarbox
     // bars when display mode is "Keep Aspect Ratio" and the wallpaper
     // aspect doesn't match the screen aspect. Stored as a Qt color
@@ -431,6 +432,25 @@ Flickable {
                     Text {
                         Layout.fillWidth: true
                         text: i18nc("@info system audio capture help text", "When enabled, audio-reactive wallpapers respond to all system audio (music, videos, games). When disabled, only the wallpaper's own background music is used.")
+                        color: Kirigami.Theme.disabledTextColor
+                        wrapMode: Text.WordWrap
+                        font.italic: true
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    }
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Media Integration")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/volume-up.svg'
+                actor: Switch {
+                    id: ckbox_mediaIntegration
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        text: i18nc("@info media integration help text", "Lets scene and web wallpapers show what your media player is playing: title, artist, album, cover, playback state and position. Works with any player that supports MPRIS (Spotify, browsers, most desktop players).")
                         color: Kirigami.Theme.disabledTextColor
                         wrapMode: Text.WordWrap
                         font.italic: true

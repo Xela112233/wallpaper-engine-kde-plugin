@@ -35,33 +35,38 @@ Item{
     // player object. SceneScript can also dispatch transport controls
     // via engine.openUserShortcut("bplaypause"/"bnext"/...).
     //
-    // Web (QtWebView.qml) and Video (QtMultimedia.qml/Mpv.qml) backends
-    // do NOT currently wire this up — there's no QWebChannel proxy for
-    // MprisMonitor on the web side, and video wallpapers have no script
-    // surface to dispatch media keys from. If you need media-control
-    // dispatch from web, expose mprisMonitor.invokeShortcut to the page
-    // via WebAudioBridge-style relay (the asymmetry is intentional
-    // today, not a bug — but worth noting since users may expect parity).
-    MprisMonitor {
-        id: mprisMonitor
-        // Engage the D-Bus watch + position poll so signals fire for
-        // scene-script subscribers. Other backends skip the cost
-        // automatically (they never instantiate MprisMonitor).
-        Component.onCompleted: engage()
-        onPlaybackStateChanged: function(state) {
-            player.mediaPlaybackChanged(state);
-        }
-        onPropertiesChanged: function(title, artist, albumTitle, albumArtist, genres, duration) {
-            player.mediaPropertiesChanged(title, artist, albumTitle, albumArtist, genres, duration);
-        }
-        onThumbnailChanged: function(hasThumbnail, colors, image) {
-            player.mediaThumbnailChanged(hasThumbnail, colors, image);
-        }
-        onTimelineChanged: function(position, duration, state) {
-            player.mediaTimelineChanged(position, duration, state);
-        }
-        onMediaAvailableChanged: function(available) {
-            player.mediaStatusChanged(available);
+    // Web wallpapers get the same data through QtWebView.qml's own monitor
+    // and the bridge's media properties (we-manager media integration).
+    // Video wallpapers have no script surface to dispatch media keys from.
+    //
+    // Behind the MediaIntegration setting (we-manager). MprisMonitor has no
+    // way back from engage(), so switching it off destroys the monitor, and
+    // the scene script hears mediaStatusChanged(false), as when the player
+    // quits. Its media shortcuts (engine.openUserShortcut) then do nothing.
+    Loader {
+        id: mprisLoader
+        active: background.mediaIntegration
+        onActiveChanged: if (!active) player.mediaStatusChanged(false)
+        sourceComponent: MprisMonitor {
+            // Engage the D-Bus watch + position poll so signals fire for
+            // scene-script subscribers. Video backends skip the cost
+            // automatically (they never instantiate MprisMonitor).
+            Component.onCompleted: engage()
+            onPlaybackStateChanged: function(state) {
+                player.mediaPlaybackChanged(state);
+            }
+            onPropertiesChanged: function(title, artist, albumTitle, albumArtist, genres, duration) {
+                player.mediaPropertiesChanged(title, artist, albumTitle, albumArtist, genres, duration);
+            }
+            onThumbnailChanged: function(hasThumbnail, colors, image) {
+                player.mediaThumbnailChanged(hasThumbnail, colors, image);
+            }
+            onTimelineChanged: function(position, duration, state) {
+                player.mediaTimelineChanged(position, duration, state);
+            }
+            onMediaAvailableChanged: function(available) {
+                player.mediaStatusChanged(available);
+            }
         }
     }
 
@@ -137,7 +142,7 @@ Item{
             // the `userShortcut` scene-bus event so wallpapers can handle
             // their own custom shortcuts in-script.
             function onUserShortcutRequested(name) {
-                mprisMonitor.invokeShortcut(name);
+                if (mprisLoader.item) mprisLoader.item.invokeShortcut(name);
             }
             // Transient overlay for video-decode failures. Deliberately NOT
             // routed through loadInfoShow: the rest of the scene keeps

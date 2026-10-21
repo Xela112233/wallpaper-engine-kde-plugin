@@ -154,6 +154,10 @@
       <label>System Audio Capture</label>
       <default>true</default>
     </entry>
+    <entry name="MediaIntegration" type="Bool">
+      <label>Media integration: scene and web wallpapers get the media player's title, artist, album, cover, playback state and position over MPRIS</label>
+      <default>true</default>
+    </entry>
     <entry name="VideoFolderPath" type="Path">
       <label>Plain video wallpapers folder</label>
       <default></default>

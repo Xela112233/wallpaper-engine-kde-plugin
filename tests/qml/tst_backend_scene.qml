@@ -81,14 +81,33 @@ TestCase {
     }
 
     // ── MprisMonitor signal handlers ──────────────────────────────────────────
+    // The monitor sits in a Loader behind MediaIntegration (we-manager), so
+    // a Loader's item counts as a child here.
     function _findChildByMethodName(parent, method) {
         const buckets = [parent.children || [], parent.data || []];
         for (const b of buckets) {
             for (let i = 0; i < b.length; i++) {
                 if (b[i] && typeof b[i][method] === "function") return b[i];
+                if (b[i] && b[i].item && typeof b[i].item[method] === "function") return b[i].item;
             }
         }
         return null;
+    }
+
+    function test_mediaIntegrationOff_destroysTheMonitor_andTellsTheScript() {
+        const player = _findScenePlayer();
+        statusSpy.target = player;
+        statusSpy.clear();
+        background.mediaIntegration = false;
+        compare(_findChildByMethodName(scene, "invokeShortcut"), null);
+        compare(statusSpy.count, 1);
+        compare(statusSpy.signalArguments[0][0], false);
+        // Media shortcuts have no player to reach; nothing throws.
+        player.userShortcutRequested("bplay");
+        background.mediaIntegration = true;
+        const mpris = _findChildByMethodName(scene, "invokeShortcut");
+        verify(mpris !== null);
+        compare(mpris.engageCount, 1);
     }
 
     function test_mprisPlaybackStateForwardsToPlayer() {

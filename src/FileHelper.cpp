@@ -300,6 +300,27 @@ QString FileHelper::patchedHtml(const QString& path) {
                        "})();"
                        "</script>");
 
+    // Media and audio listener stubs (we-manager media integration).
+    // Wallpaper Engine tells web wallpapers to register their listeners at
+    // once, from top-level script; the functions that connect them to the
+    // bridge only arrive with QtWebView.qml's Deferred WallpaperEngineInit
+    // script, after the page has run. Until then these remember what the
+    // page registered (window.__wekMedia.queue), and the Deferred script
+    // connects each one. Only single quotes inside: the we-manager test
+    // reads this literal back out of the source.
+    static const QString mediaStubs =
+        QStringLiteral("<script>"
+                       "(function(){"
+                       "var M=window.__wekMedia=window.__wekMedia||{queue:[]};"
+                       "window.wallpaperMediaIntegration=window.wallpaperMediaIntegration||"
+                       "{PLAYBACK_STOPPED:0,PLAYBACK_PLAYING:1,PLAYBACK_PAUSED:2};"
+                       "['Status','Properties','Thumbnail','Playback','Timeline'].forEach(function(k){"
+                       "window['wallpaperRegisterMedia'+k+'Listener']=function(f){M.queue.push([k,f]);};"
+                       "});"
+                       "window.wallpaperRegisterAudioListener=function(f){M.queue.push(['Audio',f]);};"
+                       "})();"
+                       "</script>");
+
     // Insert after the real <head ...> tag so the shim runs before any other
     // scripts. Attribute-tolerant + comment-aware (untrusted third-party web
     // wallpapers ship arbitrary HTML).
@@ -315,7 +336,7 @@ QString FileHelper::patchedHtml(const QString& path) {
         qWarning() << "FileHelper::patchedHtml: no clean <head>; inserting shim at offset" << pos
                    << "(after <html>/doctype or prepend)";
     }
-    html.insert(pos, patch);
+    html.insert(pos, patch + mediaStubs);
 
     return html;
 }

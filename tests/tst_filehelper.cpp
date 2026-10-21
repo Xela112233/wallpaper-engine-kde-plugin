@@ -1399,6 +1399,30 @@ private slots:
         QVERIFY(result.contains("<body></body>"));
     }
 
+    // Wallpaper Engine's web media and audio registration functions exist
+    // before the page's own scripts run, so a wallpaper registering at top
+    // level does not throw; they queue until QtWebView.qml connects them.
+    void patchedHtml_definesListenerStubsBeforePageScripts() {
+        QString path = m_tmp.filePath("media.html");
+        QFile   f(path);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("<html><head><script>wallpaperRegisterMediaPropertiesListener(function(){});"
+                "</script></head><body></body></html>");
+        f.close();
+
+        FileHelper    helper;
+        const QString result = helper.patchedHtml(path);
+        const int     stubs  = result.indexOf("wallpaperRegisterMedia'+k+'Listener");
+        const int     page   = result.indexOf("wallpaperRegisterMediaPropertiesListener(function");
+        QVERIFY(stubs > 0);
+        QVERIFY(page > stubs);
+        QVERIFY(result.contains("window.wallpaperRegisterAudioListener="));
+        QVERIFY(result.contains("PLAYBACK_PLAYING:1"));
+        // The History/error shim still comes first, right after <head>.
+        QCOMPARE(result.indexOf("<script>"), result.indexOf("<head>") + 6);
+        QVERIFY(result.indexOf("history.replaceState") < stubs);
+    }
+
     void patchedHtml_stripsFileUrlPrefix() {
         const QString path = m_tmp.filePath("urlform.html");
         QFile         f(path);

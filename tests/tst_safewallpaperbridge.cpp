@@ -6,6 +6,9 @@
 //   * An init signal: sigInit (fired by QML on LoadSucceededStatus, once per
 //     document; replaces the page-injected wpeQml.loaded = true).
 //   * No Q_INVOKABLE methods (web JS receives signals only).
+//   * Media integration and pause state (we-manager): READ-only properties
+//     whose NOTIFY is an argument-less sig* signal, set only through plain
+//     methods, each emitting only on a change.
 //
 // Real-world JS-write attempts are exercised in the QML integration test
 // (tests/qml/tst_backend_qtwebview.qml) by re-targeting the inline-test
@@ -117,6 +120,94 @@ private slots:
         // Compile-time pin: signal arg must round-trip via QList<double>.
         static_assert(
             std::is_same_v<decltype(std::declval<SafeWallpaperBridge>().sigAudio(samples)), void>);
+    }
+
+    void media_defaults_areStoppedAndEmpty() {
+        SafeWallpaperBridge b;
+        QCOMPARE(b.mediaStatus(), false);
+        QCOMPARE(b.mediaPlayback(), 0);
+        QVERIFY(b.mediaProperties().isEmpty());
+        QVERIFY(b.mediaThumbnail().isEmpty());
+        QVERIFY(b.mediaTimeline().isEmpty());
+        QCOMPARE(b.paused(), false);
+    }
+
+    // Each setter emits its NOTIFY once per change and never for the same
+    // value: the 1 Hz position poll repeats a paused track's position, and a
+    // repeat must not cost the page another channel message.
+    void media_settersEmitOnlyOnChange() {
+        SafeWallpaperBridge b;
+        QSignalSpy          status(&b, &SafeWallpaperBridge::sigMediaStatus);
+        QSignalSpy          props(&b, &SafeWallpaperBridge::sigMediaProperties);
+        QSignalSpy          thumb(&b, &SafeWallpaperBridge::sigMediaThumbnail);
+        QSignalSpy          playback(&b, &SafeWallpaperBridge::sigMediaPlayback);
+        QSignalSpy          timeline(&b, &SafeWallpaperBridge::sigMediaTimeline);
+        QSignalSpy          paused(&b, &SafeWallpaperBridge::sigPaused);
+
+        b.setMediaStatus(true);
+        b.setMediaStatus(true);
+        b.setMediaProperties({ { "title", "T" } });
+        b.setMediaProperties({ { "title", "T" } });
+        b.setMediaThumbnail({ { "thumbnail", "data:," } });
+        b.setMediaPlayback(1);
+        b.setMediaPlayback(1);
+        b.setMediaTimeline({ { "position", 1.0 }, { "duration", 9.0 } });
+        b.setMediaTimeline({ { "position", 1.0 }, { "duration", 9.0 } });
+        b.setMediaTimeline({ { "position", 2.0 }, { "duration", 9.0 } });
+        b.setPaused(true);
+        b.setPaused(true);
+
+        QCOMPARE(status.count(), 1);
+        QCOMPARE(props.count(), 1);
+        QCOMPARE(thumb.count(), 1);
+        QCOMPARE(playback.count(), 1);
+        QCOMPARE(timeline.count(), 2);
+        QCOMPARE(paused.count(), 1);
+        QCOMPARE(b.mediaProperties().value("title").toString(), QString("T"));
+        QCOMPARE(b.mediaTimeline().value("position").toDouble(), 2.0);
+        QCOMPARE(b.mediaPlayback(), 1);
+        QCOMPARE(b.paused(), true);
+
+        // The player went away: nothing of its track is left for a page
+        // that connects later, and each field says so once.
+        b.clearMedia();
+        QCOMPARE(b.mediaStatus(), false);
+        QCOMPARE(b.mediaPlayback(), 0);
+        QVERIFY(b.mediaProperties().isEmpty());
+        QVERIFY(b.mediaThumbnail().isEmpty());
+        QVERIFY(b.mediaTimeline().isEmpty());
+        QCOMPARE(status.count(), 2);
+        QCOMPARE(props.count(), 2);
+        QCOMPARE(thumb.count(), 2);
+        QCOMPARE(playback.count(), 2);
+        QCOMPARE(timeline.count(), 3);
+        // Pausing belongs to the view, not to the player.
+        QCOMPARE(b.paused(), true);
+        b.clearMedia();
+        QCOMPARE(status.count(), 2);
+        QCOMPARE(timeline.count(), 3);
+    }
+
+    // The media properties' NOTIFY signals are the sig* names the injected
+    // page script connects to, and carry no argument: QWebChannel sends a
+    // NOTIFY's arguments next to the property values, so an argument would
+    // send each cover twice.
+    void media_notifySignalsAreArgumentLessSigSignals() {
+        SafeWallpaperBridge b;
+        const QMetaObject*  mo = b.metaObject();
+        const QList<QPair<QByteArray, QByteArray>> expected {
+            { "mediaStatus", "sigMediaStatus" },       { "mediaProperties", "sigMediaProperties" },
+            { "mediaThumbnail", "sigMediaThumbnail" }, { "mediaPlayback", "sigMediaPlayback" },
+            { "mediaTimeline", "sigMediaTimeline" },   { "paused", "sigPaused" },
+        };
+        for (const auto& [prop, sig] : expected) {
+            const int i = mo->indexOfProperty(prop.constData());
+            QVERIFY2(i >= 0, prop.constData());
+            const QMetaProperty p = mo->property(i);
+            QVERIFY2(p.hasNotifySignal(), prop.constData());
+            QCOMPARE(p.notifySignal().name(), sig);
+            QCOMPARE(p.notifySignal().parameterCount(), 0);
+        }
     }
 
     // Regression: every Q_PROPERTY on the bridge must be READ-only. A WRITE

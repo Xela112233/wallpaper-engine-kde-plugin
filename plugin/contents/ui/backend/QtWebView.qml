@@ -221,6 +221,37 @@ Item {
         registeredObjects: [webobj]
     }
 
+    // Media integration (we-manager): the media player's track, cover,
+    // playback state and position for Wallpaper Engine's web media listeners
+    // (wallpaperRegisterMedia*Listener, defined by the WallpaperEngineInit
+    // script below), as Scene.qml does for scene scripts. The page reads
+    // them from webobj's READ-only media* properties. MprisMonitor has no
+    // way back from engage(), so switching MediaIntegration off destroys it.
+    Loader {
+        id: mprisLoader
+        active: background.mediaIntegration
+        onActiveChanged: if (!active) webobjCtl.clearMedia()
+        sourceComponent: MprisMonitor {
+            Component.onCompleted: engage()
+            onMediaAvailableChanged: function(available) {
+                if (available) webobjCtl.pushMediaStatus(true);
+                else webobjCtl.clearMedia();
+            }
+            onPlaybackStateChanged: function(state) {
+                webobjCtl.pushMediaPlayback(state);
+            }
+            onPropertiesChanged: function(title, artist, albumTitle, albumArtist, genres, duration) {
+                webobjCtl.pushMediaProperties(title, artist, albumTitle, albumArtist, genres);
+            }
+            onThumbnailChanged: function(hasThumbnail, colors, image) {
+                webobjCtl.pushMediaThumbnail(hasThumbnail, colors, image);
+            }
+            onTimelineChanged: function(position, duration, state) {
+                webobjCtl.pushMediaTimeline(position, duration);
+            }
+        }
+    }
+
     // One browser context per wallpaper, keyed on its workshop id: its own
     // storage directory, its own file:// gate. That used to mean one
     // WebEngineProfile declared inline here per QtWebView instance -- but Qt
@@ -415,6 +446,9 @@ Item {
             if(paused) {
                 pauseTimer.start();         // Frozen after 300 ms.
                 longPauseTimer.start();     // Discarded after longPauseMs.
+                // wallpaperPropertyListener.setPaused(true) (we-manager):
+                // told now, so it reaches the page before the freeze.
+                webItem.tellPaused(true);
             }
             else {
                 longPauseTimer.stop();
@@ -425,12 +459,18 @@ Item {
                     // the wallpaperProfile is independent).
                     web.visible = true;
                     pauseImage.visible = false;
+                    // The reloaded page starts running; it reads paused
+                    // false when its channel connects and is told nothing.
+                    webItem.tellPaused(false);
                     webItem.loadWallpaper();
                 }
                 else {
                     web.visible = true;
                     web.lifecycleState = WebEngineView.LifecycleState.Active;
                     pauseImage.visible = false;
+                    // setPaused(false) once the page runs again: a frozen
+                    // page would only get it on the thaw anyway.
+                    webItem.tellPaused(false);
                 }
             }
         }
@@ -464,20 +504,96 @@ Item {
             // Single Deferred script: Audio listener + QWebChannel + channel init
             // DocumentCreation injection doesn't work for dynamically inserted
             // sourceCode scripts on this Qt build, so everything goes in Deferred.
+            //
+            // Listener registration (we-manager media integration): Wallpaper
+            // Engine's wallpaperRegisterAudioListener and the five
+            // wallpaperRegisterMedia*Listener functions. A page that registers
+            // from its top-level script reaches FileHelper::patchedHtml's
+            // early stubs, which queue in window.__wekMedia.queue; this takes
+            // the queue over. Once the channel connects, each media listener
+            // gets the bridge's current state (QWebChannel's init message
+            // carries the property values), then every change (the media*
+            // properties' sig* NOTIFY signals; the property is read when the
+            // signal fires). Events are Wallpaper Engine's shapes: status
+            // {enabled}, properties, thumbnail, playback {state} and timeline
+            // {position, duration}; a track with no cover or no position says
+            // nothing for those two. A listener registered after the connect
+            // gets the current state on the next turn.
             userScripts.insert([
                 {
                     worldId: WebEngineScript.MainWorld,
                     injectionPoint: WebEngineScript.Deferred,
                     name: "WallpaperEngineInit",
                     sourceCode: `
-                        // Audio listener registration (available for wallpapers that
-                        // call wallpaperRegisterAudioListener before QWebChannel connects)
-                        window.wallpaperRegisterAudioListener = function(listener) {
-                            if(window.wpeQml)
-                                window.wpeQml.sigAudio.connect(listener);
-                            else
-                                window.wallpaperRAed = listener;
-                        };
+                        (function() {
+                            var M = window.__wekMedia = window.__wekMedia || {queue: []};
+                            window.wallpaperMediaIntegration = window.wallpaperMediaIntegration
+                                || {PLAYBACK_STOPPED: 0, PLAYBACK_PLAYING: 1, PLAYBACK_PAUSED: 2};
+                            var kinds = ['Status', 'Properties', 'Thumbnail', 'Playback', 'Timeline'];
+                            var listeners = {Audio: []};
+                            var last = {};
+                            kinds.forEach(function(k) { listeners[k] = []; });
+                            function copy(o) {
+                                return o && Object.keys(o).length ? JSON.parse(JSON.stringify(o)) : null;
+                            }
+                            function eventFor(k, b) {
+                                if (k === 'Status') return {enabled: !!b.mediaStatus};
+                                if (k === 'Playback') return {state: b.mediaPlayback | 0};
+                                return copy(b['media' + k]);
+                            }
+                            function call(fn, ev) {
+                                try { fn(ev); }
+                                catch (e) { console.error('[WEK-page UNCAUGHT] media listener: ' + ((e && e.stack) || e)); }
+                            }
+                            function tell(k, fn) {
+                                var ev = M.bridge && eventFor(k, M.bridge);
+                                if (ev) call(fn, ev);
+                            }
+                            function register(k, fn) {
+                                if (typeof fn !== 'function' || !listeners[k]) return;
+                                listeners[k].push(fn);
+                                if (!M.bridge) return;
+                                if (k === 'Audio') M.bridge.sigAudio.connect(fn);
+                                else setTimeout(function() { tell(k, fn); }, 0);
+                            }
+                            kinds.forEach(function(k) {
+                                window['wallpaperRegisterMedia' + k + 'Listener'] = function(fn) { register(k, fn); };
+                            });
+                            window.wallpaperRegisterAudioListener = function(fn) { register('Audio', fn); };
+                            (M.queue || []).forEach(function(q) { register(q[0], q[1]); });
+                            M.queue = [];
+                            function setPaused(b) {
+                                var l = window.wallpaperPropertyListener;
+                                if (l && typeof l.setPaused === 'function')
+                                    call(function() { l.setPaused(!!b.paused); });
+                            }
+                            M.connect = function(b) {
+                                M.bridge = b;
+                                listeners.Audio.forEach(function(fn) { b.sigAudio.connect(fn); });
+                                // A bridge from a plugin library older than
+                                // this script (plasmashell keeps the one it
+                                // started with across an upgrade) has no media
+                                // signals and no sigPaused: those listeners hear
+                                // nothing, and the property listeners below
+                                // still connect.
+                                kinds.forEach(function(k) {
+                                    if (!b['sigMedia' + k]) return;
+                                    // A change is told once, even if the channel
+                                    // reports it twice.
+                                    b['sigMedia' + k].connect(function() {
+                                        var text = JSON.stringify(eventFor(k, b));
+                                        if (text === last[k]) return;
+                                        last[k] = text;
+                                        listeners[k].forEach(function(fn) { tell(k, fn); });
+                                    });
+                                    last[k] = JSON.stringify(eventFor(k, b));
+                                    listeners[k].forEach(function(fn) { tell(k, fn); });
+                                });
+                                if (!b.sigPaused) return;
+                                b.sigPaused.connect(function() { setPaused(b); });
+                                if (b.paused) setPaused(b);
+                            };
+                        })();
                     ` + webItem.qwebChannelJs + `
                         console.log('[WEK] Deferred script running, QWebChannel=' + typeof QWebChannel);
                         new QWebChannel(qt.webChannelTransport, function(channel) {
@@ -485,8 +601,8 @@ Item {
                             window.wpeQml = channel.objects.wpeQml;
                             var wpeQml = window.wpeQml;
                             var propertyListener = window.wallpaperPropertyListener;
-                            if(window.wallpaperRAed)
-                                wpeQml.sigAudio.connect(window.wallpaperRAed);
+                            // Audio and media listeners, and setPaused (above).
+                            window.__wekMedia.connect(wpeQml);
                             if(propertyListener) {
                                 if(propertyListener.applyGeneralProperties)
                                     wpeQml.sigGeneralProperties.connect(propertyListener.applyGeneralProperties);
@@ -556,6 +672,22 @@ Item {
     }
     Component.onCompleted: {
     //target: web.children[0] ? web.children[0] : null
+    }
+
+    // The page's setPaused, through the bridge.  After an RPM upgrade inside
+    // a session, plasmashell keeps the plugin library it started with, while
+    // a QtWebView.qml it had not loaded yet comes from disk: a library from
+    // before the web-media patch has no pushPaused.  Then the page is not
+    // told, the call is named in the log, and the pause goes on (the freeze
+    // and the discard after longPauseMs, the reload after a discard).
+    function tellPaused(p) {
+        if (typeof webobjCtl.pushPaused === "function") {
+            webobjCtl.pushPaused(p);
+        } else {
+            console.warn("[WEK] SafeWallpaperBridgeController.pushPaused is missing (the plugin library "
+                         + "plasmashell runs is older than this QML; log out and in again): the page is "
+                         + "not told setPaused(" + p + ")");
+        }
     }
 
     function play(){
