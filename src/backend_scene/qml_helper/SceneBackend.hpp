@@ -195,6 +195,11 @@ public:
     // handlers (cursorDown/cursorMove/cursorUp) fire end-to-end.
     Q_INVOKABLE void simulateDragAt(double x1, double y1, double x2, double y2);
     Q_INVOKABLE void requestScreenshot(const QString& path);
+    // The next rendered frame written to `path` in the format its extension
+    // names (PNG, JPEG, ...): requestScreenshot's PPM, converted.  Returns
+    // false when no scene is loaded; frameSaved reports the outcome.  Waits
+    // at most 5 s for a frame (a paused scene draws none).
+    Q_INVOKABLE bool saveFrame(const QString& path);
     Q_INVOKABLE void requestScreenshotAtFrame(const QString& path, qint64 frame);
     // The render thread's frame counter, or -1 with no scene.
     Q_INVOKABLE qint64 frameIndex() const;
@@ -376,6 +381,8 @@ signals:
     void userPropertiesChanged();
     void nativeAspectRatioChanged();
     void firstFrame();
+    // saveFrame's outcome: ok, or why not (the path in both).
+    void frameSaved(const QString& path, bool ok, const QString& error);
     // Emitted when SceneScript calls engine.openUserShortcut(name).  The main
     // plugin's Scene.qml maps common media-control names to MPRIS actions;
     // standalone sceneviewer has no listener, so the action surfaces only

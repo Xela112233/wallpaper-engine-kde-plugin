@@ -51,7 +51,7 @@ void TestWekShortcuts::registersExpectedActions() {
         QStringLiteral("next_wallpaper"),   QStringLiteral("previous_wallpaper"),
         QStringLiteral("toggle_pause"),     QStringLiteral("toggle_mute"),
         QStringLiteral("reload_wallpaper"), QStringLiteral("open_library"),
-        QStringLiteral("toggle_wallpaper_keyboard")
+        QStringLiteral("toggle_wallpaper_keyboard"), QStringLiteral("save_screenshot")
     };
     for (const auto& id : expectedIds) {
         QVERIFY2(coll->action(id) != nullptr, qPrintable(QStringLiteral("missing action: ") + id));
@@ -115,6 +115,7 @@ void TestWekShortcuts::dispatchTable_matchesExpectedDBusMembers() {
         { QStringLiteral("toggle_mute"), QStringLiteral("ToggleMute") },
         { QStringLiteral("reload_wallpaper"), QStringLiteral("Reload") },
         { QStringLiteral("toggle_wallpaper_keyboard"), QStringLiteral("ToggleKeyboard") },
+        { QStringLiteral("save_screenshot"), QStringLiteral("SaveScreenshots") },
     };
     for (auto it = expected.constBegin(); it != expected.constEnd(); ++it) {
         auto* action = coll->action(it.key());

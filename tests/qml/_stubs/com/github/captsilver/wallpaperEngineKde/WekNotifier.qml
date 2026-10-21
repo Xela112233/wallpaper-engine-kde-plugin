@@ -35,4 +35,9 @@ QtObject {
         lastEvent = "wallpaperStillPaused";
         lastArgs = [];
     }
+
+    function screenshotFailed(path, reason) {
+        lastEvent = "screenshotFailed";
+        lastArgs = [path, reason];
+    }
 }

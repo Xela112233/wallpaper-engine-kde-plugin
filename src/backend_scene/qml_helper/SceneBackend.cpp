@@ -1422,6 +1422,42 @@ void SceneObject::requestScreenshot(const QString& path) {
     if (m_scene) m_scene->requestScreenshot(path.toStdString());
 }
 
+bool SceneObject::saveFrame(const QString& path) {
+    if (! m_scene) {
+        qWarning().noquote() << "SceneViewer.saveFrame: no scene is loaded; nothing written to" << path;
+        return false;
+    }
+    // The renderer writes PPM (VulkanRender writeSwapchainToPPM); Qt converts it.
+    const QString ppm = path + QStringLiteral(".ppm-part");
+    m_scene->requestScreenshot(ppm.toStdString());
+    auto* timer = new QTimer(this);
+    timer->setInterval(50);
+    auto waited = std::make_shared<int>(0);
+    connect(timer, &QTimer::timeout, this, [this, timer, waited, path, ppm] {
+        const bool done = m_scene && m_scene->screenshotDone();
+        if (! done && (*waited += timer->interval()) < 5000) return;
+        timer->deleteLater();
+        QString error;
+        if (! done) {
+            error = QStringLiteral("the scene drew no frame within 5 s (is it paused?)");
+        } else {
+            QImage image(ppm, "PPM");
+            if (image.isNull())
+                error = QStringLiteral("the renderer's frame %1 could not be read").arg(ppm);
+            else if (! image.save(path))
+                error = QStringLiteral("cannot write %1").arg(path);
+        }
+        QFile::remove(ppm);
+        if (error.isEmpty())
+            qInfo().noquote() << "SceneViewer.saveFrame: written" << path;
+        else
+            qWarning().noquote() << "SceneViewer.saveFrame:" << error;
+        Q_EMIT frameSaved(path, error.isEmpty(), error);
+    });
+    timer->start();
+    return true;
+}
+
 void SceneObject::requestScreenshotAtFrame(const QString& path, qint64 frame) {
     if (m_scene)
         m_scene->requestScreenshotAtFrame(path.toStdString(),

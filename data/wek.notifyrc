@@ -37,3 +37,9 @@ Name=Wallpaper still paused
 Comment=A wallpaper pause from before a plasmashell restart has been restored
 Action=Popup
 DefaultAction=Popup
+
+[Event/screenshotFailed]
+Name=Wallpaper screenshot not saved
+Comment=Save wallpaper screenshot could not write its file (we-manager screenshot patch)
+Action=Popup
+DefaultAction=Popup

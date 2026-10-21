@@ -41,6 +41,12 @@ private slots:
         QVERIFY(true);
     }
 
+    void testScreenshotFailedDoesNotCrash() {
+        WekNotifier notifier;
+        notifier.screenshotFailed(QStringLiteral("/tmp/shot.png"), QStringLiteral("no wallpaper is shown"));
+        QVERIFY(true);
+    }
+
     void testWallpaperStillPausedDoesNotCrash() {
         WekNotifier notifier;
         notifier.wallpaperStillPaused();
@@ -59,6 +65,7 @@ private slots:
         QVERIFY(contents.contains(QStringLiteral("[Event/assetsMissing]")));
         QVERIFY(contents.contains(QStringLiteral("[Event/backendUnavailable]")));
         QVERIFY(contents.contains(QStringLiteral("[Event/wallpaperStillPaused]")));
+        QVERIFY(contents.contains(QStringLiteral("[Event/screenshotFailed]")));
     }
 
     // Verify playlistAdvanced defaults to Action=None (no popup) so a

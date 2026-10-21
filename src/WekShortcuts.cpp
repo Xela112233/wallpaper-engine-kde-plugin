@@ -130,6 +130,12 @@ WekShortcuts::WekShortcuts(QObject* parent)
         i18nc("@action shortcut label", "Open wallpaper library (configuration dialog)"));
     KGlobalAccel::self()->setGlobalShortcut(openLib, QList<QKeySequence> {});
     QObject::connect(openLib, &QAction::triggered, this, []() { openWallpaperLibrary(); });
+
+    // Wallpaper Engine's "Take screenshot" hotkey: every screen's wallpaper,
+    // without icons or windows, into Pictures/Wallpapers (we-manager patch).
+    registerAction(QStringLiteral("save_screenshot"),
+                   i18nc("@action shortcut label", "Save wallpaper screenshot"),
+                   QStringLiteral("SaveScreenshots"));
 }
 
 } // namespace wekde

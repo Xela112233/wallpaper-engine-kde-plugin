@@ -4,6 +4,9 @@
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDebug>
+#include <QDir>
+#include <QFileInfo>
+#include <QStandardPaths>
 #include <QList>
 #include <QMetaObject>
 #include <QVariant>
@@ -46,6 +49,12 @@ std::function<QString()>& audioCaptureStatusReader() {
 void broadcast(const char* method) {
     for (const QPointer<QObject>& ctrl : controllerRegistry())
         if (ctrl) QMetaObject::invokeMethod(ctrl, method, Qt::QueuedConnection);
+}
+
+void broadcast(const char* method, const QVariant& a, const QVariant& b) {
+    for (const QPointer<QObject>& ctrl : controllerRegistry())
+        if (ctrl)
+            QMetaObject::invokeMethod(ctrl, method, Qt::QueuedConnection, Q_ARG(QVariant, a), Q_ARG(QVariant, b));
 }
 
 void broadcast(const char* method, const QString& arg) {
@@ -228,6 +237,32 @@ bool WekControl::ReloadAudioConfig() {
     }
     audioConfigReloader()();
     return true;
+}
+
+// -- Screenshots --
+
+QString WekControl::defaultScreenshotPath(const QDateTime& when) {
+    QString pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    if (pictures.isEmpty()) pictures = QDir::homePath();
+    return pictures + QStringLiteral("/Wallpapers/wallpaper-")
+           + when.toString(QStringLiteral("yyyyMMdd-HHmmss")) + QStringLiteral(".png");
+}
+
+void WekControl::Screenshot(const QString& path, const QString& screen) {
+    if (path.isEmpty()) {
+        qWarning("wek-dbus: Screenshot: no file path given; nothing written");
+        return;
+    }
+    // The controllers only write the file; the folder must exist first.
+    if (! QDir().mkpath(QFileInfo(path).absolutePath()))
+        qWarning().noquote() << "wek-dbus: Screenshot: cannot create the folder of" << path;
+    broadcast("screenshot", QVariant(path), QVariant(screen));
+}
+
+QString WekControl::SaveScreenshots() {
+    const QString path = defaultScreenshotPath(QDateTime::currentDateTime());
+    Screenshot(path, QString());
+    return path;
 }
 
 // -- Query (sync) --

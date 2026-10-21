@@ -54,6 +54,20 @@
     <method name="AudioCaptureStatus">
       <arg name="value" type="s" direction="out"/>
     </method>
+    <!-- A still of the wallpaper without icons or windows, written to `path`
+         (PNG by default): the screen named `screen` (its connector), or every
+         screen with "-<screen>" before the extension when `screen` is "".
+         The reply comes at once; the file appears once the next frame is
+         grabbed. -->
+    <method name="Screenshot">
+      <arg name="path" type="s" direction="in"/>
+      <arg name="screen" type="s" direction="in"/>
+    </method>
+    <!-- Every screen, into ~/Pictures/Wallpapers/wallpaper-<date>-<screen>.png;
+         returns the path before the screens' names (the shortcut's action). -->
+    <method name="SaveScreenshots">
+      <arg name="value" type="s" direction="out"/>
+    </method>
     <method name="CurrentWorkshopId">
       <arg name="value" type="s" direction="out"/>
     </method>

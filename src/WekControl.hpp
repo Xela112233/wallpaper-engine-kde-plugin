@@ -1,5 +1,6 @@
 #pragma once
 #include <QDBusConnection>
+#include <QDateTime>
 #include <QObject>
 #include <QPointer>
 #include <QString>
@@ -98,6 +99,11 @@ public:
     // "pending" while a reload runs).
     static void setAudioCaptureStatusReader(std::function<QString()> read);
 
+    // Where the "Save wallpaper screenshot" shortcut writes:
+    // <Pictures>/Wallpapers/wallpaper-<yyyyMMdd-HHmmss>.png (each screen
+    // then adds "-<screen>" before the extension).
+    static QString defaultScreenshotPath(const QDateTime& when);
+
 public slots:
     // Playlist navigation
     Q_NOREPLY void Next();
@@ -133,6 +139,19 @@ public slots:
     // "pending" while a ReloadAudioConfig still runs; "" when the plugin
     // installed no reader.
     QString AudioCaptureStatus();
+
+    // A still of the wallpaper, without icons or windows, written to `path`
+    // (PNG, or what its extension names): from the screen named `screen`
+    // (QScreen::name, the output's connector), or from every screen when
+    // `screen` is empty, each with "-<screen>" before the extension.  The
+    // file appears asynchronously: a scene writes the frame it renders next,
+    // video and web wallpapers Qt's grab of the backend item.  It answers at
+    // once (an empty reply), so a caller waiting for one never times out.
+    void Screenshot(const QString& path, const QString& screen);
+    // Every screen, to defaultScreenshotPath(now); returns that path (before
+    // the screens' names are added).  The "Save wallpaper screenshot"
+    // shortcut calls it.
+    QString SaveScreenshots();
 
     // Query (sync, returns a value — D-Bus method, not signal/property)
     QString CurrentWorkshopId() const;

@@ -25,7 +25,7 @@ namespace wekde
 //
 // Action ids (visible in ~/.config/kglobalshortcutsrc):
 //   next_wallpaper, previous_wallpaper, toggle_pause,
-//   toggle_mute, reload_wallpaper, open_library,
+//   toggle_mute, reload_wallpaper, open_library, save_screenshot,
 //   toggle_wallpaper_keyboard (we-manager patch: keyboard mode for web
 //   wallpapers, when the screen's KeyboardInput setting is on)
 // open_library starts we-manager-gui when it is on PATH (we-manager patch),

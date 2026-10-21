@@ -22,6 +22,10 @@
 #include <QSignalSpy>
 #include <QtTest/QtTest>
 
+#include <QFileInfo>
+#include <QStandardPaths>
+#include <QTemporaryDir>
+
 #include <functional>
 
 using namespace wekde;
@@ -71,6 +75,11 @@ public slots:
         ++ends;
     }
     // QML functions take QVariant arguments, so the stub does too.
+    // WekControl.Screenshot: (path, screen), QVariants like any QML function.
+    void screenshot(const QVariant& path, const QVariant& screen) {
+        lastMethod = QStringLiteral("screenshot");
+        lastArg    = path.toString() + QLatin1Char('|') + screen.toString();
+    }
     void remoteStop(const QVariant& source, const QVariant& stopped) {
         lastMethod = QStringLiteral("remoteStop");
         lastArg    = source.toString();
@@ -189,6 +198,11 @@ private slots:
     void reloadAudioConfig_runsTheInstalledReloader();
     void reloadAudioConfig_withoutReloader_returnsFalse();
     void audioCaptureStatus_answersWhatTheReaderSays();
+
+    // -- Screenshots (screenshot patch) --------------------------------------
+    void screenshot_broadcastsPathAndScreenToEveryController();
+    void screenshot_createsTheFolder_andRefusesAnEmptyPath();
+    void saveScreenshots_usesPicturesWallpapersWithTheTime();
 
     // -- Ctor-injected connection (the dbus-launch fallback seam) ------
     void registerOnConnection_acceptsInjectedBus_orReturnsNull();
@@ -710,6 +724,59 @@ void TestWekControl::audioCaptureStatus_answersWhatTheReaderSays() {
     WekControl::setAudioCaptureStatusReader({});
     QTest::ignoreMessage(QtWarningMsg, QRegularExpression("AudioCaptureStatus: no capture status reader"));
     QCOMPARE(control->AudioCaptureStatus(), QString());
+}
+
+void TestWekControl::screenshot_broadcastsPathAndScreenToEveryController() {
+    PlaylistControllerStub a, b;
+    auto                   ca = std::make_unique<WekControl>();
+    auto                   cb = std::make_unique<WekControl>();
+    ca->setPlaylistController(&a);
+    cb->setPlaylistController(&b);
+    QTemporaryDir dir;
+    const QString path = dir.filePath(QStringLiteral("shot.png"));
+    ca->Screenshot(path, QStringLiteral("DP-1"));
+    QTRY_COMPARE(a.lastMethod, QStringLiteral("screenshot"));
+    QTRY_COMPARE(b.lastMethod, QStringLiteral("screenshot"));
+    QCOMPARE(a.lastArg, path + QStringLiteral("|DP-1"));
+    QCOMPARE(b.lastArg, path + QStringLiteral("|DP-1")); // each controller checks its own screen
+}
+
+void TestWekControl::screenshot_createsTheFolder_andRefusesAnEmptyPath() {
+    PlaylistControllerStub a;
+    auto                   c = std::make_unique<WekControl>();
+    c->setPlaylistController(&a);
+    QTemporaryDir dir;
+    const QString path = dir.filePath(QStringLiteral("deeper/still/shot.png"));
+    c->Screenshot(path, QString());
+    QVERIFY(QDir(dir.filePath(QStringLiteral("deeper/still"))).exists());
+    QTRY_COMPARE(a.lastArg, path + QStringLiteral("|"));
+    a.lastMethod.clear();
+    QTest::ignoreMessage(QtWarningMsg, QRegularExpression("Screenshot: no file path given"));
+    c->Screenshot(QString(), QString());
+    QCoreApplication::processEvents();
+    QVERIFY(a.lastMethod.isEmpty());
+}
+
+void TestWekControl::saveScreenshots_usesPicturesWallpapersWithTheTime() {
+    // A throwaway HOME: SaveScreenshots creates <Pictures>/Wallpapers, and the
+    // temporary directory takes it away again.
+    QTemporaryDir   home;
+    const QByteArray oldHome = qgetenv("HOME");
+    qputenv("HOME", home.path().toUtf8());
+    QStandardPaths::setTestModeEnabled(true);
+    const QDateTime when(QDate(2026, 11, 6), QTime(14, 5, 9));
+    const QString   path = WekControl::defaultScreenshotPath(when);
+    QVERIFY2(path.startsWith(home.path()), qPrintable(path));
+    QVERIFY2(path.endsWith(QStringLiteral("/Wallpapers/wallpaper-20261106-140509.png")), qPrintable(path));
+    PlaylistControllerStub a;
+    auto                   c = std::make_unique<WekControl>();
+    c->setPlaylistController(&a);
+    const QString given = c->SaveScreenshots();
+    QVERIFY(given.contains(QStringLiteral("/Wallpapers/wallpaper-")));
+    QVERIFY(QFileInfo(QFileInfo(given).absolutePath()).isDir());
+    QTRY_COMPARE(a.lastArg, given + QStringLiteral("|")); // every screen
+    QStandardPaths::setTestModeEnabled(false);
+    qputenv("HOME", oldHome);
 }
 
 void TestWekControl::reloadAudioConfig_withoutReloader_returnsFalse() {

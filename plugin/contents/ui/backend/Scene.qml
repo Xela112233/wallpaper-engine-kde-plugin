@@ -295,4 +295,33 @@ Item{
     function getMouseTarget() {
         return Qt.binding(function() { return player; })
     }
+    // WekControl.Screenshot (main.qml): the frame the renderer draws next, at
+    // its render size, converted to `path`'s format by SceneViewer.saveFrame.
+    // A paused scene draws no frame (pause() stops the renderer's frame
+    // timer, as main.qml does behind a maximized window), so then it is
+    // `grab` (main.qml's grabScreenshot) of the player, which still shows
+    // its last frame.  The grab also stands in when saveFrame reports a
+    // failure, and on a plugin library from before the screenshot patch
+    // (plasmashell keeps its library across an upgrade inside a session),
+    // which has no saveFrame.
+    property var _screenshotGrab: null
+    function saveScreenshot(path, grab) {
+        if (typeof player.saveFrame !== "function") {
+            console.warn("[WEK] screenshot: SceneViewer.saveFrame is missing (the plugin library plasmashell "
+                         + "runs is older than this QML; log out and in again); the frame on screen instead");
+            return typeof grab === "function" ? grab(player, path) : false;
+        }
+        if (sceneItem._paused && typeof grab === "function") return grab(player, path);
+        sceneItem._screenshotGrab = grab || null;
+        return player.saveFrame(path);
+    }
+    Connections {
+        target: player
+        ignoreUnknownSignals: true
+        function onFrameSaved(path, ok, error) {
+            if (ok) return;
+            console.warn("[WEK] screenshot: " + error + "; the frame on screen instead, for " + path);
+            if (typeof sceneItem._screenshotGrab === "function") sceneItem._screenshotGrab(player, path);
+        }
+    }
 }

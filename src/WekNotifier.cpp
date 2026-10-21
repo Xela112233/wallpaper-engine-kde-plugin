@@ -108,4 +108,15 @@ void WekNotifier::wallpaperStillPaused() {
     notification->sendEvent();
 }
 
+void WekNotifier::screenshotFailed(const QString& path, const QString& reason) {
+    auto* notification = new KNotification(QStringLiteral("screenshotFailed"));
+    notification->setComponentName(componentName());
+    notification->setTitle(i18nc("@title notification, wallpaper screenshot not saved",
+                                 "Wallpaper screenshot not saved"));
+    notification->setText(i18nc("@info notification, %1=file path, %2=reason", "%1: %2", path, reason));
+    notification->setIconName(QStringLiteral("dialog-warning"));
+    QObject::connect(notification, &KNotification::closed, notification, &QObject::deleteLater);
+    notification->sendEvent();
+}
+
 } // namespace wekde

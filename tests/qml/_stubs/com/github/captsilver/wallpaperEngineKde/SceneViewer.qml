@@ -35,6 +35,9 @@ Item {
     property real   nativeAspectRatio:  0  // 0 = scene not loaded yet (real type's sentinel)
 
     signal firstFrame()
+    signal frameSaved(string path, bool ok, string error)
+    property var savedFrames: []   // saveFrame() paths, in order (test recorder)
+    function saveFrame(path) { savedFrames = savedFrames.concat([path]); return true; }
     signal userShortcutRequested(string name)
     signal mediaPlaybackChanged(int state)
     // arities mirror the C++ SceneObject::media*Changed Q_INVOKABLEs and the

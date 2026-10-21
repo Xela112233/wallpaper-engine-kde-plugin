@@ -812,6 +812,8 @@ Rectangle {
         setUserPaused: function(v) {
             wallpaper.configuration.UserPaused = v;
         }
+        screenName: background.Screen.name
+        saveScreenshot: function(path) { return background.saveWallpaperScreenshot(path); }
     }
 
     // lauch pause time to avoid freezing
@@ -900,6 +902,37 @@ Rectangle {
         onDirChanged: tried = 0
         source: want && tried < names.length ? dir + "/" + names[tried] : ""
         onStatusChanged: if (status === Image.Error) tried += 1
+    }
+
+    // WekControl.Screenshot: the frame the wallpaper shows, without the icons
+    // or windows above it.  A backend with its own writer (Scene.qml: the
+    // renderer's frame) uses it, and is handed grabScreenshot for when it has
+    // no frame to give; video and web go through grabScreenshot itself.
+    // Asynchronous.  A failure is logged and notified with the path and the
+    // reason, so a global shortcut does not fail silently.
+    function saveWallpaperScreenshot(path) {
+        const item = backendLoader.item;
+        if (!item || background.nowBackend === "InfoShow") {
+            background.screenshotFailed(path, "no wallpaper is shown on " + background.Screen.name);
+            return false;
+        }
+        if (typeof item.saveScreenshot === "function") return item.saveScreenshot(path, background.grabScreenshot);
+        return background.grabScreenshot(item, path);
+    }
+    // Qt's grab of `item` (what it shows now) at the screen's pixel size.
+    function grabScreenshot(item, path) {
+        const dpr = background.Screen.devicePixelRatio || 1;
+        const started = item.grabToImage(function(result) {
+            if (result.saveToFile(path)) console.log("[WEK] screenshot written: " + path);
+            else background.screenshotFailed(path, "the image could not be written there");
+        }, Qt.size(Math.round(item.width * dpr), Math.round(item.height * dpr)));
+        if (!started) background.screenshotFailed(path, "Qt could not grab the wallpaper (it is not on screen)");
+        return started;
+    }
+    function screenshotFailed(path, reason) {
+        console.warn("[WEK] screenshot: " + reason + "; nothing written to " + path);
+        // A plugin library from before the screenshot patch has no such event.
+        if (typeof notifier.screenshotFailed === "function") notifier.screenshotFailed(path, reason);
     }
 
     // main

@@ -66,6 +66,10 @@ Item {
     // persists from QML — only the dialog's CRUD triggers writes).
     property var bumpReloadSeq: function() { }
     property var setUserPaused: function(v) { }
+    // WekControl.Screenshot: this screen's name (QScreen::name, the output's
+    // connector) and the writer main.qml supplies.  Null in editor / tests.
+    property string screenName: ""
+    property var saveScreenshot: null
 
     // editorMode flips this ctrl's mgr into a UI-only shadow: it still
     // tracks activeId / does CRUD / persists, but never ticks the wallpaper
@@ -213,6 +217,25 @@ Item {
 
     function isPaused() {
         return root.userPaused;
+    }
+
+    // WekControl.Screenshot(path, screen): only the screen named, or every
+    // screen when `screen` is empty, each adding "-<screen>" before the
+    // extension so they do not overwrite each other.
+    function screenshot(path, screen) {
+        const want = String(screen || "");
+        if (want !== "" && want !== root.screenName) return false;
+        if (typeof root.saveScreenshot !== "function") {
+            console.warn("[WEK] screenshot: this controller has no writer (editor mode)");
+            return false;
+        }
+        return root.saveScreenshot(want === "" ? screenshotPathFor(String(path), root.screenName) : String(path));
+    }
+    function screenshotPathFor(path, screen) {
+        const name = String(screen || "screen").replace(/[^A-Za-z0-9._-]/g, "_");
+        const slash = path.lastIndexOf("/");
+        const dot = path.lastIndexOf(".");
+        return dot > slash ? path.slice(0, dot) + "-" + name + path.slice(dot) : path + "-" + name;
     }
 
     // Screens of this plasmashell that stopped with StopScope 1 (all
