@@ -304,6 +304,9 @@ public:
         case 1: return { 1u, false };
         case 2: return { 2u, false };
         case 4: return { 4u, false };
+        // 8x (we-manager scene-quality patch): pinned like 2x and 4x; the
+        // device's own maximum still caps it where the pass is prepared.
+        case 8: return { 8u, false };
         default: return { scene_default, true };
         }
     }

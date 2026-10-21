@@ -20,6 +20,25 @@
 // Engine exempts those) is never smaller; sprite sheets and video textures
 // are exempt.  Only the uploaded image shrinks: the texture's header, and
 // with it g_TextureNResolution and mipmap_larger, stays as authored.
+//
+// The switches of the scene-quality patch.  Each one's default is "as the
+// scene asks", which is what the renderer did before the patch, and a
+// default is never written into the property's text: with nothing switched,
+// the text, the struct's decisions and so the parsed scene are the ones of
+// the tree without the patch.
+// * volumetrics (main.xml Volumetrics): Off, no light gets the volumetric
+//   chain (no per-light nodes, no half-resolution targets, no passes): the
+//   state WEKDE_VOLUMETRICS=force-off already gives.
+// * reflections (main.xml Reflections): Off, a 3D scene with camera paths
+//   gets no reflected camera, so no reflection passes and no blur chain, and
+//   the scene-sized _rt_Reflection and _rt_Reflection_blur are not
+//   registered; a material that samples _rt_Reflection reads a 4x4 target
+//   of that name, which stays transparent black.
+// * flatMsaa (main.xml MsaaOffForFlatScenes): Off, a scene drawn with the
+//   orthographic camera that holds no model and nothing drawn in perspective
+//   renders without multisampling, whatever MsaaMode says, as Wallpaper
+//   Engine does since 2.3; a 3D scene, and a 2D one with such an object, is
+//   left alone.
 
 #include <algorithm>
 #include <cstdint>
@@ -36,9 +55,27 @@ struct SceneQuality {
         Performance = 1,
         Automatic   = 2,
     };
+    enum class Volumetrics : std::uint8_t
+    {
+        Off   = 0,
+        Scene = 1,
+    };
+    enum class Reflections : std::uint8_t
+    {
+        Off   = 0,
+        Scene = 1,
+    };
+    enum class FlatMsaa : std::uint8_t
+    {
+        AsSet = 0,
+        Off   = 1,
+    };
     Textures     textures { Textures::Full };
     std::int32_t targetWidth { 0 };
     std::int32_t targetHeight { 0 };
+    Volumetrics  volumetrics { Volumetrics::Scene };
+    Reflections  reflections { Reflections::Scene };
+    FlatMsaa     flatMsaa { FlatMsaa::AsSet };
 
     bool operator==(const SceneQuality&) const = default;
 
@@ -62,13 +99,25 @@ struct SceneQuality {
                 q.targetWidth = (std::int32_t)v;
             else if (key == "targetHeight" && v >= 0 && v <= 65535)
                 q.targetHeight = (std::int32_t)v;
+            else if (key == "volumetrics" && v >= 0 && v <= 1)
+                q.volumetrics = static_cast<Volumetrics>(v);
+            else if (key == "reflections" && v >= 0 && v <= 1)
+                q.reflections = static_cast<Reflections>(v);
+            else if (key == "flatMsaa" && v >= 0 && v <= 1)
+                q.flatMsaa = static_cast<FlatMsaa>(v);
         }
         return q;
     }
 
+    // A switch of the scene-quality patch is named only when it is off its
+    // default, so the text of a scene nobody switched is the old one.
     std::string ToString() const {
-        return "textures=" + std::to_string((int)textures) + ";targetWidth=" + std::to_string(targetWidth) +
-               ";targetHeight=" + std::to_string(targetHeight);
+        std::string text = "textures=" + std::to_string((int)textures) + ";targetWidth=" + std::to_string(targetWidth) +
+                           ";targetHeight=" + std::to_string(targetHeight);
+        if (volumetrics != Volumetrics::Scene) text += ";volumetrics=" + std::to_string((int)volumetrics);
+        if (reflections != Reflections::Scene) text += ";reflections=" + std::to_string((int)reflections);
+        if (flatMsaa != FlatMsaa::AsSet) text += ";flatMsaa=" + std::to_string((int)flatMsaa);
+        return text;
     }
 
     static const char* TexturesName(Textures t) {

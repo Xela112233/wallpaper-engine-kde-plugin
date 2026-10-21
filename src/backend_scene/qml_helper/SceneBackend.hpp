@@ -102,6 +102,10 @@ class SceneObject : public QQuickItem {
     // are more keys of the same map.  For Automatic the render target size
     // (item size x dpr x renderScale, as the Vulkan target is made) is added
     // here.  Read while the scene is parsed, so a change reloads it.
+    // The scene-quality patch's keys, each named only to switch it:
+    // volumetrics: 0 (no volumetric lighting), reflections: 0 (no planar
+    // reflections), flatMsaa: 1 (no anti-aliasing on a 2D scene without 3D
+    // elements).
     Q_PROPERTY(QVariantMap sceneQuality READ sceneQuality WRITE setSceneQuality NOTIFY sceneQualityChanged)
     // The device-local memory the scene's renderer holds after its first
     // frame (textures, render targets, buffers), in MiB; 0 before.  The KDE

@@ -71,6 +71,12 @@ Item {
         clear:  function() {},
     })
 
+    // Real WebEngineView's zoomFactor (0.25 to 5.0); QtWebView.qml writes it
+    // only below 100 % web resolution (we-manager scene-quality patch), and
+    // reads loadProgress (0 to 100) when that setting changes; tests set it.
+    property real zoomFactor: 1.0
+    property int loadProgress: 0
+
     property int lifecycleState: WebEngineView.Active
     property bool activeFocusOnPress: true
 

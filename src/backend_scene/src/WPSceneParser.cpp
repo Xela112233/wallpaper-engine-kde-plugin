@@ -195,6 +195,10 @@ struct ParseContext {
     int         msaa_mode { 0 };
     // WPSceneParser::SetCameraParallax: false keeps camera parallax off.
     bool camera_parallax { true };
+    // The scene quality switches of this load (SceneQuality.hpp): what
+    // WPSceneParser::SetQuality was given.  The scene-quality patch's
+    // decisions (volumetrics, reflections, flatMsaa) read this copy.
+    SceneQuality quality;
 
     // Layer names referenced by any SceneScript (via getLayer('X')).  These
     // layers may have their visibility toggled at runtime, so we keep them in
@@ -1129,6 +1133,31 @@ static void applyMsaaSetting(Scene& scene, int mode, u32 scene_default, const ch
     LOG_INFO("MSAA requested: x%u (%s, auto=%d)", req.samples, what, (int)req.autoScale);
 }
 
+// WEKDE_MSAA holds a count applyMsaaSetting takes: a measurement run keeps
+// it, whatever the scene-quality patch's flatMsaa says.
+static bool MsaaPinnedByEnv() {
+    const char* env = std::getenv("WEKDE_MSAA");
+    return env != nullptr && Scene::isSupportedMsaaSampleCount((u32)std::atoi(env));
+}
+
+// A scene Wallpaper Engine calls one "without 3D elements" (scene-quality
+// patch, SceneQuality's flatMsaa): drawn with the orthographic camera, holding
+// no model object, and with no node on the 2D scene's perspective camera
+// (a particle system flagged perspective).  Called after the objects are
+// parsed, and only with the switch on.
+static bool IsFlat2DScene(const ParseContext& context, const wpscene::WPScene& sc) {
+    if (! sc.general.isOrtho || ! context.model_object_ids.empty()) return false;
+    std::vector<const SceneNode*> todo { context.scene->sceneGraph.get() };
+    while (! todo.empty()) {
+        const SceneNode* node = todo.back();
+        todo.pop_back();
+        if (node == nullptr) continue;
+        if (node->Camera() == "global_perspective") return false;
+        for (const auto& child : node->GetChildren()) todo.push_back(child.get());
+    }
+    return true;
+}
+
 void ParseCamera(ParseContext& context, wpscene::WPScene& sc, const nlohmann::json& json) {
     auto& general = sc.general;
     auto& scene   = *context.scene;
@@ -1242,15 +1271,22 @@ void ParseCamera(ParseContext& context, wpscene::WPScene& sc, const nlohmann::js
             LOG_INFO("loaded %zu camera paths from %s", camPaths.size(), pathFile.c_str());
         }
         if (! camPaths.empty()) {
-            // Create reflected camera for planar reflections (Y=0 mirror).
-            // Must be done BEFORE LoadPaths moves the vector.
-            auto reflCam =
-                std::make_shared<SceneCamera>(aspect, general.nearz, general.farz, general.fov);
-            reflCam->SetReflectY0(true);
-            reflCam->SetDirectLookAt(eye, center, up);
-            reflCam->LoadPaths(camPaths); // copy paths (not move)
-            reflCam->SetFadeEnabled(sc.general.camerafade);
-            scene.cameras["reflected_perspective"] = reflCam;
+            // Reflections off (scene-quality patch): no reflected camera, and
+            // with it no reflection passes (sceneToRenderGraph), no blur
+            // chain (buildBloomAndReflection) and no per-frame update of it.
+            if (context.quality.reflections != SceneQuality::Reflections::Off) {
+                // Create reflected camera for planar reflections (Y=0 mirror).
+                // Must be done BEFORE LoadPaths moves the vector.
+                auto reflCam =
+                    std::make_shared<SceneCamera>(aspect, general.nearz, general.farz, general.fov);
+                reflCam->SetReflectY0(true);
+                reflCam->SetDirectLookAt(eye, center, up);
+                reflCam->LoadPaths(camPaths); // copy paths (not move)
+                reflCam->SetFadeEnabled(sc.general.camerafade);
+                scene.cameras["reflected_perspective"] = reflCam;
+            } else {
+                LOG_INFO("reflections are off: no reflected camera, no reflection passes");
+            }
 
             scene.activeCamera->LoadPaths(std::move(camPaths));
             scene.activeCamera->SetFadeEnabled(sc.general.camerafade);
@@ -4674,14 +4710,28 @@ void initSceneRenderTargets(ParseContext& context) {
         .width  = 2048,
         .height = 2048,
     };
-    context.scene->renderTargets[WE_REFLECTION.data()] = {
-        .width  = context.ortho_w,
-        .height = context.ortho_h,
-    };
-    context.scene->renderTargets[WE_REFLECTION_BLUR.data()] = {
-        .width  = context.ortho_w,
-        .height = context.ortho_h,
-    };
+    // Reflections off (scene-quality patch): nothing draws a mirror image,
+    // so the two scene-sized targets are not registered.  A material that
+    // samples _rt_Reflection (the reflecting surface) still needs something
+    // to sample that adds nothing: a 4x4 stand-in under the same name.  Like
+    // every render target it starts out transparent black and nothing ever
+    // writes it.  (Left unregistered, the slot would get the 1x1 texture for
+    // empty slots, which is opaque: TextureCache's GenInitialClearColor.)
+    if (context.quality.reflections != SceneQuality::Reflections::Off) {
+        context.scene->renderTargets[WE_REFLECTION.data()] = {
+            .width  = context.ortho_w,
+            .height = context.ortho_h,
+        };
+        context.scene->renderTargets[WE_REFLECTION_BLUR.data()] = {
+            .width  = context.ortho_w,
+            .height = context.ortho_h,
+        };
+    } else {
+        context.scene->renderTargets[WE_REFLECTION.data()] = {
+            .width  = 4,
+            .height = 4,
+        };
+    }
 }
 
 // Initialise the global shader-compiler (glslang) and text (FreeType) subsystems.
@@ -6059,6 +6109,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     context.postprocessing_override = m_postprocessing_override;
     context.msaa_mode               = m_msaa_mode;
     context.camera_parallax         = m_camera_parallax;
+    context.quality                 = m_quality;
     // Plumb the host's cooperative-cancellation flag (set by
     // SceneWallpaper::abortLoad when the wallpaper's screen goes away
     // mid-load) into the parse context so per-object hot loops can poll it.
@@ -6146,6 +6197,17 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         context.scene->msaaRequested = msaa;
     }
 
+    // Anti-aliasing off for 2D scenes (scene-quality patch, SceneQuality's
+    // flatMsaa): every object is parsed, so what the scene draws is known.
+    // Asked only with the switch on; WEKDE_MSAA still pins the count.
+    if (context.quality.flatMsaa == SceneQuality::FlatMsaa::Off && context.scene->msaaRequested > 1 &&
+        ! MsaaPinnedByEnv() && IsFlat2DScene(context, sc)) {
+        LOG_INFO("2D scene without 3D elements: MSAA off (x%u was requested)",
+                 context.scene->msaaRequested);
+        context.scene->msaaSamples   = 1;
+        context.scene->msaaRequested = 1;
+    }
+
     fixupDeferredGroupLinks(context, deferred_group_links, json_order);
 
     // OWT for groups was computed before wp_objs parsing via the raw-JSON
@@ -6180,13 +6242,26 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     // BuildVolumetricNodes then iterates that vector to construct the
     // back/front/fullscreen SceneNodes + the global blur/combine nodes +
     // the half-res RT entries.
+    // Volumetric lighting off (scene-quality patch, SceneQuality's
+    // volumetrics): no light enters the chain, which leaves the state
+    // WEKDE_VOLUMETRICS=force-off gives: no nodes, no targets, no passes.
+    const bool volumetrics_off = context.quality.volumetrics == SceneQuality::Volumetrics::Off;
     for (const auto& l : context.scene->lights) {
-        if (l && l->isVolumetricEmitterCandidate()) {
+        if (! volumetrics_off && l && l->isVolumetricEmitterCandidate()) {
             context.scene->volumetricsConfig.enabled = true;
             Scene::VolumetricsConfig::PerLight pl;
             pl.light = l.get();
             context.scene->volumetricsConfig.per_light.push_back(std::move(pl));
         }
+    }
+    if (volumetrics_off) {
+        const auto wanted = std::count_if(
+            context.scene->lights.begin(), context.scene->lights.end(), [](const auto& l) {
+                return l && l->isVolumetricEmitterCandidate();
+            });
+        if (wanted > 0)
+            LOG_INFO("volumetric lighting is off: %d light(s) of this scene are not drawn as volumetric",
+                     (int)wanted);
     }
     if (context.scene->volumetricsConfig.enabled) {
         // Resolve the per-scene post-processing tier (plugin-level override

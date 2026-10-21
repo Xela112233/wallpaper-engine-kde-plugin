@@ -84,6 +84,17 @@ Rectangle {
     // TextureQuality): Scene.qml hands it to SceneViewer.sceneQuality, which
     // reloads the scene when it changes.
     property int    textureQuality: wallpaper.configuration.TextureQuality ?? 0
+    // The scene quality switches of the scene-quality patch (main.xml
+    // Volumetrics, Reflections, MsaaOffForFlatScenes): Scene.qml names one in
+    // SceneViewer.sceneQuality only when it is off its default, and the scene
+    // reloads when one changes.  Defaults: as each scene asks.
+    property bool   volumetrics: wallpaper.configuration.Volumetrics ?? true
+    property bool   reflections: wallpaper.configuration.Reflections ?? true
+    property bool   msaaOffForFlatScenes: wallpaper.configuration.MsaaOffForFlatScenes ?? false
+    // Percentage of the display resolution web wallpapers are drawn at
+    // (scene-quality patch, main.xml WebRenderScale): QtWebView.qml lays the
+    // view out smaller and scales it up below 100; 100 leaves it as it is.
+    property int    webRenderScale: wallpaper.configuration.WebRenderScale ?? 100
     // SceneScript localStorage per wallpaper and per screen (localstorage
     // patch, main.xml LocalStoragePerWallpaper): Scene.qml hands both to
     // SceneViewer.  storageScreen is the screen whose LOCATION_SCREEN values

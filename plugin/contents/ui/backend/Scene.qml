@@ -151,8 +151,18 @@ Item{
             // Texture resolution (texture-quality patch); a change reloads
             // the scene.  Set before the renderer is up, so the first load
             // already uses it.
+            // The scene-quality patch's switches join the map only when one
+            // is off its default (volumetric lighting or reflections off,
+            // no anti-aliasing on 2D scenes), so the map of a screen nobody
+            // switched is {textures} as before.  They reload the scene too.
             Common.setIfSupported(player, "SceneViewer", "sceneQuality",
-                                  Qt.binding(function() { return { textures: background.textureQuality }; }));
+                                  Qt.binding(function() {
+                                      var q = { textures: background.textureQuality };
+                                      if (background.volumetrics === false) q.volumetrics = 0;
+                                      if (background.reflections === false) q.reflections = 0;
+                                      if (background.msaaOffForFlatScenes === true) q.flatMsaa = 1;
+                                      return q;
+                                  }));
             // Audio output (mute patch, AudioOutput): off, the scene opens no
             // sound device at all.
             Common.setIfSupported(player, "SceneViewer", "audioOutput",

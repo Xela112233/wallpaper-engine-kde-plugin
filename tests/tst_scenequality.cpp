@@ -2,7 +2,8 @@
 // Unit tests for wallpaper::SceneQuality and LeadingMipsToDrop (we-manager
 // texture-quality patch): which leading mip levels a texture leaves out per
 // texture resolution and render target, the textures that never get
-// smaller, and the property's text form.
+// smaller, and the property's text form, with the scene-quality patch's
+// switches in it.
 
 #include <QtTest>
 
@@ -35,6 +36,7 @@ private slots:
     void aTextureKeepsAtLeastOneLevel();
     void spritesAndVideosAreExempt();
     void theTextFormRoundTripsAndToleratesTheUnknown();
+    void theSwitchesAreNamedOnlyWhenSet();
 };
 
 void TestSceneQuality::fullLeavesEveryLevel() {
@@ -92,6 +94,41 @@ void TestSceneQuality::theTextFormRoundTripsAndToleratesTheUnknown() {
     QCOMPARE(SceneQuality::FromString("textures=9"), quality(Full));
     QCOMPARE(SceneQuality::FromString(""), quality(Full));
     QCOMPARE(QString::fromLatin1(SceneQuality::TexturesName(Automatic)), QStringLiteral("automatic"));
+}
+
+// The scene-quality patch's switches (volumetric lighting, reflections, no
+// anti-aliasing on 2D scenes): with none set the property's text is the one
+// from before the patch, so a renderer that gets it decides as before; each
+// one set is a different SceneQuality, which is what makes SceneWallpaper
+// reload the scene.
+void TestSceneQuality::theSwitchesAreNamedOnlyWhenSet() {
+    const SceneQuality none;
+    QCOMPARE(QString::fromStdString(none.ToString()), QStringLiteral("textures=0;targetWidth=0;targetHeight=0"));
+    QCOMPARE(SceneQuality::FromString("textures=0;targetWidth=0;targetHeight=0"), none);
+    QVERIFY(none.volumetrics == SceneQuality::Volumetrics::Scene);
+    QVERIFY(none.reflections == SceneQuality::Reflections::Scene);
+    QVERIFY(none.flatMsaa == SceneQuality::FlatMsaa::AsSet);
+
+    SceneQuality q = quality(Performance);
+    q.volumetrics  = SceneQuality::Volumetrics::Off;
+    QCOMPARE(QString::fromStdString(q.ToString()),
+             QStringLiteral("textures=1;targetWidth=0;targetHeight=0;volumetrics=0"));
+    QVERIFY(! (q == quality(Performance)));
+    QCOMPARE(SceneQuality::FromString(q.ToString()), q);
+
+    q.reflections = SceneQuality::Reflections::Off;
+    q.flatMsaa      = SceneQuality::FlatMsaa::Off;
+    QCOMPARE(QString::fromStdString(q.ToString()),
+             QStringLiteral("textures=1;targetWidth=0;targetHeight=0;volumetrics=0;reflections=0;flatMsaa=1"));
+    QCOMPARE(SceneQuality::FromString(q.ToString()), q);
+
+    // What the settings page sends for one switch, and the defaults written out.
+    SceneQuality mirrorless;
+    mirrorless.reflections = SceneQuality::Reflections::Off;
+    QCOMPARE(SceneQuality::FromString("textures=0;reflections=0"), mirrorless);
+    QCOMPARE(SceneQuality::FromString("textures=0;volumetrics=1;reflections=1;flatMsaa=0"), none);
+    // A value no build defines leaves the switch as the scene asks.
+    QCOMPARE(SceneQuality::FromString("reflections=7;flatMsaa=2;volumetrics=-1"), none);
 }
 
 QTEST_GUILESS_MAIN(TestSceneQuality)

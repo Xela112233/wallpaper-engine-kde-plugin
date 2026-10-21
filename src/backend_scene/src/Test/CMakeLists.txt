@@ -178,6 +178,11 @@ add_executable(backend_scene_tests
     test_WPParticleOperators.cpp
     test_WPRemapValueOps.cpp
     test_WPScenePostprocessing.cpp
+    # The scene quality switches (we-manager scene-quality patch): the parser's
+    # and the render graph's output with no switch set against the tree without
+    # the patch, and what each switch takes away.
+    test_SceneQualityDefaults.cpp
+    test_SceneQualitySwitches.cpp
     test_WPImageObject.cpp
     test_ParticleEmitter.cpp
     test_Looper.cpp

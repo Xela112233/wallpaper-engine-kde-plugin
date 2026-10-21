@@ -46,6 +46,9 @@ ColumnLayout {
     property alias  cfg_MpvPowerSaving:      settingPage.cfg_MpvPowerSaving
     property alias  cfg_MpvInterpolation:    settingPage.cfg_MpvInterpolation
     property alias  cfg_MpvHwdec:            settingPage.cfg_MpvHwdec
+    property alias  cfg_MsaaOffForFlatScenes: settingPage.cfg_MsaaOffForFlatScenes
+    property alias  cfg_Volumetrics:         settingPage.cfg_Volumetrics
+    property alias  cfg_Reflections:         settingPage.cfg_Reflections
     property alias  cfg_MpvLoadInMemory:     settingPage.cfg_MpvLoadInMemory
     property alias  cfg_VerboseLogging:      settingPage.cfg_VerboseLogging
     property alias  cfg_SafeStartAfterCrash: settingPage.cfg_SafeStartAfterCrash
@@ -119,6 +122,9 @@ ColumnLayout {
     // Texture resolution (texture-quality patch): SettingPage's combo box
     // writes it unqualified, like cfg_RenderScale.
     property int    cfg_TextureQuality
+    // Web wallpaper resolution (scene-quality patch): SettingPage's combo box
+    // writes it unqualified, like cfg_TextureQuality.
+    property int    cfg_WebRenderScale
     property int    cfg_ProcessPriority
     property int    cfg_ShareRenderer
     property int    cfg_SpanGroup

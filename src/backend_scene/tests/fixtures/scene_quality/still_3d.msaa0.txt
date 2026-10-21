@@ -1,0 +1,20 @@
+msaa requested=4 samples=4 autoScale=1
+ortho 1920x1080 hdr=0 skybox=0
+camera effect ortho 2x2 near=-1 far=1 paths=0 fade=0 reflectY0=0 effect=0
+camera global perspective fov=50 aspect=1.778 near=0.01 far=1e+04 paths=0 fade=0 reflectY0=0 effect=0 active
+camera global_ortho ortho 1920x1080 near=-5000 far=5000 paths=0 fade=0 reflectY0=0 effect=0
+volumetrics enabled=0 lights=0 quality=2 blur=0 combine=0
+reflectionBlur nodes=0 outputs=-
+bloom enabled=0 nodes=0 outputs=-
+node id=-1 camera=- visible=1
+  node id=-1 camera=- visible=1
+  node id=-1 camera=- visible=1
+  node id=50 camera=global_ortho visible=1 material=_t textures=-
+  node id=51 camera=global_ortho visible=1 material=_mirror textures=_rt_Reflection
+pass _t type=0 output=_rt_default camera=- textures=- reflectionDepth=0
+pass _mirror type=0 output=_rt_default camera=- textures=_rt_Reflection reflectionDepth=0
+target _rt_MipMappedFrameBuffer 1920x1080 format=5 mipmap=1 reuse=0 bind=_rt_default*1
+target _rt_Reflection 1920x1080 format=5 mipmap=0 reuse=0
+target _rt_Reflection_blur 1920x1080 format=5 mipmap=0 reuse=0
+target _rt_default 1920x1080 format=5 mipmap=0 reuse=0 bind=screen*1
+target _rt_shadowAtlas 2048x2048 format=5 mipmap=0 reuse=0

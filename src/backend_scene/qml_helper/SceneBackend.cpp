@@ -820,6 +820,17 @@ void SceneObject::sendSceneQuality() {
     std::string text   = "textures=" + std::to_string(textures);
     if (textures == (int)wallpaper::SceneQuality::Textures::Automatic && m_targetWidth > 0 && m_targetHeight > 0)
         text += ";targetWidth=" + std::to_string(m_targetWidth) + ";targetHeight=" + std::to_string(m_targetHeight);
+    // The scene-quality patch's switches: each is sent only when the map
+    // names it with the value that is not its default (volumetrics and
+    // reflections 0 for off, flatMsaa 1 for off), so a map without them sends
+    // the text it always did.
+    const auto switched = [this](const char* key, int value) {
+        const auto it = m_sceneQuality.constFind(QLatin1String(key));
+        return it != m_sceneQuality.constEnd() && it->toInt() == value;
+    };
+    if (switched("volumetrics", 0)) text += ";volumetrics=0";
+    if (switched("reflections", 0)) text += ";reflections=0";
+    if (switched("flatMsaa", 1)) text += ";flatMsaa=1";
     SET_PROPERTY(String, wallpaper::PROPERTY_SCENE_QUALITY, text);
 }
 

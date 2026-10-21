@@ -22,6 +22,9 @@ Flickable {
     property alias cfg_MpvPowerSaving: ckbox_mpvPowerSaving.checked
     property alias cfg_MpvInterpolation: ckbox_mpvInterpolation.checked
     property alias cfg_MpvHwdec: ckbox_mpvHwdec.checked
+    property alias cfg_MsaaOffForFlatScenes: ckbox_msaaOffForFlatScenes.checked
+    property alias cfg_Volumetrics: ckbox_volumetrics.checked
+    property alias cfg_Reflections: ckbox_reflections.checked
     property alias cfg_MpvLoadInMemory: ckbox_mpvLoadInMemory.checked
     property alias cfg_VerboseLogging: ckbox_verboseLogging.checked
     property alias cfg_SafeStartAfterCrash: ckbox_safeStartAfterCrash.checked
@@ -528,6 +531,7 @@ Flickable {
                         { text: i18nc("@item:inlistbox anti-aliasing", "Off"),                     value: 1 },
                         { text: i18nc("@item:inlistbox anti-aliasing", "2x"),                      value: 2 },
                         { text: i18nc("@item:inlistbox anti-aliasing", "4x"),                      value: 4 },
+                        { text: i18nc("@item:inlistbox anti-aliasing", "8x (heavy)"),              value: 8 },
                     ]
                     textRole: "text"
                     onActivated: cfg_MsaaMode = Common.cbCurrentValue(this)
@@ -538,6 +542,77 @@ Flickable {
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
                         text: i18nc("@info anti-aliasing help text", "Smooths edges on thin, bright shapes like rain streaks and sparks. Its cost is paid once per layer a wallpaper draws, so a busy scene on a large screen pays it hundreds of times per frame. Automatic lowers it as the screen gets larger and as more screens run wallpapers; pick a value yourself to override that. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "No anti-aliasing on 2D scenes")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: Switch {
+                    id: ckbox_msaaOffForFlatScenes
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info no anti-aliasing on 2D scenes help text", "Draws a scene without 3D elements (no model, nothing in perspective) without anti-aliasing, whatever is chosen above, as Wallpaper Engine does. Flat layers gain little from it; thin particles can look rougher. Volumetric lights are only drawn without anti-aliasing, so a 2D scene that has them starts drawing them, which costs more. 3D scenes keep the setting above. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Volumetric lighting")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: Switch {
+                    id: ckbox_volumetrics
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info volumetric lighting help text", "Light shafts and fog around the lights of scenes that have them. They are only drawn while a scene has no anti-aliasing (Anti-aliasing Off, or the switch above on a 2D scene); with anti-aliasing on, this switch changes nothing. Off, no scene draws them. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Reflections")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: Switch {
+                    id: ckbox_reflections
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info reflections help text", "Mirror images on the floors of 3D scenes that have them. Off, the scene is not drawn a second time for the mirror image and the reflecting surface shows none. Changing this reloads the wallpaper.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Web wallpaper resolution")
+                text_color: Kirigami.Theme.textColor
+                icon: '../../images/window.svg'
+                actor: ComboBox {
+                    id: cbWebRenderScale
+                    model: [
+                        { text: i18nc("@item:inlistbox web wallpaper resolution", "Full"),       value: 100 },
+                        { text: i18nc("@item:inlistbox web wallpaper resolution", "Half (50%)"), value: 50 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_WebRenderScale = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Math.max(0, Common.cbIndexOfValue(this, cfg_WebRenderScale))
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info web wallpaper resolution help text", "Half draws web wallpapers with half as many pixels in each direction and scales the picture up, so the picture is softer. The page keeps its layout and is told half the pixel ratio: the browser has fewer pixels to fill, and so has a page that sizes its canvas by the pixel ratio; a canvas sized by the window alone keeps its pixels. Applies once the page has loaded, without reloading it.")
                         wrapMode: Text.Wrap
                     }
                 }

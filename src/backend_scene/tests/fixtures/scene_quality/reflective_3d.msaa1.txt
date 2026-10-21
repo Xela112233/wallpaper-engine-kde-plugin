@@ -1,0 +1,49 @@
+msaa requested=1 samples=1 autoScale=0
+ortho 1920x1080 hdr=0 skybox=0
+camera @1 ortho 256x256 near=-1 far=1 paths=0 fade=0 reflectY0=0 effect=1
+camera effect ortho 2x2 near=-1 far=1 paths=0 fade=0 reflectY0=0 effect=0
+camera global perspective fov=50 aspect=1.778 near=1 far=5000 paths=1 fade=1 reflectY0=0 effect=0 active
+camera global_ortho ortho 1920x1080 near=-5000 far=5000 paths=0 fade=0 reflectY0=0 effect=0
+camera reflected_perspective perspective fov=50 aspect=1.778 near=1 far=5000 paths=1 fade=1 reflectY0=1 effect=0
+light kind=1 radius=300 castsVolumetrics=1
+volumetrics enabled=1 lights=1 quality=2 blur=2 combine=1
+reflectionBlur nodes=2 outputs=_rt_Reflection_blur,_rt_Reflection
+bloom enabled=1 nodes=4 outputs=_rt_Bloom_Quarter,_rt_Bloom_Eighth,_rt_Bloom_Result,_rt_default
+node id=-1 camera=- visible=1
+  node id=-1 camera=- visible=1
+  node id=-1 camera=- visible=1
+  node id=40 camera=global_ortho visible=1 material=_t textures=-
+  node id=41 camera=global_ortho visible=1 material=_mirror textures=_rt_Reflection
+  node id=42 camera=@1 visible=1 material=_t textures=-
+  node id=44 camera=- visible=1
+pass blur_h_bloom type=0 output=_rt_Bloom_Result camera=- textures=- reflectionDepth=0
+pass downsample_eighth_blur_v type=0 output=_rt_Bloom_Eighth camera=- textures=- reflectionDepth=0
+pass downsample_quarter_bloom type=0 output=_rt_Bloom_Quarter camera=- textures=- reflectionDepth=0
+pass volumetrics_back_0 type=0 output=_rt_volumetricsBack camera=- textures=- reflectionDepth=0
+pass volumetrics_front_0 type=0 output=_rt_volumetricsLightBuffer camera=- textures=_rt_volumetricsBack reflectionDepth=0
+pass volumetrics_blur_h type=0 output=_rt_volumetricsLightBufferB camera=- textures=_rt_volumetricsLightBuffer reflectionDepth=0
+pass volumetrics_blur_v type=0 output=_rt_volumetricsLightBuffer camera=- textures=_rt_volumetricsLightBufferB reflectionDepth=0
+pass _t type=0 output=_rt_effect_pingpong_a_@1 camera=- textures=- reflectionDepth=0
+pass _t type=0 output=_rt_default camera=- textures=- reflectionDepth=0
+pass blur_k3 type=0 output=_rt_Reflection_blur camera=- textures=- reflectionDepth=0
+pass refl__t type=0 output=_rt_Reflection camera=reflected_perspective textures=- reflectionDepth=1
+pass blur_k3 type=0 output=_rt_Reflection camera=- textures=- reflectionDepth=0
+pass _mirror type=0 output=_rt_default camera=- textures=_rt_Reflection reflectionDepth=0
+pass _t type=0 output=_rt_default camera=- textures=- reflectionDepth=0
+pass volumetrics_combine type=0 output=_rt_default camera=- textures=_rt_volumetricsLightBuffer reflectionDepth=0
+pass copy type=1
+pass combine type=0 output=_rt_default camera=- textures=-,- reflectionDepth=0
+target _rt_Bloom_Eighth 2x2 format=5 mipmap=0 reuse=0 bind=screen*0.125
+target _rt_Bloom_Quarter 2x2 format=5 mipmap=0 reuse=0 bind=screen*0.25
+target _rt_Bloom_Result 2x2 format=5 mipmap=0 reuse=0 bind=screen*0.125
+target _rt_Bloom_Scene 1920x1080 format=5 mipmap=0 reuse=0 bind=screen*1
+target _rt_MipMappedFrameBuffer 1920x1080 format=5 mipmap=1 reuse=0 bind=_rt_default*1
+target _rt_Reflection 1920x1080 format=5 mipmap=0 reuse=0
+target _rt_Reflection_blur 1920x1080 format=5 mipmap=0 reuse=0
+target _rt_default 1920x1080 format=5 mipmap=0 reuse=0 bind=screen*1
+target _rt_effect_pingpong_a_@1 256x256 format=5 mipmap=0 reuse=1
+target _rt_effect_pingpong_b_@1 256x256 format=5 mipmap=0 reuse=1
+target _rt_shadowAtlas 2048x2048 format=5 mipmap=0 reuse=0
+target _rt_volumetricsBack 2x2 format=8 mipmap=0 reuse=1 bind=screen*0.5
+target _rt_volumetricsLightBuffer 2x2 format=8 mipmap=0 reuse=1 bind=screen*0.5
+target _rt_volumetricsLightBufferB 2x2 format=8 mipmap=0 reuse=1 bind=screen*0.5

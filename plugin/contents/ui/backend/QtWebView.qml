@@ -75,6 +75,10 @@ Item {
         var fileUrl = webItem.source.toString();
         if (!fileUrl) return;
 
+        // Web wallpaper resolution (scene-quality patch): a document starts
+        // in the full-size view.  Returns at once unless the view is reduced.
+        webItem.fullSizeViewForLoad();
+
         // The document the bridge was talking to is about to be replaced —
         // by another wallpaper, or by the reload after a discard. Clear loaded
         // so the LoadSucceededStatus that follows is a real false->true edge;
@@ -661,6 +665,74 @@ Item {
         }
 
     }
+    // Web wallpaper resolution (scene-quality patch, main.xml WebRenderScale,
+    // background.webRenderScale): below 100, once the document has loaded,
+    // the view is laid out at that fraction of the screen, its zoom factor
+    // is the same fraction, and the item is scaled back up.  The page keeps
+    // its size in CSS pixels, so its layout does not change; Chromium rasters
+    // that fraction of the device pixels in each direction and
+    // devicePixelRatio drops with it.  The mouse goes through the item's
+    // transform (MouseGrabber maps to the item).
+    //
+    // Only for a loaded document: Chromium gives a new document its zoom
+    // factor a moment after its first script runs, so a page that starts in
+    // the small view sees a fraction of its viewport and may size itself by
+    // it.  So a document always starts in the full-size view at zoom 1 (the
+    // first load, the load after a discard, and loadWallpaper() on a view
+    // that is reduced, which first drops the old document), and the view is
+    // reduced when the load has succeeded.
+    //
+    // At 100 none of this runs: the state is not entered, the Connections
+    // below are off, and the view is as declared above: filling its parent,
+    // scale 1, the zoom factor never written.
+    readonly property real renderFraction: {
+        var p = background.webRenderScale;
+        return (p >= 25 && p < 100) ? p / 100 : 1;
+    }
+    // The document in the view has finished loading (kept only below 100).
+    property bool documentLoaded: false
+    // The setting changed under a running view: what the view holds now.
+    onRenderFractionChanged: documentLoaded = renderFraction < 1 && !web.loading && web.loadProgress === 100
+                                              && web.lifecycleState !== WebEngineView.LifecycleState.Discarded
+    Connections {
+        target: web
+        enabled: webItem.renderFraction < 1
+        function onLoadingChanged(loadingInfo) {
+            if (loadingInfo.status === WebEngineView.LoadStartedStatus)
+                webItem.documentLoaded = false;
+            else if (loadingInfo.status === WebEngineView.LoadSucceededStatus)
+                webItem.documentLoaded = true;
+        }
+        function onLifecycleStateChanged() {
+            if (web.lifecycleState === WebEngineView.LifecycleState.Discarded)
+                webItem.documentLoaded = false;
+        }
+    }
+    // loadWallpaper() calls this before it loads.  A view that is reduced
+    // still holds a document: drop it (as the long pause does), which puts
+    // the view back to full size at zoom 1 with no page to see the change,
+    // so the next document starts there.  A paused view, which the pause
+    // has hidden and frozen, is left as it is.  Nothing to do at 100, at the
+    // first load and after a discard.
+    function fullSizeViewForLoad() {
+        if (webItem.state !== "reducedResolution" || web.paused) return;
+        web.visible = false;
+        web.lifecycleState = WebEngineView.LifecycleState.Discarded;
+        web.visible = true;
+    }
+    states: State {
+        name: "reducedResolution"
+        when: webItem.renderFraction < 1 && webItem.documentLoaded
+        PropertyChanges {
+            target: web
+            anchors.rightMargin: webItem.width - Math.ceil(webItem.width * webItem.renderFraction)
+            anchors.bottomMargin: webItem.height - Math.ceil(webItem.height * webItem.renderFraction)
+            transformOrigin: Item.TopLeft
+            scale: 1 / webItem.renderFraction
+            zoomFactor: webItem.renderFraction
+        }
+    }
+
     // There is no signal for frame complete, so use timer to make sure not black result
     Timer{
         id: pauseTimer
