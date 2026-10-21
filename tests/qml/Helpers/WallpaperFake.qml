@@ -27,6 +27,7 @@ Item {
         "WallpaperWorkShopId": "",
         "WallpaperSource":     "",
         "BackgroundColor":     "#0a0a0a",
+        "AccentFromSchemeColor": true,   // matches main.xml default
         "DisplayMode":         0,        // Common.DisplayMode.Aspect
         "PauseMode":           0,
         "PauseFilterByScreen": false,

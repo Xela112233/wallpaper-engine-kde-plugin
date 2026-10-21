@@ -194,8 +194,20 @@ Rectangle {
     property bool _accentPending: false
     function emitAccentColor() {
         _accentPending = false;
+        // Plasma takes the wallpaper's scheme colour when it has one
+        // (AccentFromSchemeColor), else samples the picture.
         if (wallpaper.hasOwnProperty('accentColor'))
-            wallpaper.accentColorChanged();
+            schemeAccent.announce();
+    }
+    // we-manager: Plasma's accent colour from the wallpaper's own scheme
+    // colour; see SchemeAccent.qml.
+    SchemeAccent {
+        id: schemeAccent
+        wallpaperItem: wallpaper
+        readfile: pyext.readfile
+        enabled: wallpaper.configuration.AccentFromSchemeColor
+        path: background.wallpaperPath
+        userProps: background.curOpt['user_props'] || ({})
     }
 
     signal sig_backendFirstFrame(string backname)

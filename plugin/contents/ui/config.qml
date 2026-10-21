@@ -50,6 +50,7 @@ ColumnLayout {
     property alias  cfg_MuteAudio:           settingPage.cfg_MuteAudio
     property alias  cfg_MouseInput:          settingPage.cfg_MouseInput
     property alias  cfg_AnimatedPreview:     settingPage.cfg_AnimatedPreview
+    property alias  cfg_AccentFromSchemeColor: settingPage.cfg_AccentFromSchemeColor
     property alias  cfg_ResumeTime:          settingPage.cfg_ResumeTime
     property alias  cfg_SwitchTimer:         settingPage.cfg_SwitchTimer
     property alias  cfg_RandomizeWallpaper:  settingPage.cfg_RandomizeWallpaper

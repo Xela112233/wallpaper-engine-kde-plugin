@@ -25,6 +25,7 @@ Flickable {
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
     property alias cfg_MouseInput: ckbox_mouseInput.checked
+    property alias cfg_AccentFromSchemeColor: ckbox_accentFromSchemeColor.checked
     property alias cfg_AnimatedPreview: ckbox_animatedPreview.checked
     property alias cfg_ResumeTime: resumeSpin.value
     property alias cfg_SwitchTimer: randomSpin.value
@@ -281,6 +282,22 @@ Flickable {
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
                         text: i18nc("@info background color help text", "Color drawn in the letterbox/pillarbox bars when the wallpaper's aspect ratio doesn't match the screen.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Accent Color from Scheme Color")
+                text_color: Kirigami.Theme.textColor
+                actor: Switch {
+                    id: ckbox_accentFromSchemeColor
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info accent from scheme color help text", "When Plasma takes its accent color from the wallpaper (System Settings, Colors), use the scheme color the wallpaper's author chose, if it has one, instead of a color sampled from the picture. Plasma reads the wallpaper of the primary screen only.")
                         wrapMode: Text.Wrap
                     }
                 }

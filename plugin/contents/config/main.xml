@@ -22,6 +22,10 @@
       <label>Backdrop color (visible in Keep Aspect Ratio mode behind aspect-mismatched wallpapers)</label>
       <default>black</default>
     </entry>
+    <entry name="AccentFromSchemeColor" type="Bool">
+      <label>Plasma's accent colour from the wallpaper takes the wallpaper's own scheme colour, when it has one, instead of a colour sampled from the picture</label>
+      <default>true</default>
+    </entry>
     <entry name="DisplayMode" type="Int">
       <label>Video display mode</label>
       <default>1</default>
