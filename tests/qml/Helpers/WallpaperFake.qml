@@ -53,6 +53,7 @@ Item {
         "VerboseLogging":      false,
         "MouseInput":          false,
         "KeyboardInput":       false,    // matches main.xml default (we-manager input patch)
+        "IconOpacity":         100,      // matches main.xml default (we-manager icon-opacity patch)
         "AnimatedPreview":     false,
         "Fps":                 30,
         "RenderScale":         100,

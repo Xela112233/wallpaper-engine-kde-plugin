@@ -122,6 +122,12 @@
       <label>Mouse Input</label>
       <default>true</default>
     </entry>
+    <entry name="IconOpacity" type="Int">
+      <label>Opacity of the desktop's icons (Folder View) over the wallpaper, in percent; widgets are not faded</label>
+      <default>100</default>
+      <min>0</min>
+      <max>100</max>
+    </entry>
     <entry name="KeyboardInput" type="Bool">
       <label>Keyboard mode for web wallpapers: the "Give the keyboard to the web wallpaper" shortcut hands the desktop's keys to the page until Escape</label>
       <default>false</default>

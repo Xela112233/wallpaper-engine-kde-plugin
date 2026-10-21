@@ -26,6 +26,7 @@ Flickable {
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
     property alias cfg_MouseInput: ckbox_mouseInput.checked
     property alias cfg_KeyboardInput: ckbox_keyboardInput.checked
+    property alias cfg_IconOpacity: sliderIconOpacity.value
     property alias cfg_AccentFromSchemeColor: ckbox_accentFromSchemeColor.checked
     property alias cfg_AnimatedPreview: ckbox_animatedPreview.checked
     property alias cfg_ResumeTime: resumeSpin.value
@@ -651,6 +652,37 @@ Flickable {
                     Text {
                         Layout.fillWidth: true
                         text: i18nc("@info media integration help text", "Lets scene and web wallpapers show what your media player is playing: title, artist, album, cover, playback state and position. Works with any player that supports MPRIS (Spotify, browsers, most desktop players).")
+                        color: Kirigami.Theme.disabledTextColor
+                        wrapMode: Text.WordWrap
+                        font.italic: true
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    }
+                }
+            }
+
+            OptionItem {
+                text: i18nc("@label settings option", "Desktop Icon Opacity")
+                text_color: Kirigami.Theme.textColor
+                actor: RowLayout {
+                    Layout.preferredWidth: displayMode.width
+                    Label {
+                        Layout.preferredWidth: font.pixelSize * 3
+                        text: sliderIconOpacity.value.toString() + "%"
+                        color: Kirigami.Theme.textColor
+                    }
+                    Slider {
+                        id: sliderIconOpacity
+                        Layout.fillWidth: true
+                        from: 0
+                        to: 100
+                        stepSize: 5.0
+                        snapMode: Slider.SnapOnRelease
+                    }
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        text: i18nc("@info icon opacity help text", "Fades the desktop's icons (Folder View) over the wallpaper. Widgets stay as they are. With the Desktop layout there are no icons to fade.")
                         color: Kirigami.Theme.disabledTextColor
                         wrapMode: Text.WordWrap
                         font.italic: true

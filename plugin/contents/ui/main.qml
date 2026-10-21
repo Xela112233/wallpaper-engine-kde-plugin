@@ -45,6 +45,11 @@ Rectangle {
     readonly property bool keyboardModeAvailable: keyboardInput && backendLoader.item !== null
                                                   && typeof backendLoader.item.getKeyboardTarget === "function"
     onKeyboardModeAvailableChanged: if (!keyboardModeAvailable) keyboardMode = false
+    // Desktop icon opacity (IconOpacity, the we-manager build): fades Folder
+    // View's icon layer, the FolderViewLayer item plasma-desktop's desktop
+    // containment loads into its AppletsLayout, and not the widgets beside it.
+    // Nothing is touched at 100.
+    property int    iconOpacity: Math.max(0, Math.min(100, wallpaper.configuration.IconOpacity ?? 100))
     property bool   animatedPreview: wallpaper.configuration.AnimatedPreview
     property bool   mpvStats: wallpaper.configuration.MpvStats
     property bool   mpvPowerSaving: wallpaper.configuration.MpvPowerSaving
@@ -359,6 +364,57 @@ Rectangle {
         }
         function onKeyboardEndRequested() { background.keyboardMode = false; }
     }
+    // The icon layer, found in plasmashell's item tree like the mouse hook's
+    // AppletsLayout; null until found, and again when Folder View goes (the
+    // Desktop layout) or reloads.
+    property Item iconLayer: null
+    function findIconLayer() {
+        if (!background.Window || !Window.contentItem) return null;
+        // The FolderViewLayer item, not its loader (FolderViewLayerLoader).
+        const seen = new Set();
+        function walk(node) {
+            if (!node || seen.has(node)) return null;
+            seen.add(node);
+            if (/^FolderViewLayer(_QML|\()/.test(node.toString())) return node;
+            for (let i = 0; i < node.children.length; i++) {
+                const found = walk(node.children[i]);
+                if (found) return found;
+            }
+            return null;
+        }
+        return walk(Window.contentItem);
+    }
+    Binding {
+        target: background.iconLayer
+        property: "opacity"
+        value: background.iconOpacity / 100
+        when: background.iconLayer !== null && background.iconOpacity < 100
+        restoreMode: Binding.RestoreBindingOrValue
+    }
+    // Folder View may load after the wallpaper: look again every 2 s, 15
+    // times, while icons are to be faded, then say once that there are none.
+    Timer {
+        id: iconLayerTimer
+        interval: 2000
+        repeat: true
+        running: background.iconOpacity < 100 && background.iconLayer === null && tries < 15
+        triggeredOnStart: true
+        property int tries: 0
+        property bool reported: false
+        onTriggered: {
+            background.iconLayer = background.findIconLayer();
+            tries += 1;
+            if (background.iconLayer !== null) {
+                console.log("[WEK] IconOpacity: fading " + background.iconLayer + " to " + background.iconOpacity + "%");
+            } else if (tries >= 15 && !reported) {
+                reported = true;
+                console.warn("[WEK] IconOpacity: no FolderViewLayer in this screen's desktop (the Desktop layout has "
+                             + "no icons, or this Plasma names Folder View's layer differently); nothing is faded");
+            }
+        }
+    }
+    onIconLayerChanged: if (iconLayer === null) iconLayerTimer.tries = 0
+    onIconOpacityChanged: if (iconLayer === null) iconLayerTimer.tries = 0
     // Says the keys go to the wallpaper and how to give them back.
     Rectangle {
         id: keyboardModeNote
@@ -450,6 +506,8 @@ Rectangle {
             keyHooker.active = false;
             keyHooker.destroy();
         }
+        // A Binding that goes with this item does not put the old value back.
+        if (iconLayer && iconOpacity < 100) iconLayer.opacity = 1.0;
     }
 
     function applySource() {

@@ -3,5 +3,7 @@ AppletsLayout 1.0 AppletsLayout.qml
 AsyncUtil 1.0 AsyncUtil.qml
 BackgroundFake 1.0 BackgroundFake.qml
 BackgroundStageFake 1.0 BackgroundStageFake.qml
+FolderViewLayer 1.0 FolderViewLayer.qml
+FolderViewLayerLoader 1.0 FolderViewLayerLoader.qml
 WallpaperFake 1.0 WallpaperFake.qml
 ScreenRig 1.0 ScreenRig.qml
