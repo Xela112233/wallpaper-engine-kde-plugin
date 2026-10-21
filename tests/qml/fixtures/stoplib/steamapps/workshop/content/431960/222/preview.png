@@ -1,0 +1,8 @@
+P3
+# The preview tst_main_stop.qml shows while stopped: a text image (PPM) under
+# the name main.qml tries, since a patch cannot carry a binary file; Qt reads
+# it by its content.
+2 2
+255
+255 0 0  0 255 0
+0 0 255  255 255 255

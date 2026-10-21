@@ -48,6 +48,7 @@ WekControl::WekControl(QObject* parent, QDBusConnection bus)
     : QObject(parent), m_bus(std::move(bus)) {}
 
 WekControl::~WekControl() {
+    if (m_stopAnnounced) broadcastStop(false);
     // Drop this instance's own registry entry, and opportunistically purge
     // any already-null entries left by a controller that died before its
     // WekControl sibling did -- otherwise the process-wide registry grows by
@@ -171,6 +172,20 @@ bool WekControl::IsPaused() const {
     QMetaObject::invokeMethod(
         m_controller, "isPaused", Qt::DirectConnection, Q_RETURN_ARG(QVariant, v));
     return v.toBool();
+}
+
+// -- Stop on every screen --
+
+void WekControl::broadcastStop(bool stopped) {
+    m_stopAnnounced  = stopped;
+    const QString me = QStringLiteral("wekcontrol-%1").arg(quintptr(this), 0, 16);
+    for (const QPointer<QObject>& ctrl : controllerRegistry())
+        if (ctrl && ctrl != m_controller)
+            QMetaObject::invokeMethod(ctrl,
+                                      "remoteStop",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QVariant, QVariant(me)),
+                                      Q_ARG(QVariant, QVariant(stopped)));
 }
 
 // -- Signal bridge from QML --

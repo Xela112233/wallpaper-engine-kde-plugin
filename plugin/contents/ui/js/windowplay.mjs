@@ -46,6 +46,57 @@ export function countWindows(windows, mode, screenGeometry) {
     return { notMin, max, full, active };
 }
 
+// What a window condition does to the wallpaper (FocusAction, MaximizedAction,
+// FullscreenAction in main.xml).  Pause is every action's default, which is
+// what the plugin did before there were per-condition actions.
+export const Action = Object.freeze({ Keep: 0, Mute: 1, Pause: 2, Stop: 3 });
+
+// The conditions each PauseMode watches.  `any` is Any mode's catch-all: a
+// window that is none of the other three still pauses there.
+function watched(mode) {
+    switch (mode) {
+    case PauseMode.Any:        return { focus: true,  max: true,  full: true, any: true };
+    case PauseMode.Max:        return { focus: false, max: true,  full: true, any: false };
+    case PauseMode.Focus:      return { focus: true,  max: false, full: false, any: false };
+    case PauseMode.FocusOrMax: return { focus: true,  max: true,  full: true, any: false };
+    case PauseMode.FullScreen: return { focus: false, max: false, full: true, any: false };
+    default:                   return { focus: false, max: false, full: false, any: false };
+    }
+}
+
+function actionOf(value) {
+    return (value === Action.Keep || value === Action.Mute || value === Action.Stop) ? value : Action.Pause;
+}
+
+// The per-condition decision: { pause, mute, stop } requested by the windows.
+// PauseMode still picks which conditions are watched; `actions`
+// ({ focus, maximized, fullscreen }, each an Action, missing = Pause) says
+// what each one does.  A window counts once, for the most specific watched
+// condition it meets (fullscreen, then maximized, then focused), so a
+// focused fullscreen game follows FullscreenAction where fullscreen is
+// watched.  With every action Pause, `pause` is exactly !shouldPlay(), so
+// configs from before the actions existed behave as they did.
+export function windowRequests(windows, mode, screenGeometry, actions) {
+    const out = { pause: false, mute: false, stop: false };
+    const w = watched(mode);
+    const a = actions || {};
+    for (let i = 0; i < windows.length; i++) {
+        const win = windows[i];
+        if (win.isMinimized === true) continue;
+        const isFull = win.isFullScreen === true || coversScreen(win.geometry, screenGeometry);
+        const isMax = win.isMaximized === true || isFull;
+        let act = null;
+        if (w.full && isFull)                      act = actionOf(a.fullscreen);
+        else if (w.max && isMax)                   act = actionOf(a.maximized);
+        else if (w.focus && win.isActive === true) act = actionOf(a.focus);
+        else if (w.any)                            act = Action.Pause;
+        if (act === Action.Pause) out.pause = true;
+        else if (act === Action.Mute) out.mute = true;
+        else if (act === Action.Stop) out.stop = true;
+    }
+    return out;
+}
+
 // The play decision: returns true when the wallpaper should PLAY, exactly
 // reproducing the previous switch (play iff no window satisfies the mode's
 // predicate). Unknown modes play (the previous `default:` branch). The

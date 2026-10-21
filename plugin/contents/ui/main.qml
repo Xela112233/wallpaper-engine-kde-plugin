@@ -94,7 +94,9 @@ Rectangle {
 
     property int    displayMode: get_opt_value('display_mode', wallpaper.configuration.DisplayMode)
     property string backgroundColor: get_opt_value('background_color', wallpaper.configuration.BackgroundColor)
-    property bool   mute: get_opt_value('mute_audio', wallpaper.configuration.MuteAudio)
+    // A window condition set to Mute (FocusAction, MaximizedAction,
+    // FullscreenAction) silences the wallpaper over its own setting.
+    property bool   mute: windowModel.reqMute || get_opt_value('mute_audio', wallpaper.configuration.MuteAudio)
     property int    volume: get_opt_value('volume', wallpaper.configuration.Volume)
     property real   speed: get_opt_value('speed', wallpaper.configuration.Speed)
     // User properties for scene wallpapers (JSON string format)
@@ -116,10 +118,93 @@ Rectangle {
     // Toggle, global shortcut). It sits in the same gate as the automatic
     // sources so resuming from it can't start drawing while a fullscreen
     // window, battery saving or the locker still wants the renderer idle.
+    // A stop request pauses at once and unloads after stopGrace (see Stop
+    // below); a stop on another screen (StopScope 1) holds this one too.
     property bool   ok: !playlistController.userPaused
                        && !windowModel.reqPause && !powerSource.reqPause
+                       && !windowModel.reqStop && !playlistController.stoppedElsewhere
                        && !(lockMonitor.active
                             && wallpaper.configuration.ScreenSaverPolicy === 1)
+
+    // Stop: instead of pausing, unload the backend, so its scene, textures,
+    // decoder and GPU device are freed, and load it again when the reason
+    // ends.  The reasons: a window condition whose action is Stop
+    // (windowModel.reqStop), battery with PauseAction 1, and, with StopScope 1
+    // (all screens), a stop on another screen of this plasmashell.  A user
+    // pause and the screen locker still only pause.  A request has to last
+    // stopGraceMs first, so a window that flashes up does not cost a reload.
+    readonly property bool stopRequested: windowModel.reqStop
+                       || (powerSource.reqPause && wallpaper.configuration.PauseAction === 1)
+    property int    stopGraceMs: 10000
+    property bool   _stopDue: false
+    // A wallpaper picked by hand while another screen holds this one stopped
+    // is shown until that stop ends.
+    property bool   _ignoreRemoteStop: false
+    readonly property bool stopNow: _stopDue
+                       || (playlistController.stoppedElsewhere && !_ignoreRemoteStop)
+    // The backend is unloaded.
+    property bool   stopped: false
+    // Set while the playlist writes the next wallpaper (setWallpaperFromItem):
+    // rotation does not load a stopped screen, a pick by hand does.
+    property bool   _pickedByPlaylist: false
+    // The failure the primary screen last notified about (source and
+    // message).  A stop unloads InfoShow too, and loading the same broken
+    // wallpaper again when the stop ends must not notify again; a backend
+    // that draws its first frame clears it.
+    property string _notifiedFail: ""
+    readonly property bool stopsAllScreens: _stopDue && wallpaper.configuration.StopScope === 1
+    onStopRequestedChanged: {
+        if (stopRequested) {
+            stopGrace.restart();
+        } else {
+            stopGrace.stop();
+            _stopDue = false;
+        }
+    }
+    onStopNowChanged: stopNow ? stopBackend() : startBackend()
+    onStopsAllScreensChanged: {
+        if (typeof dbusControl.broadcastStop === "function")
+            dbusControl.broadcastStop(stopsAllScreens);
+    }
+    Connections {
+        target: playlistController
+        function onStoppedElsewhereChanged() { background._ignoreRemoteStop = false; }
+    }
+    Timer {
+        id: stopGrace
+        interval: background.stopGraceMs
+        repeat: false
+        onTriggered: background._stopDue = background.stopRequested
+    }
+    function stopBackend() {
+        if (stopped) return;
+        stopped = true;
+        console.log("[WEK] stop: unloading the wallpaper until the reason ends");
+        diagnostics.logPauseTransition("stop", false);
+        backendLoader.unload();
+    }
+    function startBackend() {
+        if (!stopped) return;
+        stopped = false;
+        diagnostics.logPauseTransition("stop", true);
+        loadBackend();
+    }
+    // A wallpaper written from outside while stopped, decided on the next
+    // turn, once plasmashell has handed over every key of the write in
+    // whatever order: AutoPickSource equal to WallpaperSource marks an
+    // automatic step (we-manager writes it for its playlists' and virtual
+    // desktops' changes, and "" for a pick by hand), which waits for the
+    // reload like the plugin's own playlist; anything else is a pick by hand,
+    // shown now, and the stop comes back after the grace period if its
+    // reason is still there.
+    function _pickedWhileStopped() {
+        if (!background.stopped) return;
+        const marker = wallpaper.configuration.AutoPickSource;
+        if (marker && marker === wallpaper.configuration.WallpaperSource) return;
+        background._ignoreRemoteStop = playlistController.stoppedElsewhere;
+        background._stopDue = false;
+        if (background.stopRequested) stopGrace.restart();
+    }
 
     // detect TTY switch and pause wallpaper(s)
     TTYSwitchMonitor {
@@ -217,6 +302,7 @@ Rectangle {
     // inside Connections).
     onSig_backendFirstFrame: (backname) => {
         console.log(`backend ${backname} first frame`);
+        background._notifiedFail = "";
         // Plasma samples the wallpaper when this fires; with an outgoing layer
         // still on top it would read the old one, so wait for it to go.
         if (backendLoader._outgoing || outgoingFade.running)
@@ -262,6 +348,14 @@ Rectangle {
 
         if(type_changed) wallpaperType = type;
         if(path_changed) wallpaperPath = path;
+
+        // Stopped: the playlist's next wallpaper waits for the reload; one
+        // written from outside is looked at in _pickedWhileStopped().
+        if (background.stopped) {
+            backendWorkshopId = wid;
+            if (!background._pickedByPlaylist) Qt.callLater(background._pickedWhileStopped);
+            return;
+        }
 
         // A different wallpaper always gets a fresh backend item, even of the
         // same type, so it goes through the backendLoader handoff: the old one
@@ -376,6 +470,10 @@ Rectangle {
         // dump which window satisfied the PauseMode predicate.
         logging: wallpaper.configuration.PauseDebugLogging
         onReqPauseChanged: diagnostics.logPauseTransition("windowModel", !windowModel.reqPause)
+        focusAction: wallpaper.configuration.FocusAction
+        maximizedAction: wallpaper.configuration.MaximizedAction
+        fullscreenAction: wallpaper.configuration.FullscreenAction
+        onReqStopChanged: diagnostics.logPauseTransition("windowStop", !windowModel.reqStop)
     }
 
     PowerSource {
@@ -510,8 +608,10 @@ Rectangle {
             wallpaper.configuration.CurrentItemIndex = idx;
         }
         setWallpaperFromItem: function(item) {
+            background._pickedByPlaylist = true;
             wallpaper.configuration.WallpaperWorkShopId = item.workshopid;
             wallpaper.configuration.WallpaperSource = Common.packWallpaperSource(item);
+            background._pickedByPlaylist = false;
         }
         setUserPaused: function(v) {
             wallpaper.configuration.UserPaused = v;
@@ -560,6 +660,7 @@ Rectangle {
         id: loadingHintDelay
         interval: 600
         running: !backendLoader.item && background.source && background.nowBackend !== "InfoShow"
+                 && !background.stopped
         repeat: false
     }
     Text {
@@ -568,6 +669,7 @@ Rectangle {
               && !loadingHintDelay.running
               && background.source
               && background.nowBackend !== "InfoShow"
+              && !background.stopped
         text: "Loading wallpaper…"
         color: "#cccccc"
         font.pixelSize: 18
@@ -575,6 +677,33 @@ Rectangle {
         Behavior on opacity { NumberAnimation { duration: background.reducedMotion ? 0 : 250 } }
         onVisibleChanged: opacity = visible ? 0.7 : 0.0
         Component.onCompleted: opacity = visible ? 0.7 : 0.0
+    }
+
+    // What a stopped wallpaper leaves on screen: its preview image (workshop
+    // items ship preview.jpg, .gif or .png next to project.json; a gif shows
+    // its first frame), else the background colour.  Not cached, so the
+    // memory goes with the stop.
+    Image {
+        id: stopPlaceholder
+        anchors.fill: parent
+        visible: background.stopped && status === Image.Ready
+        fillMode: Image.PreserveAspectCrop
+        asynchronous: true
+        cache: false
+        sourceSize.width: width
+        sourceSize.height: height
+        readonly property var names: ["preview.jpg", "preview.gif", "preview.png"]
+        readonly property string dir: {
+            const p = background.wallpaperPath;
+            const i = p.lastIndexOf('/');
+            return i > 0 ? p.slice(0, i) : "";
+        }
+        property int tried: 0
+        readonly property bool want: background.stopped && dir !== ""
+        onWantChanged: tried = 0
+        onDirChanged: tried = 0
+        source: want && tried < names.length ? dir + "/" + names[tried] : ""
+        onStatusChanged: if (status === Image.Error) tried += 1
     }
 
     // main
@@ -636,6 +765,20 @@ Rectangle {
             } else {
                 backend.destroy();
             }
+        }
+        // Stop: every backend goes now, the outgoing layer too, with no fade.
+        function unload() {
+            handoffTimeout.stop();
+            if (outgoingFade.running) outgoingFade.stop();
+            if (outgoingFade.target) this.retire(outgoingFade.target);
+            outgoingFade.target = null;
+            if (this._outgoing) this.retire(this._outgoing);
+            this._outgoing = null;
+            const cur = this.item;
+            this.item = null;
+            if (cur) this.retire(cur);
+            if (background.mouseHooker) background.mouseHooker.target = null;
+            background.nowBackend = "";
         }
         // Fade the outgoing backend out and destroy it.
         function dropOutgoing() {
@@ -704,7 +847,11 @@ Rectangle {
             // dedup the user sees 1+N popups for the same failure. `!== false`
             // (not `=== true`) lets undefined fall through as truthy → fire-
             // by-default on Plasma versions that don't expose primary.
-            if (Window.screen?.primary !== false) {
+            // Once per failure (_notifiedFail): a stop and its reload bring
+            // the same InfoShow back.
+            const failure = background.source + "\n" + info;
+            if (Window.screen?.primary !== false && background._notifiedFail !== failure) {
+                background._notifiedFail = failure;
                 notifier.wallpaperLoadFailed(background.workshopid || "", info);
             }
             this.load("backend/InfoShow.qml", {
@@ -738,6 +885,8 @@ Rectangle {
     }
 
     function loadBackend() {
+        // Stopped: startBackend() loads the wallpaper when the stop ends.
+        if (background.stopped) return;
         let qmlsource = "";
         let properties = {};
 
@@ -892,6 +1041,8 @@ Rectangle {
 
         // load first backend
         applySource();
+        // A stop reason already there at start (on battery) emits no change.
+        if (stopRequested) stopGrace.restart();
 
         // background signal connect
         background.videoBackendChanged.connect(loadBackend);

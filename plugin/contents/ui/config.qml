@@ -76,6 +76,13 @@ ColumnLayout {
     property alias  cfg_CacheQuotaMB:        settingPage.cfg_CacheQuotaMB
     property int    cfg_DisplayMode
     property int    cfg_PauseMode
+    // Per-condition actions and the stop (SettingPage's Pause rows read and
+    // write them unqualified, like cfg_PauseMode).
+    property int    cfg_FocusAction
+    property int    cfg_MaximizedAction
+    property int    cfg_FullscreenAction
+    property int    cfg_PauseAction
+    property int    cfg_StopScope
     property int    cfg_VideoBackend
     // Render resolution and anti-aliasing combo boxes on SettingPage read
     // and write these two unqualified (Common.cbCurrentValue/cbIndexOfValue,

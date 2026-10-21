@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PauseMode, countWindows, shouldPlay, coversScreen } from '../../plugin/contents/ui/js/windowplay.mjs';
+import { PauseMode, Action, countWindows, shouldPlay, coversScreen, windowRequests }
+    from '../../plugin/contents/ui/js/windowplay.mjs';
 
 // Window descriptor helper: defaults everything false, override per case.
 // Matches the shape WindowModel.qml builds from tasksModel.data(idx, role):
@@ -149,4 +150,64 @@ test('Focus: a screen-covering window without isActive does not pause (geometry 
 });
 test('Max: omitting the screenGeometry argument matches the pre-geometry behavior (no false pause)', () => {
     assert.equal(shouldPlay([borderless], PauseMode.Max), true);
+});
+
+// ── windowRequests: an action per condition (FocusAction, MaximizedAction, ──
+// FullscreenAction).  With every action at its default (Pause) the decision
+// must be exactly shouldPlay's, in every mode, so configs from before the
+// actions existed keep their behaviour.
+const shapes = [
+    [], [w()], [w({ isMinimized: true })], [w({ isActive: true })], [w({ isMaximized: true })],
+    [w({ isFullScreen: true })], [w({ isActive: true, isFullScreen: true })], [borderless],
+    [w({ isMaximized: true, isMinimized: true })], [w(), w({ isActive: true }), w({ isMaximized: true })],
+];
+test('windowRequests with default actions pauses exactly when shouldPlay says not to play', () => {
+    for (const mode of [0, 1, 2, 3, 4, 5, 99])
+        for (const ws of shapes)
+            for (const g of [undefined, screen]) {
+                const r = windowRequests(ws, mode, g, {});
+                assert.equal(r.pause, !shouldPlay(ws, mode, g), `mode ${mode} ${JSON.stringify(ws)}`);
+                assert.equal(r.mute || r.stop, false);
+            }
+});
+test('Action values are the main.xml ones: 0 keep, 1 mute, 2 pause, 3 stop', () => {
+    assert.deepEqual([Action.Keep, Action.Mute, Action.Pause, Action.Stop], [0, 1, 2, 3]);
+});
+test('windowRequests: a fullscreen window follows FullscreenAction, not MaximizedAction', () => {
+    const acts = { maximized: Action.Pause, fullscreen: Action.Stop };
+    assert.deepEqual(windowRequests([w({ isFullScreen: true })], PauseMode.Max, screen, acts),
+                     { pause: false, mute: false, stop: true });
+    assert.deepEqual(windowRequests([w({ isMaximized: true })], PauseMode.Max, screen, acts),
+                     { pause: true, mute: false, stop: false });
+    // borderless: covers the screen without the flag, still fullscreen
+    assert.equal(windowRequests([borderless], PauseMode.Max, screen, acts).stop, true);
+});
+test('windowRequests: a focused fullscreen window is fullscreen where fullscreen is watched', () => {
+    const acts = { focus: Action.Mute, fullscreen: Action.Keep };
+    const game = [w({ isActive: true, isFullScreen: true })];
+    assert.deepEqual(windowRequests(game, PauseMode.FocusOrMax, screen, acts),
+                     { pause: false, mute: false, stop: false });
+    // Focus mode watches focus only: the same window is a focused window there
+    assert.deepEqual(windowRequests(game, PauseMode.Focus, screen, acts),
+                     { pause: false, mute: true, stop: false });
+});
+test('windowRequests: Keep ignores a condition, and each window adds its own request', () => {
+    const acts = { focus: Action.Keep, maximized: Action.Mute, fullscreen: Action.Stop };
+    const ws = [w({ isActive: true }), w({ isMaximized: true })];
+    assert.deepEqual(windowRequests(ws, PauseMode.FocusOrMax, screen, acts),
+                     { pause: false, mute: true, stop: false });
+    assert.deepEqual(windowRequests(ws.concat([w({ isFullScreen: true })]), PauseMode.FocusOrMax, screen, acts),
+                     { pause: false, mute: true, stop: true });
+});
+test('windowRequests: Any mode still pauses for a plain window whatever the actions', () => {
+    const acts = { focus: Action.Keep, maximized: Action.Keep, fullscreen: Action.Keep };
+    assert.equal(windowRequests([w()], PauseMode.Any, screen, acts).pause, true);
+    assert.equal(windowRequests([w({ isMaximized: true })], PauseMode.Any, screen, acts).pause, false);
+});
+test('windowRequests: Never and minimized windows request nothing; unknown values mean Pause', () => {
+    const none = { pause: false, mute: false, stop: false };
+    assert.deepEqual(windowRequests([w({ isFullScreen: true })], PauseMode.Never, screen, { fullscreen: 3 }), none);
+    assert.deepEqual(windowRequests([w({ isFullScreen: true, isMinimized: true })], PauseMode.Max, screen,
+                                    { fullscreen: 3 }), none);
+    assert.equal(windowRequests([w({ isFullScreen: true })], PauseMode.Max, screen, { fullscreen: 7 }).pause, true);
 });

@@ -24,6 +24,7 @@ Item {
 
     property var configuration: ({
         "SteamLibraryPath":    "",
+        "AutoPickSource":      "",       // we-manager's mark of an automatic change (stop-action patch)
         "WallpaperWorkShopId": "",
         "WallpaperSource":     "",
         "BackgroundColor":     "#0a0a0a",
@@ -31,6 +32,11 @@ Item {
         "DisplayMode":         0,        // Common.DisplayMode.Aspect
         "PauseMode":           0,
         "PauseFilterByScreen": false,
+        "FocusAction":         2,        // Pause (main.xml default)
+        "MaximizedAction":     2,
+        "FullscreenAction":    2,
+        "PauseAction":         0,        // Pause on battery
+        "StopScope":           0,        // This screen
         "PauseOnBatPower":     false,
         "PauseBatPercent":     0,
         "PauseDebugLogging":   false,

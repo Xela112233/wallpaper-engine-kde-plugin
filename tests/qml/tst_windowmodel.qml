@@ -467,4 +467,71 @@ TestCase {
                "onVirtualDesktopChanged must schedule the triggerTimer");
         tt.stop();
     }
+
+    // ── per-condition actions: keep / mute / pause / stop ────────────────────
+    function _actions(focus, maximized, fullscreen) {
+        wm.focusAction = focus;
+        wm.maximizedAction = maximized;
+        wm.fullscreenAction = fullscreen;
+    }
+    function cleanup() {
+        // Back to the defaults (Pause) and no requests, for the tests above.
+        _actions(2, 2, 2);
+        _setWindows([]);
+        _runUpdate();
+        _settlePlay();
+    }
+
+    function test_actions_default_to_pause() {
+        compare(wm.focusAction, 2);
+        compare(wm.maximizedAction, 2);
+        compare(wm.fullscreenAction, 2);
+    }
+
+    function test_fullscreenStop_requestsStopNotPause() {
+        wm.modePlay = Plugin.Common.PauseMode.FocusOrMax;
+        _actions(2, 2, 3);
+        _setWindows([{
+            isWindow: true, isActive: true, isMaximized: false, isFullScreen: true,
+            isMinimized: false, activities: [], appName: "game",
+        }]);
+        _runUpdate();
+        compare(wm.reqStop, true);
+        compare(wm.reqPause, false, "a focused fullscreen game follows FullscreenAction");
+        // The game quits: the stop is dropped after the resume delay, like a pause.
+        _setWindows([]);
+        _runUpdate();
+        compare(wm.reqStop, true, "dropped before the resume delay");
+        _settlePlay();
+        compare(wm.reqStop, false);
+    }
+
+    function test_maximizedMute_andFocusKeep() {
+        wm.modePlay = Plugin.Common.PauseMode.FocusOrMax;
+        _actions(0, 1, 2);
+        _setWindows([{
+            isWindow: true, isActive: true, isMaximized: false, isFullScreen: false,
+            isMinimized: false, activities: [], appName: "browser",
+        }]);
+        _runUpdate();
+        _settlePlay();
+        compare(wm.reqPause, false, "Keep: a focused window does nothing");
+        compare(wm.reqMute, false);
+        _setWindows([{
+            isWindow: true, isActive: false, isMaximized: true, isFullScreen: false,
+            isMinimized: false, activities: [], appName: "editor",
+        }]);
+        _runUpdate();
+        compare(wm.reqMute, true);
+        compare(wm.reqPause, false);
+    }
+
+    function test_actionChange_schedulesRedecision() {
+        const tt = _findTriggerTimer();
+        verify(tt !== null);
+        tt.stop();
+        wm.fullscreenAction = 3;
+        verify(tt.running, "a changed action must apply now, not at the next window event");
+        tt.stop();
+    }
 }

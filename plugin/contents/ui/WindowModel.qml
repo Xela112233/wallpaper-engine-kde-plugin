@@ -73,25 +73,56 @@ Item {
     // A changed pause mode must apply now, not at the next window event.
     onModePlayChanged: updateWindowsinfo()
 
+    // What each watched condition does (main.xml FocusAction, MaximizedAction,
+    // FullscreenAction; WindowPlay.Action: 0 keep, 1 mute, 2 pause, 3 stop).
+    // Pause, the default, is what every condition did before they had actions.
+    property int focusAction: WindowPlay.Action.Pause
+    property int maximizedAction: WindowPlay.Action.Pause
+    property int fullscreenAction: WindowPlay.Action.Pause
+    onFocusActionChanged: updateWindowsinfo()
+    onMaximizedActionChanged: updateWindowsinfo()
+    onFullscreenActionChanged: updateWindowsinfo()
+
     // ---
     readonly property bool reqPause: _reqPause
+    readonly property bool reqMute: _reqMute
+    readonly property bool reqStop: _reqStop
     property bool _reqPause: false
+    property bool _reqMute: false
+    property bool _reqStop: false
+    // What the windows ask for now; a request that ends is dropped only after
+    // resumeTime, like a pause always was.
+    property bool _wantPause: false
+    property bool _wantMute: false
+    property bool _wantStop: false
 
     Timer{
         id: playTimer
         running: false
         repeat: false
         onTriggered: {
-            _reqPause = false;
+            _reqPause = _wantPause;
+            _reqMute = _wantMute;
+            _reqStop = _wantStop;
         }
     }
-    function play() {
+    // A new request applies at once; one that ended waits for playTimer.
+    function requestBy(r) {
+        _wantPause = r.pause === true;
+        _wantMute = r.mute === true;
+        _wantStop = r.stop === true;
+        if (_wantPause) _reqPause = true;
+        if (_wantMute) _reqMute = true;
+        if (_wantStop) _reqStop = true;
         playTimer.stop();
-        playTimer.start();
+        if ((_reqPause && !_wantPause) || (_reqMute && !_wantMute) || (_reqStop && !_wantStop))
+            playTimer.start();
+    }
+    function play() {
+        requestBy({});
     }
     function pause() {
-        playTimer.stop();
-        _reqPause = true;
+        requestBy({ pause: true });
     }
     function playBy(value) {
         if(value) play();
@@ -216,7 +247,9 @@ Item {
             });
         }
 
-        playBy(WindowPlay.shouldPlay(windows, modePlay, wModel.screenGeometry));
+        requestBy(WindowPlay.windowRequests(windows, modePlay, wModel.screenGeometry, {
+            focus: wModel.focusAction, maximized: wModel.maximizedAction, fullscreen: wModel.fullscreenAction,
+        }));
 
         if(logging) {
             // Keep the diagnostic dump (gated on `logging`, off the hot path).

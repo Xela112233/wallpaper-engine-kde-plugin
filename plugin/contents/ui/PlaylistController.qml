@@ -196,6 +196,18 @@ Item {
         return root.userPaused;
     }
 
+    // Screens of this plasmashell that stopped with StopScope 1 (all
+    // screens).  WekControl.broadcastStop calls remoteStop on every other
+    // screen's controller; main.qml stops this screen while any is listed.
+    property var _stoppedScreens: ({})
+    readonly property bool stoppedElsewhere: Object.keys(_stoppedScreens).length > 0
+    function remoteStop(source, stopped) {
+        const screens = Object.assign({}, _stoppedScreens);
+        if (stopped) screens[String(source)] = true;
+        else delete screens[String(source)];
+        _stoppedScreens = screens;
+    }
+
     function _resolveItem(workshopId) {
         if (!workshopId) return null;
         // Prefer the unfiltered source via findItem(): the user's filter

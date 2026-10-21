@@ -10,6 +10,10 @@
       <label>Steam workshop path</label>
       <default></default>
     </entry>
+    <entry name="AutoPickSource" type="String">
+      <label>The WallpaperSource of the last automatic change from outside the plugin (we-manager's playlists and virtual desktops write it just before WallpaperSource): while stopped, it waits for the reload instead of loading like a pick by hand</label>
+      <default></default>
+    </entry>
     <entry name="WallpaperWorkShopId" type="String">
       <label>Wallpaper workshopid</label>
       <default></default>
@@ -37,6 +41,26 @@
     <entry name="PauseFilterByScreen" type="Bool">
       <label>Filter By Screen</label>
       <default>true</default>
+    </entry>
+    <entry name="FocusAction" type="Int">
+      <label>What a focused window does, where Pause mode watches focus (0=Keep running, 1=Mute, 2=Pause, 3=Stop and free memory)</label>
+      <default>2</default>
+    </entry>
+    <entry name="MaximizedAction" type="Int">
+      <label>What a maximized window does, where Pause mode watches maximized windows (0=Keep running, 1=Mute, 2=Pause, 3=Stop and free memory)</label>
+      <default>2</default>
+    </entry>
+    <entry name="FullscreenAction" type="Int">
+      <label>What a fullscreen window does, where Pause mode watches fullscreen windows (0=Keep running, 1=Mute, 2=Pause, 3=Stop and free memory)</label>
+      <default>2</default>
+    </entry>
+    <entry name="PauseAction" type="Int">
+      <label>What running on battery does (0=Pause, 1=Stop and free memory)</label>
+      <default>0</default>
+    </entry>
+    <entry name="StopScope" type="Int">
+      <label>Which screens a stop unloads (0=This screen, 1=All screens)</label>
+      <default>0</default>
     </entry>
     <entry name="PauseDebugLogging" type="Bool">
       <label>Log which window satisfied the pause predicate (console.error, off the hot path)</label>

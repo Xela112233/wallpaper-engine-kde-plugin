@@ -32,8 +32,9 @@ using namespace wekde;
 class PlaylistControllerStub : public QObject {
     Q_OBJECT
 public:
-    QString lastMethod;
-    QString lastArg;
+    QString     lastMethod;
+    QString     lastArg;
+    QList<bool> stops; // remoteStop calls, in order
 
 public slots:
     void next() { lastMethod = QStringLiteral("next"); }
@@ -49,6 +50,12 @@ public slots:
         lastArg    = id;
     }
     void reload() { lastMethod = QStringLiteral("reload"); }
+    // QML functions take QVariant arguments, so the stub does too.
+    void remoteStop(const QVariant& source, const QVariant& stopped) {
+        lastMethod = QStringLiteral("remoteStop");
+        lastArg    = source.toString();
+        stops << stopped.toBool();
+    }
 
     // Direct-connection getters return a QVariant so the C++ adapter's
     // Q_RETURN_ARG(QVariant) marshalling works without per-type templating.
@@ -132,6 +139,10 @@ private slots:
     // -- Registry lifetime safety net (not TDD-red; see the comment below) --
     void destroyedController_isSkippedByBroadcastNotCrashed();
     void destroyedWekControl_removesOnlyItsOwnRegistryEntry();
+
+    // -- StopScope "all screens" -----------------------------------------
+    void broadcastStop_reachesEveryOtherControllerButNotItsOwn();
+    void broadcastStop_isWithdrawnWhenTheStoppedInstanceGoes();
 
     // -- No-controller safety --------------------------------------------
     void allSlots_areNoOpsWhenControllerIsNull();
@@ -376,6 +387,50 @@ void TestWekControl::destroyedWekControl_removesOnlyItsOwnRegistryEntry() {
     controlB->Next();
     QTRY_COMPARE(stubB.lastMethod, QString("next"));
     QCOMPARE(stubA.lastMethod, QString()); // never invoked after controlA died
+}
+
+// -- StopScope "all screens" -----------------------------------------------
+
+void TestWekControl::broadcastStop_reachesEveryOtherControllerButNotItsOwn() {
+    PlaylistControllerStub stubA, stubB, stubC;
+    auto                   controlA = std::make_unique<WekControl>();
+    auto                   controlB = std::make_unique<WekControl>();
+    auto                   controlC = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlB->setPlaylistController(&stubB);
+    controlC->setPlaylistController(&stubC);
+    controlA->broadcastStop(true);
+    QTRY_COMPARE(stubB.stops, QList<bool> { true });
+    QTRY_COMPARE(stubC.stops, QList<bool> { true });
+    QVERIFY(stubA.stops.isEmpty()); // the stopping screen already knows
+    QVERIFY(! stubB.lastArg.isEmpty());
+    QCOMPARE(stubB.lastArg, stubC.lastArg); // one name per announcing instance
+    controlA->broadcastStop(false);
+    QTRY_COMPARE(stubB.stops, (QList<bool> { true, false }));
+    QTRY_COMPARE(stubC.stops, (QList<bool> { true, false }));
+}
+
+void TestWekControl::broadcastStop_isWithdrawnWhenTheStoppedInstanceGoes() {
+    PlaylistControllerStub stubA, stubB;
+    auto                   controlB = std::make_unique<WekControl>();
+    controlB->setPlaylistController(&stubB);
+    {
+        auto controlA = std::make_unique<WekControl>();
+        controlA->setPlaylistController(&stubA);
+        controlA->broadcastStop(true);
+    } // the stopped screen is removed while its stop is still announced
+    QTRY_COMPARE(stubB.stops, (QList<bool> { true, false }));
+    // An instance that withdrew its stop itself sends nothing more when it goes.
+    PlaylistControllerStub stubD;
+    {
+        auto controlD = std::make_unique<WekControl>();
+        controlD->setPlaylistController(&stubD);
+        controlD->broadcastStop(true);
+        controlD->broadcastStop(false);
+    }
+    QTRY_COMPARE(stubB.stops.size(), 4);
+    QTest::qWait(50);
+    QCOMPARE(stubB.stops.size(), 4);
 }
 
 // -- No-controller safety --------------------------------------------------

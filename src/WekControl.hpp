@@ -76,6 +76,13 @@ public:
     // fire the D-Bus signal.
     Q_INVOKABLE void emitWallpaperChanged(const QString& workshopId, const QString& playlistId);
 
+    // StopScope "all screens": this screen stopped (true) or loaded again
+    // (false).  Calls remoteStop(source, stopped) on every OTHER screen's
+    // controller in this process; `source` names this instance.  A stop still
+    // announced when this instance goes (its screen was removed) is withdrawn
+    // then, so the other screens do not stay stopped.
+    Q_INVOKABLE void broadcastStop(bool stopped);
+
 public slots:
     // Playlist navigation
     Q_NOREPLY void Next();
@@ -113,6 +120,7 @@ private:
     QPointer<QObject> m_controller;
     QDBusConnection   m_bus;
     bool              m_registered = false;
+    bool              m_stopAnnounced = false;
 };
 
 } // namespace wekde

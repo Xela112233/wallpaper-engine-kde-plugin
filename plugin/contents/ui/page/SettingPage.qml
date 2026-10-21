@@ -122,6 +122,81 @@ Flickable {
                     id: ckbox_pauseFilterByScreen
                 }
             }
+            // What a focused window does where the Pause mode above watches it.
+            OptionItem {
+                text: i18nc("@label playback action for a window condition", "Focused window")
+                text_color: Kirigami.Theme.textColor
+                enabled: cfg_PauseMode === Common.PauseMode.Focus || cfg_PauseMode === Common.PauseMode.FocusOrMax || cfg_PauseMode === Common.PauseMode.Any
+                actor: ComboBox {
+                    model: [
+                        { text: i18nc("@item:inlistbox playback action", "Keep running"),        value: 0 },
+                        { text: i18nc("@item:inlistbox playback action", "Mute"),                value: 1 },
+                        { text: i18nc("@item:inlistbox playback action", "Pause"),               value: 2 },
+                        { text: i18nc("@item:inlistbox playback action", "Stop (free memory)"),  value: 3 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_FocusAction = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Common.cbIndexOfValue(this, cfg_FocusAction)
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info playback action help text", "Another application has the focus. Watched by the Focus Window, Focus or Maximized Window and Any Window modes.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            // What a maximized window does where the Pause mode above watches it.
+            OptionItem {
+                text: i18nc("@label playback action for a window condition", "Maximized window")
+                text_color: Kirigami.Theme.textColor
+                enabled: cfg_PauseMode === Common.PauseMode.Max || cfg_PauseMode === Common.PauseMode.FocusOrMax || cfg_PauseMode === Common.PauseMode.Any
+                actor: ComboBox {
+                    model: [
+                        { text: i18nc("@item:inlistbox playback action", "Keep running"),        value: 0 },
+                        { text: i18nc("@item:inlistbox playback action", "Mute"),                value: 1 },
+                        { text: i18nc("@item:inlistbox playback action", "Pause"),               value: 2 },
+                        { text: i18nc("@item:inlistbox playback action", "Stop (free memory)"),  value: 3 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_MaximizedAction = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Common.cbIndexOfValue(this, cfg_MaximizedAction)
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info playback action help text", "A maximized window covers the screen. Watched by the Maximized Window, Focus or Maximized Window and Any Window modes.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            // What a fullscreen window does where the Pause mode above watches it.
+            OptionItem {
+                text: i18nc("@label playback action for a window condition", "Fullscreen window")
+                text_color: Kirigami.Theme.textColor
+                enabled: cfg_PauseMode !== Common.PauseMode.Never && cfg_PauseMode !== Common.PauseMode.Focus
+                actor: ComboBox {
+                    model: [
+                        { text: i18nc("@item:inlistbox playback action", "Keep running"),        value: 0 },
+                        { text: i18nc("@item:inlistbox playback action", "Mute"),                value: 1 },
+                        { text: i18nc("@item:inlistbox playback action", "Pause"),               value: 2 },
+                        { text: i18nc("@item:inlistbox playback action", "Stop (free memory)"),  value: 3 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_FullscreenAction = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Common.cbIndexOfValue(this, cfg_FullscreenAction)
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info playback action help text", "A fullscreen or borderless window covers the screen; a focused fullscreen game counts here. Stop unloads the wallpaper 10 seconds after the window appears, so its memory and video memory are free, and loads it again when the window goes.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
             OptionItem {
                 text: i18nc("@label settings option", "Pause if PC is on battery power")
                 text_color: Kirigami.Theme.textColor
@@ -137,6 +212,41 @@ Flickable {
                         from: 0
                         to: 100
                         stepSize: 1
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "On battery")
+                text_color: Kirigami.Theme.textColor
+                enabled: cfg_PauseOnBatPower || cfg_PauseBatPercent > 0
+                actor: ComboBox {
+                    model: [
+                        { text: i18nc("@item:inlistbox battery action", "Pause"),              value: 0 },
+                        { text: i18nc("@item:inlistbox battery action", "Stop (free memory)"), value: 1 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_PauseAction = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Common.cbIndexOfValue(this, cfg_PauseAction)
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Stop applies to")
+                text_color: Kirigami.Theme.textColor
+                actor: ComboBox {
+                    model: [
+                        { text: i18nc("@item:inlistbox stop scope", "This screen"), value: 0 },
+                        { text: i18nc("@item:inlistbox stop scope", "All screens"), value: 1 },
+                    ]
+                    textRole: "text"
+                    onActivated: cfg_StopScope = Common.cbCurrentValue(this)
+                    Component.onCompleted: currentIndex = Common.cbIndexOfValue(this, cfg_StopScope)
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info stop scope help text", "All screens: when one screen stops for a window or the battery, every screen stops with it until that reason ends. A pause from the shortcut or the lock screen never stops.")
+                        wrapMode: Text.Wrap
+                    }
                 }
             }
             OptionItem {
