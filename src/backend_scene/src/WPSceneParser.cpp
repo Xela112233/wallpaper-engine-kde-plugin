@@ -5017,7 +5017,11 @@ void fixupDeferredGroupLinks(ParseContext& context,
 // Record user property → visibility bindings by scanning raw JSON
 void registerObjectBindings(ParseContext& context, const nlohmann::json& json,
                             const std::unordered_map<std::string, ObjInitState>& nameToObjState) {
+    // The object's index in `objects`, which is the order the scene is drawn
+    // in (restoreZOrder sorts by it): cursor presses go from the top down.
+    int32_t drawOrder = -1;
     for (auto& obj : json.at("objects")) {
+        ++drawOrder;
         if (! obj.contains("id") || ! obj.at("id").is_number_integer()) continue;
         i32  id      = obj.at("id").get<i32>();
         auto node_it = context.node_map.find(id);
@@ -5086,7 +5090,15 @@ void registerObjectBindings(ParseContext& context, const nlohmann::json& json,
                     float sz =
                         (float)std::sqrt(w(0, 2) * w(0, 2) + w(1, 2) * w(1, 2) + w(2, 2) * w(2, 2));
                     lis.worldScale = { sx, sy, sz };
+                    lis.worldAxes  = { (float)w(0, 0), (float)w(1, 0), (float)w(0, 1), (float)w(1, 1) };
                 }
+                lis.drawOrder = drawOrder;
+                // Read from the object's own JSON, as WPImageObject and
+                // WPParticleObject do (they keep it but nothing used it).
+                // Which Wallpaper Engine option writes this key was not
+                // checked against a 2.7 wallpaper.
+                if (obj.contains("disablepropagation") && obj.at("disablepropagation").is_boolean())
+                    lis.disablePropagation = obj.at("disablepropagation").get<bool>();
                 context.scene->layerInitialStates[name] = lis;
             }
         }

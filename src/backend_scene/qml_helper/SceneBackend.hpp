@@ -20,6 +20,7 @@
 
 #include "HoverLeaveDebounce.h"
 #include "JsWatchdog.h"
+#include "SceneCursorHitTest.h"
 #include "MediaThumbnailCrossfade.hpp"
 #include "ScriptDiagState.h"
 #include "SceneWallpaper.hpp"
@@ -334,6 +335,7 @@ public:
 protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void mouseUngrabEvent() override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void hoverMoveEvent(QHoverEvent* event) override;
 
@@ -1070,6 +1072,28 @@ private:
     };
     CursorParallaxCache m_parallaxCache {};
     void                refreshParallaxCache();
+
+    // Press propagation (scene.json `disablepropagation`).  On when any layer
+    // in the scene sets it: a press then goes to the layers under the cursor
+    // from the top down to the first flagged one, as in Wallpaper Engine.
+    // Off (every scene without the flag): cursorDown and cursorUp go to every
+    // hit layer and cursorClick to the smallest, as before.  m_pressBlockers
+    // holds the proxies of flagged layers that have no cursor handler, which
+    // stop a press all the same.  Set in buildCursorTargets.
+    bool                  m_pressPropagation { false };
+    std::vector<QJSValue> m_pressBlockers;
+    // Which of m_cursorTargets a press at (sceneX, sceneY) reaches, from each
+    // target's hit (see the .cpp).  `order` gets the reached targets topmost
+    // first when propagation is on; `stopped` says a flagged layer took it.
+    std::vector<bool> pressReach(const std::vector<scenebackend::LayerCursorHit>& hits,
+                                 float sceneX, float sceneY,
+                                 const scenebackend::CursorParallax& para, std::vector<int>* order,
+                                 bool* stopped) const;
+
+    // {x, y} read by engine.isPortrait() / isLandscape() (kOrientationJs):
+    // the item's width and height, written at load and on every resize.
+    QJSValue m_viewSizeObj;
+    void     updateViewSize();
 
     // localStorage persistence — see Q_INVOKABLE ls* in the public section.
     // `m_lsSceneId` is resolved from m_source on first scene load; empty

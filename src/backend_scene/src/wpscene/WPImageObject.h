@@ -117,10 +117,11 @@ public:
     bool visibleIsComboSelector { false }; // combo condition-based visibility (skip offscreen)
     // The user property `visible` is bound to, if any.
     std::string visibleUserProp;
-    // WE editor flag: when true, this object doesn't inherit transform /
-    // visibility / alpha / tint from parent groups or nodes.  Parsed for
-    // completeness; currently no group hierarchy exists in the scenes we
-    // handle, so nothing to propagate.
+    // WE editor flag.  Parsed for completeness; nothing reads this field.
+    // registerObjectBindings (WPSceneParser.cpp) reads the same key from the
+    // object's JSON and treats it as Wallpaper Engine 2.7's "disable click
+    // propagation": a cursor press stops at this layer.  Which editor option
+    // writes the key was not checked against a 2.7 wallpaper.
     bool        disablepropagation { false };
     bool        perspective { false }; // Use perspective camera (default: flat/ortho)
     // 360° skybox flag from the image's model JSON or scene-level override.

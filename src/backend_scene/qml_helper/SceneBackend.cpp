@@ -370,6 +370,9 @@ SceneObject::SceneObject(QQuickItem* parent): QQuickItem(parent) {
         setupTextScripts();
         replayMediaState();
     });
+    // engine.isPortrait() / isLandscape() follow the item's size.
+    connect(this, &QQuickItem::widthChanged, this, &SceneObject::updateViewSize);
+    connect(this, &QQuickItem::heightChanged, this, &SceneObject::updateViewSize);
 
     // Screen-removal cooperative-abort plumbing.  When the wallpaper's screen
     // is unplugged (monitor, USB-C dock, KVM switch), Plasma destroys the
@@ -429,6 +432,22 @@ void SceneObject::resizeFb() {
     int w = (int)this->width();
     int h = (int)this->height();
     fireResizeScreen(w, h);
+}
+
+void SceneObject::updateViewSize() {
+    if (! m_viewSizeObj.isObject()) return;
+    double w = width();
+    double h = height();
+    // An item not laid out yet has no size: the scene's design canvas stands
+    // in, which is what the orientation was read from before.
+    if (w <= 0 || h <= 0) {
+        if (! m_scene) return;
+        auto ortho = m_scene->getOrthoSize();
+        w          = ortho[0];
+        h          = ortho[1];
+    }
+    m_viewSizeObj.setProperty("x", w);
+    m_viewSizeObj.setProperty("y", h);
 }
 
 QSGNode* SceneObject::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
@@ -2056,7 +2075,56 @@ static void flushJsConsole(QJSEngine* engine, const QJSValue& consoleObj, qint64
     if (len > 0) engine->evaluate("console._buf = [];");
 }
 
+// A cursor event for one layer: the shared positions plus where the cursor
+// falls on that layer (event.localPosition), when its transform allows it.
+static QJSValue cursorEventFor(QJSEngine* engine, const LayerCursorHit& hit, float sceneX,
+                               float sceneY, float screenX, float screenY) {
+    QJSValue ev = makeCursorEvent(engine, sceneX, sceneY, screenX, screenY);
+    if (hit.hasLocal) setCursorEventLocal(engine, ev, hit.localX, hit.localY);
+    return ev;
+}
+
+// Without disablepropagation in the scene, a press reaches every target it
+// hits (cursorClick then picks the smallest, in mousePressEvent).  With it,
+// Wallpaper Engine's rule: the layers under the cursor from the top (the
+// latest in scene.json's objects) down to the first one that sets the flag,
+// which may be a layer without handlers (m_pressBlockers).
+std::vector<bool> SceneObject::pressReach(const std::vector<LayerCursorHit>& hits, float sceneX,
+                                          float sceneY, const CursorParallax& para,
+                                          std::vector<int>* order, bool* stopped) const {
+    std::vector<bool> reached(hits.size(), false);
+    if (stopped) *stopped = false;
+    if (! m_pressPropagation) {
+        for (size_t i = 0; i < hits.size(); i++) reached[i] = hits[i].inside;
+        return reached;
+    }
+    std::vector<PressHit> under;
+    for (size_t i = 0; i < hits.size() && i < m_cursorTargets.size(); i++) {
+        if (! hits[i].inside) continue;
+        QJSValue st = m_cursorTargets[i].thisLayerProxy.property("_state");
+        under.push_back({ (int)i,
+                          (int32_t)st.property("drawOrder").toInt(),
+                          st.property("disablePropagation").toBool() });
+    }
+    for (size_t j = 0; j < m_pressBlockers.size(); j++) {
+        if (! hitTestLayerProxy(m_pressBlockers[j], sceneX, sceneY, para)) continue;
+        QJSValue st = m_pressBlockers[j].property("_state");
+        under.push_back({ -1 - (int)j, (int32_t)st.property("drawOrder").toInt(), true });
+    }
+    for (const auto& h : pressPropagation(std::move(under))) {
+        if (h.index >= 0) {
+            reached[h.index] = true;
+            if (order) order->push_back(h.index);
+        }
+        if (h.stops && stopped) *stopped = true;
+    }
+    return reached;
+}
+
 void SceneObject::mousePressEvent(QMouseEvent* event) {
+    // Before the no-target return: a script that polls input.cursorLeftDown
+    // needs no cursor handler of its own.
+    if (event->button() == Qt::LeftButton) setCursorLeftDown(m_inputObj, true);
     if (m_cursorTargets.empty() || ! m_jsEngine) return;
 
 #if (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
@@ -2091,22 +2159,34 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
     // fullscreen toggle-background like 2866203962 bg0), moveIdx → smallest
     // hit with moveFn.  downFn / upFn ride on the selected drag target,
     // which prefers moveIdx (drag scripts) and falls back to clickIdx.
-    CursorParallax para     = buildCursorParallax(this,
-                                                  m_mouseNx,
-                                                  m_mouseNy,
-                                                  m_sceneOrthoW,
-                                                  m_sceneOrthoH,
-                                                  m_parallaxCache.enable,
-                                                  m_parallaxCache.amount,
-                                                  m_parallaxCache.mouseInfluence,
-                                                  m_parallaxCache.camX,
-                                                  m_parallaxCache.camY);
-    QJSValue       ev       = makeCursorEvent(m_jsEngine, sceneX, sceneY, screenX, screenY);
-    int            clickIdx = -1, moveIdx = -1, downIdx = -1;
-    double         clickArea = 0.0, moveArea = 0.0, downArea = 0.0;
+    //
+    // In a scene that sets disablepropagation somewhere, "hit" means reached
+    // by the press (pressReach), and cursorClick goes to every reached layer
+    // from the top instead of the smallest.
+    CursorParallax para = buildCursorParallax(this,
+                                              m_mouseNx,
+                                              m_mouseNy,
+                                              m_sceneOrthoW,
+                                              m_sceneOrthoH,
+                                              m_parallaxCache.enable,
+                                              m_parallaxCache.amount,
+                                              m_parallaxCache.mouseInfluence,
+                                              m_parallaxCache.camX,
+                                              m_parallaxCache.camY);
+    std::vector<LayerCursorHit> hits(m_cursorTargets.size());
+    for (size_t i = 0; i < m_cursorTargets.size(); i++)
+        hits[i] = cursorHitOnLayer(m_cursorTargets[i].thisLayerProxy, sceneX, sceneY, para);
+    std::vector<int>  topDown;
+    bool              stopped = false;
+    std::vector<bool> reached = pressReach(hits, sceneX, sceneY, para, &topDown, &stopped);
+    auto              eventFor = [&](int i) {
+        return cursorEventFor(m_jsEngine, hits[i], sceneX, sceneY, screenX, screenY);
+    };
+    int    clickIdx = -1, moveIdx = -1, downIdx = -1;
+    double clickArea = 0.0, moveArea = 0.0, downArea = 0.0;
     for (int i = 0; i < (int)m_cursorTargets.size(); i++) {
         auto& target = m_cursorTargets[i];
-        if (! hitTestLayerProxy(target.thisLayerProxy, sceneX, sceneY, para)) continue;
+        if (! reached[i]) continue;
         QJSValue state = target.thisLayerProxy.property("_state");
         QJSValue size  = state.property("size");
         QJSValue scale = state.property("scale");
@@ -2135,6 +2215,13 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
             downArea = area;
         }
     }
+    // The reached targets in dispatch order: topmost first with propagation
+    // on, else the order they were registered in.
+    std::vector<int> dispatchOrder = topDown;
+    if (! m_pressPropagation) {
+        for (int i = 0; i < (int)m_cursorTargets.size(); i++)
+            if (reached[i]) dispatchOrder.push_back(i);
+    }
     // Fire cursorDown on every hit layer with downFn (WE convention — each
     // geometrically-hit layer receives its own cursorDown).  Game of Life
     // (3453251764) Canvas and Pattern Texture are both fullscreen with
@@ -2145,10 +2232,9 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
     // tiny button still beats a fullscreen toggle backdrop.
     int downFired = 0;
     if (downIdx >= 0) {
-        for (int i = 0; i < (int)m_cursorTargets.size(); i++) {
+        for (int i : dispatchOrder) {
             auto& target = m_cursorTargets[i];
             if (! target.downFn.isCallable()) continue;
-            if (! hitTestLayerProxy(target.thisLayerProxy, sceneX, sceneY, para)) continue;
             // Keep the global setProperty so scripts that read `thisLayer` as
             // a free variable from nested helper scopes still resolve;
             // callWithInstance additionally binds `this === thisLayerProxy`
@@ -2157,7 +2243,8 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
             // sound-volume dispatch below.
             m_globalObj.setProperty("thisLayer", target.thisLayerProxy);
             m_globalObj.setProperty("thisObject", target.thisObjectProxy);
-            QJSValue r = callJsGuarded([&] {
+            QJSValue ev = eventFor(i);
+            QJSValue r  = callJsGuarded([&] {
                 return target.downFn.callWithInstance(target.thisLayerProxy, { ev });
             });
             downFired++;
@@ -2166,18 +2253,20 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
                          target.layerName.c_str(),
                          qPrintable(r.toString()));
         }
-    } else if (clickIdx < 0 && moveIdx < 0) {
+    } else if (clickIdx < 0 && moveIdx < 0 && ! stopped) {
         // Nothing hit-tested.  Fall back to global cursorDown fan-out for
         // "tap anywhere" game-control scripts (built-in dino_run's walking
         // sprite is a moving 24×24 hitbox — requiring precise clicks would
         // break its tap-to-jump).  Only engaged when no click / drag target
         // is available, so well-defined UI wallpapers (2866203962) aren't
-        // affected.
-        for (auto& target : m_cursorTargets) {
+        // affected.  A layer that stops propagation counts as hit.
+        for (int i = 0; i < (int)m_cursorTargets.size(); i++) {
+            auto& target = m_cursorTargets[i];
             if (! target.downFn.isCallable()) continue;
             m_globalObj.setProperty("thisLayer", target.thisLayerProxy);
             m_globalObj.setProperty("thisObject", target.thisObjectProxy);
-            QJSValue r = callJsGuarded([&] {
+            QJSValue ev = eventFor(i);
+            QJSValue r  = callJsGuarded([&] {
                 return target.downFn.callWithInstance(target.thisLayerProxy, { ev });
             });
             downFired++;
@@ -2187,17 +2276,25 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
                          qPrintable(r.toString()));
         }
     }
-    // Fire cursorClick on the smallest-hit layer with clickFn.
-    if (clickIdx >= 0) {
-        auto& target = m_cursorTargets[clickIdx];
+    // Fire cursorClick on the smallest-hit layer with clickFn, or, with
+    // propagation on, on every reached layer with clickFn from the top.
+    auto fireClick = [&](int i) {
+        auto& target = m_cursorTargets[i];
         m_globalObj.setProperty("thisLayer", target.thisLayerProxy);
         m_globalObj.setProperty("thisObject", target.thisObjectProxy);
-        QJSValue r = callJsGuarded([&] {
+        QJSValue ev = eventFor(i);
+        QJSValue r  = callJsGuarded([&] {
             return target.clickFn.callWithInstance(target.thisLayerProxy, { ev });
         });
         LOG_INFO(
             "cursorClick fired on '%s'%s", target.layerName.c_str(), r.isError() ? " ERROR" : "");
         if (r.isError()) LOG_INFO("  cursorClick error: %s", qPrintable(r.toString()));
+    };
+    if (m_pressPropagation) {
+        for (int i : topDown)
+            if (m_cursorTargets[i].clickFn.isCallable()) fireClick(i);
+    } else if (clickIdx >= 0) {
+        fireClick(clickIdx);
     }
     // Drag target: prefer the smallest-hit layer with moveFn, fall back to
     // downFn (so cursorUp lands on the same layer that saw cursorDown),
@@ -2217,7 +2314,12 @@ void SceneObject::mousePressEvent(QMouseEvent* event) {
     flushJsConsole(m_jsEngine, m_consoleObj, m_propFrameCount, "click");
 }
 
+// The press is lost without a release (another item took the mouse, or the
+// window lost it): the button no longer counts as down for polling scripts.
+void SceneObject::mouseUngrabEvent() { setCursorLeftDown(m_inputObj, false); }
+
 void SceneObject::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton) setCursorLeftDown(m_inputObj, false);
     if (m_cursorTargets.empty() || ! m_jsEngine) {
         m_dragTarget.clear();
         return;
@@ -2251,7 +2353,6 @@ void SceneObject::mouseReleaseEvent(QMouseEvent* event) {
     //      winning shared.currentBrush.)
     //   3. Fan-out fallback for true "tap anywhere" patterns where no
     //      cursor target was hit (dino_run-style controls).
-    QJSValue       ev      = makeCursorEvent(m_jsEngine, sceneX, sceneY, screenX, screenY);
     int            upFired = 0;
     CursorParallax para    = buildCursorParallax(this,
                                                  m_mouseNx,
@@ -2263,11 +2364,18 @@ void SceneObject::mouseReleaseEvent(QMouseEvent* event) {
                                                  m_parallaxCache.mouseInfluence,
                                                  m_parallaxCache.camX,
                                                  m_parallaxCache.camY);
-    auto           fire    = [&](CursorTarget& target) {
+    std::vector<LayerCursorHit> hits(m_cursorTargets.size());
+    for (size_t i = 0; i < m_cursorTargets.size(); i++)
+        hits[i] = cursorHitOnLayer(m_cursorTargets[i].thisLayerProxy, sceneX, sceneY, para);
+    bool              stopped = false;
+    std::vector<bool> reached = pressReach(hits, sceneX, sceneY, para, nullptr, &stopped);
+    auto              fire    = [&](int i) {
+        auto& target = m_cursorTargets[i];
         if (! target.upFn.isCallable()) return;
         m_globalObj.setProperty("thisLayer", target.thisLayerProxy);
         m_globalObj.setProperty("thisObject", target.thisObjectProxy);
-        QJSValue r = callJsGuarded([&] {
+        QJSValue ev = cursorEventFor(m_jsEngine, hits[i], sceneX, sceneY, screenX, screenY);
+        QJSValue r  = callJsGuarded([&] {
             return target.upFn.callWithInstance(target.thisLayerProxy, { ev });
         });
         upFired++;
@@ -2281,22 +2389,24 @@ void SceneObject::mouseReleaseEvent(QMouseEvent* event) {
     // is now blocked at the hit-test step: Lock at top-right is only fired
     // when the cursor was actually released over Lock.  Drag target is
     // always included (releases its press state even if it's no longer
-    // under the cursor — the user might have dragged off).
+    // under the cursor — the user might have dragged off).  With
+    // propagation on, only the layers the release reaches count as hit.
     {
         bool firedDragTarget = false;
-        for (auto& t : m_cursorTargets) {
+        for (int i = 0; i < (int)m_cursorTargets.size(); i++) {
+            auto& t = m_cursorTargets[i];
             if (! t.upFn.isCallable()) continue;
             bool isDrag = ! m_dragTarget.empty() && t.layerName == m_dragTarget;
-            bool isHit  = hitTestLayerProxy(t.thisLayerProxy, sceneX, sceneY, para);
+            bool isHit  = reached[i];
             if (! isDrag && ! isHit) continue;
             if (isDrag) firedDragTarget = true;
-            fire(t);
+            fire(i);
         }
         // Fallback: if no drag target and no hits, fan out to mirror what
         // the legacy "tap anywhere" cursorDown fan-out did (game-control
         // state machines that rely on every release firing).
-        if (m_dragTarget.empty() && upFired == 0) {
-            for (auto& t : m_cursorTargets) fire(t);
+        if (m_dragTarget.empty() && upFired == 0 && ! stopped) {
+            for (int i = 0; i < (int)m_cursorTargets.size(); i++) fire(i);
         }
         (void)firedDragTarget;
     }
@@ -2340,7 +2450,22 @@ void SceneObject::mouseMoveEvent(QMouseEvent* event) {
             if (target.layerName != m_dragTarget || ! target.moveFn.isCallable()) continue;
             m_globalObj.setProperty("thisLayer", target.thisLayerProxy);
             m_globalObj.setProperty("thisObject", target.thisObjectProxy);
-            QJSValue ev = makeCursorEvent(m_jsEngine, sceneX, sceneY, screenX, screenY);
+            CursorParallax para = buildCursorParallax(this,
+                                                      m_mouseNx,
+                                                      m_mouseNy,
+                                                      m_sceneOrthoW,
+                                                      m_sceneOrthoH,
+                                                      m_parallaxCache.enable,
+                                                      m_parallaxCache.amount,
+                                                      m_parallaxCache.mouseInfluence,
+                                                      m_parallaxCache.camX,
+                                                      m_parallaxCache.camY);
+            QJSValue       ev   = cursorEventFor(m_jsEngine,
+                                         cursorHitOnLayer(target.thisLayerProxy, sceneX, sceneY, para),
+                                         sceneX,
+                                         sceneY,
+                                         screenX,
+                                         screenY);
             QJSValue r  = callJsGuarded([&] {
                 return target.moveFn.callWithInstance(target.thisLayerProxy, { ev });
             });
@@ -2440,7 +2565,12 @@ void SceneObject::hoverMoveEvent(QHoverEvent* event) {
             LOG_INFO("cursorEnter: layer '%s' at scene=(%.1f,%.1f)", name.c_str(), sceneX, sceneY);
             m_globalObj.setProperty("thisLayer", target.thisLayerProxy);
             m_globalObj.setProperty("thisObject", target.thisObjectProxy);
-            QJSValue ev = makeCursorEvent(m_jsEngine, sceneX, sceneY, screenX, screenY);
+            QJSValue ev = cursorEventFor(m_jsEngine,
+                                         cursorHitOnLayer(target.thisLayerProxy, sceneX, sceneY, para),
+                                         sceneX,
+                                         sceneY,
+                                         screenX,
+                                         screenY);
             QJSValue r  = callJsGuarded([&] {
                 return target.enterFn.callWithInstance(target.thisLayerProxy, { ev });
             });
@@ -2481,8 +2611,23 @@ void SceneObject::flushPendingLeaves() {
             if (target.leaveFn.isCallable()) {
                 m_globalObj.setProperty("thisLayer", target.thisLayerProxy);
                 m_globalObj.setProperty("thisObject", target.thisObjectProxy);
-                QJSValue ev = makeCursorEvent(
-                    m_jsEngine, m_cursorSceneX, m_cursorSceneY, m_cursorScreenX, m_cursorScreenY);
+                CursorParallax para = buildCursorParallax(this,
+                                                          m_mouseNx,
+                                                          m_mouseNy,
+                                                          m_sceneOrthoW,
+                                                          m_sceneOrthoH,
+                                                          m_parallaxCache.enable,
+                                                          m_parallaxCache.amount,
+                                                          m_parallaxCache.mouseInfluence,
+                                                          m_parallaxCache.camX,
+                                                          m_parallaxCache.camY);
+                QJSValue       ev   = cursorEventFor(
+                    m_jsEngine,
+                    cursorHitOnLayer(target.thisLayerProxy, m_cursorSceneX, m_cursorSceneY, para),
+                    m_cursorSceneX,
+                    m_cursorSceneY,
+                    m_cursorScreenX,
+                    m_cursorScreenY);
                 QJSValue r = callJsGuarded([&] {
                     return target.leaveFn.callWithInstance(target.thisLayerProxy, { ev });
                 });
@@ -3514,6 +3659,36 @@ void SceneObject::setupTextScripts() {
             tgt.upFn            = state.cursorUpFn;
             tgt.moveFn          = state.cursorMoveFn;
         }
+        // Layers that set `disablepropagation` switch the scene's presses to
+        // Wallpaper Engine's top-down rule (pressReach).  Flagged layers with
+        // no handler of their own still stop a press, so keep their proxies.
+        m_pressBlockers.clear();
+        m_pressPropagation = false;
+        if (! m_cursorTargets.empty()) {
+            QJSValue flagged = m_jsEngine->evaluate(
+                "(function() { var r = [];\n"
+                "  for (var n in _layerInitStates) {\n"
+                "    var s = _layerInitStates[n]; if (s && s.dp) r.push(n);\n"
+                "  }\n"
+                "  return r; })()");
+            int n = flagged.property("length").toInt();
+            for (int i = 0; i < n; i++) {
+                QString     name = flagged.property((quint32)i).toString();
+                std::string key  = name.toStdString();
+                m_pressPropagation = true;
+                bool isTarget      = false;
+                for (const auto& t : m_cursorTargets) isTarget = isTarget || t.layerName == key;
+                if (isTarget) continue;
+                QJSValue proxy =
+                    m_jsEngine->evaluate(wek::qml_helper::jsLayerLookupExpr(name));
+                if (proxy.isObject()) m_pressBlockers.push_back(proxy);
+            }
+            if (m_pressPropagation)
+                LOG_INFO("cursor presses stop at disablepropagation layers: %d flagged, %zu "
+                         "without handlers",
+                         n,
+                         m_pressBlockers.size());
+        }
         if (! m_cursorTargets.empty()) {
             LOG_INFO("cursor targets: %zu layers registered", m_cursorTargets.size());
             // Dump each target's origin/size/scale and which handlers it has
@@ -4013,18 +4188,13 @@ void SceneObject::setupEngineGlobals() {
                          "engine.isScreensaver = function() { return false; };\n"
                          "engine.isRunningInEditor = function() { return false; };\n");
 
-    // Orientation stubs (no Vec dependency).  canvasSize / screenResolution are
-    // assigned below, after Vec2 exists — WE returns them as Vec2 (scripts call
-    // e.g. `engine.canvasSize.divide(2)`), so plain {x,y} literals break any
+    // Orientation (no Vec dependency): live over the item's size, see
+    // kOrientationJs.  canvasSize / screenResolution are assigned below, after
+    // Vec2 exists — WE returns them as Vec2 (scripts call e.g.
+    // `engine.canvasSize.divide(2)`), so plain {x,y} literals break any
     // wallpaper that does vector arithmetic on them.
-    {
-        auto orthoSize = m_scene->getOrthoSize();
-        bool portrait  = orthoSize[1] > orthoSize[0];
-        m_jsEngine->evaluate(QString("engine.isPortrait = function() { return %1; };\n"
-                                     "engine.isLandscape = function() { return %2; };\n")
-                                 .arg(portrait ? "true" : "false")
-                                 .arg(portrait ? "false" : "true"));
-    }
+    m_viewSizeObj = m_jsEngine->evaluate(wek::qml_helper::kOrientationJs);
+    updateViewSize();
 
     // Vec2 / Vec3 / Vec4 — canonical shim in SceneScriptShimsJs.hpp.
     // Defined first so the input / String.match / localStorage block below
@@ -6278,6 +6448,9 @@ void SceneObject::cleanupTextScripts() {
     m_inputObj          = QJSValue();
     m_cwpObj            = QJSValue();
     m_cspObj            = QJSValue();
+    m_viewSizeObj       = QJSValue();
+    m_pressBlockers.clear();
+    m_pressPropagation = false;
     m_consoleObj        = QJSValue();
     m_cachedTimeOfDay   = -1.0;
     m_lastTimeOfDayMs   = -1;

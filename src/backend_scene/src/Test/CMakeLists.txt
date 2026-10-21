@@ -450,6 +450,7 @@ if(Qt6_FOUND)
     add_executable(scenescript_tests
         test_main_qt.cpp
         test_SceneScript.cpp
+        test_SceneScriptInput.cpp
         test_SceneScriptDispatch.cpp
         test_PropertyScriptDispatchGate.cpp
         test_SceneLocalStorageDisk.cpp

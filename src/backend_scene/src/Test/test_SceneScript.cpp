@@ -668,12 +668,12 @@ TEST_SUITE("SceneScript Device Detection") {
                             "engine.isRunningInEditor = function() { return false; };\n");
         }
 
+        // The production orientation shim; SceneObject writes the item's size
+        // into the object it returns (updateViewSize).
         void setOrientation(float w, float h) {
-            bool portrait = h > w;
-            engine.evaluate(QString("engine.isPortrait = function() { return %1; };\n"
-                                    "engine.isLandscape = function() { return %2; };\n")
-                                .arg(portrait ? "true" : "false")
-                                .arg(portrait ? "false" : "true"));
+            QJSValue view = engine.evaluate(wek::qml_helper::kOrientationJs);
+            view.setProperty("x", (double)w);
+            view.setProperty("y", (double)h);
         }
     };
 

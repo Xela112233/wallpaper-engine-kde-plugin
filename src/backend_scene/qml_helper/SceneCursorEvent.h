@@ -49,6 +49,23 @@ inline QJSValue makeCursorEvent(QJSEngine* engine,
     return ev;
 }
 
+// event.localPosition: the cursor in the receiving layer's own coordinates
+// (its centre at 0,0, before its scale and rotation, Y up, like worldPosition),
+// as a Vec3.  Each layer gets its own event, since the point differs per layer.
+// SceneCursorHitTest.h's cursorHitOnLayer works the point out.
+inline void setCursorEventLocal(QJSEngine* engine, QJSValue& ev, float localX, float localY) {
+    QJSValue lp =
+        engine->evaluate(QString("new Vec3(%1,%2,0)").arg((double)localX).arg((double)localY));
+    ev.setProperty("localPosition", lp);
+}
+
+// input.cursorLeftDown (and engine.cursorLeftDown, a getter over it): true from
+// a left press on the wallpaper until its release, or until the press is lost
+// (an ungrab), for scripts that poll the button instead of handling cursorDown.
+inline void setCursorLeftDown(QJSValue& inputObj, bool down) {
+    if (inputObj.isObject()) inputObj.setProperty("cursorLeftDown", down);
+}
+
 // Per-tick refresh of input.cursorWorldPosition / input.cursorScreenPosition.
 // Splits "world" (scene-ortho, Y-up) from "screen" (widget pixels, Y-down)
 // for the same reason makeCursorEvent does.  Called from refreshEngineTickGlobals

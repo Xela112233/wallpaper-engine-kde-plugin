@@ -376,6 +376,21 @@ Vec4.lerp = function(a, b, t) {
 };
 )JS";
 
+// engine.isPortrait() / isLandscape() follow the wallpaper's own size, which is
+// the size of the screen it covers, so a landscape scene on a portrait monitor
+// reports portrait.  (They used to be fixed at load from the scene's design
+// canvas.)  The expression's value is the {x, y} object both read; production
+// keeps a handle to it and writes the item's width and height into it at load
+// and on every resize.  A square counts as landscape, as before.
+//
+// Requires `engine` to already exist on the global object.
+inline constexpr const char* kOrientationJs = R"JS((function() {
+  var view = { x: 0, y: 0 };
+  engine.isPortrait = function() { return view.y > view.x; };
+  engine.isLandscape = function() { return !(view.y > view.x); };
+  return view;
+})())JS";
+
 // `input` (cursor state) + `localStorage`, the two non-Vec globals production
 // installs right after the Vec classes.
 //
@@ -829,6 +844,8 @@ function _makeLayerProxy(name) {
     _wsBaked: init.ws ? Vec3(init.ws[0], init.ws[1], init.ws[2]) : null,
     visible: init.v, alpha: 1.0,
     text: (init.text !== undefined ? init.text : ''), pointsize: init.ps || 0,
+    disablePropagation: !!init.dp,
+    drawOrder: (typeof init.ro === 'number' ? init.ro : -1),
     name: name, _dirty: {}, _cmds: []
   } : { origin: Vec3(0,0,0), scale: Vec3(1,1,1),
         angles: Vec3(0,0,0), size: {x:0, y:0},
@@ -836,6 +853,7 @@ function _makeLayerProxy(name) {
         _woBaked: null, _wsBaked: null,
         visible: true, alpha: 1.0,
         text: '', pointsize: 0,
+        disablePropagation: false, drawOrder: -1,
         name: name, _dirty: {}, _cmds: [] };
   Object.defineProperty(_s, 'worldOrigin', {
     get: function() {
@@ -860,6 +878,29 @@ function _makeLayerProxy(name) {
         }
       }
       return _s._wsBaked;
+    }, enumerable: true, configurable: true });
+  // The layer's place, scale and rotation in one, for the cursor hit test
+  // (SceneCursorHitTest.h): world = [a c; b d] * local + (ox, oy).  The live
+  // world matrix when the renderer has one (the same test worldOrigin makes),
+  // else the transform baked at load (wo and wa), else null, and the hit test
+  // falls back to origin and scale.
+  Object.defineProperty(_s, 'worldFrame', {
+    get: function() {
+      if (typeof __sceneBridge !== 'undefined' && __sceneBridge.getLayerWorldTransform) {
+        var m = __sceneBridge.getLayerWorldTransform(_s.name);
+        if (m && m.length === 16) {
+          var tx = +m[12], ty = +m[13], a = +m[0], b = +m[1], c = +m[4], d = +m[5];
+          if (Number.isFinite(tx) && Number.isFinite(ty) && (tx !== 0 || ty !== 0) &&
+              Number.isFinite(a * d - b * c) && a * d - b * c !== 0)
+            return { ox: tx, oy: ty, a: a, b: b, c: c, d: d };
+        }
+      }
+      var wo = _s._woBaked;
+      if (!wo) return null;
+      if (init && init.wa && init.wa.length === 4)
+        return { ox: wo.x, oy: wo.y, a: init.wa[0], b: init.wa[1], c: init.wa[2], d: init.wa[3] };
+      var ws = _s._wsBaked;
+      return ws ? { ox: wo.x, oy: wo.y, a: ws.x, b: 0, c: 0, d: ws.y } : null;
     }, enumerable: true, configurable: true });
   var p = {};
   Object.defineProperty(p, 'name', { get: function(){return _s.name;}, enumerable:true });

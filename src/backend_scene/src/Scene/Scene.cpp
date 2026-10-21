@@ -30,7 +30,11 @@ std::string Scene::SerializeLayerInitialStates() const {
                              // hit-test uses these so clicks on parented
                              // buttons reach the right layer.
                              { "wo", { lis.worldOrigin[0], lis.worldOrigin[1], lis.worldOrigin[2] } },
-                             { "ws", { lis.worldScale[0], lis.worldScale[1], lis.worldScale[2] } } };
+                             { "ws", { lis.worldScale[0], lis.worldScale[1], lis.worldScale[2] } },
+                             { "wa", { lis.worldAxes[0], lis.worldAxes[1], lis.worldAxes[2], lis.worldAxes[3] } } };
+        // Cursor press propagation (see LayerInitialState).
+        if (lis.drawOrder >= 0) entry["ro"] = lis.drawOrder;
+        if (lis.disablePropagation) entry["dp"] = true;
         // Effects metadata for SceneScript getEffect()
         auto eit = layerEffectNames.find(name);
         if (eit != layerEffectNames.end()) {

@@ -2832,6 +2832,50 @@ TEST_SUITE("WPSceneParser::Parse (end-to-end)") {
         CHECK(init["mixed_visibility_layer"]["efx"].dump() == "[\"bloom\",\"glow\"]");
     }
 
+    TEST_CASE("the layer init JSON carries the draw order, disablepropagation and the turn") {
+        // SceneObject's cursor presses read these: `ro` (the index in objects,
+        // later is on top), `dp` (only when set) and `wa`, the world axes the
+        // hit test turns a rotated layer by.
+        ensureGlslangInit();
+        auto        vfs        = makeAssetsVfsWith({});
+        const char* kSceneJson = R"JSON(
+{
+  "general": { "clearcolor": "0 0 0",
+               "orthogonalprojection": { "width": 1280, "height": 720 } },
+  "objects": [
+    { "id": 601, "name": "backdrop",
+      "image": "models/_plain.json",
+      "origin": "640 360 0", "scale": "1 1 1", "angles": "0 0 0", "visible": true,
+      "effects": [] },
+    { "id": 602, "name": "shortcut",
+      "image": "models/_plain.json",
+      "origin": "100 100 0", "scale": "1 1 1", "angles": "0 0 1.5707963",
+      "visible": true, "disablepropagation": true, "effects": [] }
+  ]
+}
+)JSON";
+        audio::SoundManager sm;
+        WPUserProperties    props;
+        WPSceneParser       parser;
+        auto                scene = parser.Parse("scene_press_order", kSceneJson, *vfs, sm, props);
+        REQUIRE(scene != nullptr);
+
+        auto init = nlohmann::json::parse(scene->SerializeLayerInitialStates());
+        REQUIRE(init.contains("backdrop"));
+        REQUIRE(init.contains("shortcut"));
+        CHECK(init["backdrop"]["ro"].get<int>() == 0);
+        CHECK(init["shortcut"]["ro"].get<int>() == 1);
+        CHECK_FALSE(init["backdrop"].contains("dp"));
+        CHECK(init["shortcut"]["dp"].get<bool>());
+        // A quarter turn: the x axis points up, the y axis left.
+        REQUIRE(init["shortcut"]["wa"].size() == 4);
+        CHECK(init["shortcut"]["wa"][0].get<double>() == doctest::Approx(0.0).epsilon(1e-4));
+        CHECK(init["shortcut"]["wa"][1].get<double>() == doctest::Approx(1.0).epsilon(1e-4));
+        CHECK(init["shortcut"]["wa"][2].get<double>() == doctest::Approx(-1.0).epsilon(1e-4));
+        CHECK(init["shortcut"]["wa"][3].get<double>() == doctest::Approx(0.0).epsilon(1e-4));
+        CHECK(init["backdrop"]["wa"][0].get<double>() == doctest::Approx(1.0).epsilon(1e-4));
+    }
+
     TEST_CASE("a user-bound single effect that starts hidden is built, hidden, with its binding") {
         ensureGlslangInit();
         auto                vfs        = makeAssetsVfsWith({

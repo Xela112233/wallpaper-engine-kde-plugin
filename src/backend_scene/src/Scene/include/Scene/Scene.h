@@ -622,6 +622,17 @@ public:
         // runtime accept hit-test drift until next setSource.
         std::array<float, 3> worldOrigin { 0, 0, 0 };
         std::array<float, 3> worldScale { 1, 1, 1 };
+        // The same world matrix's x and y axes in the scene plane (xx, xy,
+        // yx, yy), so the hit-test sees a rotated or mirrored layer where it
+        // is drawn and can hand scripts the cursor in the layer's own
+        // coordinates (event.localPosition).
+        std::array<float, 4> worldAxes { 1, 0, 0, 1 };
+        // scene.json's `disablepropagation` on the object, and the object's
+        // index in `objects` (the draw order: a later object is drawn on
+        // top).  A press stops at the first layer from the top that sets
+        // the flag (SceneObject::mousePressEvent).
+        bool    disablePropagation { false };
+        int32_t drawOrder { -1 };
     };
     std::unordered_map<std::string, LayerInitialState> layerInitialStates;
 
