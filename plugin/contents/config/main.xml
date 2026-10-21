@@ -62,6 +62,16 @@
       <label>Which screens a stop unloads (0=This screen, 1=All screens)</label>
       <default>0</default>
     </entry>
+    <entry name="VramStop" type="Bool">
+      <label>Stop when video memory runs out: the wallpaper unloads when the GPU has too little free for 3 seconds, and loads again when there is room for it and a margin (we-manager vram patch)</label>
+      <default>false</default>
+    </entry>
+    <entry name="UnloadAfterPausedMin" type="Int">
+      <label>Unload a wallpaper that has been paused this many minutes, and load it again when the pause ends (0=never)</label>
+      <default>0</default>
+      <min>0</min>
+      <max>1440</max>
+    </entry>
     <entry name="PauseDebugLogging" type="Bool">
       <label>Log which window satisfied the pause predicate (console.error, off the hot path)</label>
       <default>false</default>

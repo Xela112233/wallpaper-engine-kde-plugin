@@ -98,6 +98,9 @@ public:
     // What AudioCaptureStatus answers (the plugin: AudioBus::CaptureStatus,
     // "pending" while a reload runs).
     static void setAudioCaptureStatusReader(std::function<QString()> read);
+    // What VramStatus answers (the plugin: VramSampler::processStatusJson;
+    // we-manager vram patch).  Kept out of this class like the two above.
+    static void setVramStatusReader(std::function<QString()> read);
 
     // Where the "Save wallpaper screenshot" shortcut writes:
     // <Pictures>/Wallpapers/wallpaper-<yyyyMMdd-HHmmss>.png (each screen
@@ -152,6 +155,22 @@ public slots:
     // the screens' names are added).  The "Save wallpaper screenshot"
     // shortcut calls it.
     QString SaveScreenshots();
+
+    // Stop on request (we-manager vram patch): unload the wallpaper on the
+    // screen named (QScreen::name, the output's connector; "" for every
+    // screen) for `seconds`, as main.qml's Stop does (the preview shows; no
+    // Plasma configuration is written), under `reason`, which the screen's
+    // caption shows.  A lease: the caller renews it before it runs out, and
+    // 0 seconds ends it.  It ends on its own if the caller goes away, and a
+    // plasmashell restart forgets it.  At most a day at a time.
+    void RequestStop(const QString& reason, const QString& screen, double seconds);
+    // Every screen's stop reasons, as JSON: [{"screen", "stopped",
+    // "reasons": [{"reason", "detail", "ignored", "leftMs"}]}] (leftMs: what
+    // is left of a request's lease).
+    QString StopReasons() const;
+    // The video memory monitor, as JSON (VramSampler::processStatusJson);
+    // "" when the plugin installed no reader.
+    QString VramStatus() const;
 
     // Query (sync, returns a value — D-Bus method, not signal/property)
     QString CurrentWorkshopId() const;

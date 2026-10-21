@@ -41,6 +41,7 @@ add_library(${PROJECT_NAME}
 	WekNotifier.cpp
 	WekDiagnostics.cpp
 	ActivityHelper.cpp
+	VramSampler.cpp
 	qmldir
 	qwebchannel.qrc
 )
@@ -61,6 +62,8 @@ target_link_libraries(${PROJECT_NAME}
 	KF6::Notifications
 	KF6::Crash
 	KF6::I18n
+	# VramSampler.cpp opens libvulkan.so.1 with dlopen (we-manager vram patch).
+	${CMAKE_DL_LIBS}
 )
 
 # i18nc()/i18n() resolve to a real catalog only when the compiling TU has

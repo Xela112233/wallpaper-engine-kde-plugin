@@ -120,6 +120,19 @@ target_include_directories(tst_loadguard PRIVATE ${WEKDE_SRC_DIR})
 target_link_libraries(tst_loadguard PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME tst_loadguard COMMAND tst_loadguard -v2)
 
+# ── VramPolicy / VramSampler (stop on low video memory, we-manager vram patch)
+# The policy is header-only; the sampler opens libvulkan.so.1 with dlopen, so
+# neither needs the Vulkan library at link time.  tst_vramsampler points the
+# loader at no driver: what it tests is the "nothing answers" path.
+add_executable(tst_vrampolicy tst_vrampolicy.cpp)
+target_include_directories(tst_vrampolicy PRIVATE ${WEKDE_SRC_DIR})
+target_link_libraries(tst_vrampolicy PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME tst_vrampolicy COMMAND tst_vrampolicy -v2)
+add_executable(tst_vramsampler tst_vramsampler.cpp ${WEKDE_SRC_DIR}/VramSampler.cpp)
+target_include_directories(tst_vramsampler PRIVATE ${WEKDE_SRC_DIR})
+target_link_libraries(tst_vramsampler PRIVATE Qt6::Core Qt6::Test ${CMAKE_DL_LIBS})
+add_test(NAME tst_vramsampler COMMAND tst_vramsampler -v2)
+
 # ── WebUrlInterceptor unit tests ──────────────────────────────────────────────
 # Pure-predicate tests for the file:// allow/block gate.  The QtWebEngineCore
 # component ships in qt6-qtwebengine on Fedora / Bazzite; gated so a build

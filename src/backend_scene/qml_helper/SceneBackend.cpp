@@ -136,6 +136,11 @@ void ReleaseSceneInBackground(sp_scene_t&& scene) {
 }
 } // namespace
 
+// we-manager vram patch: the plugin's VramSampler (src/VramSampler.cpp in the
+// plugin, not part of this renderer) watches the video memory of the GPU the
+// scenes render on.  Weak, so the renderer's own tools link without it.
+extern "C" __attribute__((weak)) void wekde_vram_scene_device(const unsigned char* uuid, int size);
+
 namespace scenebackend
 {
 
@@ -196,6 +201,8 @@ public:
         info.deterministic      = deterministic;
         info.offscreen_tiling   = m_glex.tiling();
         info.uuid               = m_glex.uuid();
+        if (wekde_vram_scene_device != nullptr)
+            wekde_vram_scene_device(info.uuid.data(), static_cast<int>(info.uuid.size()));
         info.width              = w;
         info.height             = h;
         // Every callback below captures m_guard, not `this`: the wallpaper

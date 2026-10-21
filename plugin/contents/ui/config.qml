@@ -49,6 +49,8 @@ ColumnLayout {
     property alias  cfg_MpvLoadInMemory:     settingPage.cfg_MpvLoadInMemory
     property alias  cfg_VerboseLogging:      settingPage.cfg_VerboseLogging
     property alias  cfg_SafeStartAfterCrash: settingPage.cfg_SafeStartAfterCrash
+    property alias  cfg_VramStop:            settingPage.cfg_VramStop
+    property alias  cfg_UnloadAfterPausedMin: settingPage.cfg_UnloadAfterPausedMin
     property alias  cfg_Speed:               settingPage.cfg_Speed
     property alias  cfg_MuteAudio:           settingPage.cfg_MuteAudio
     property alias  cfg_MouseInput:          settingPage.cfg_MouseInput

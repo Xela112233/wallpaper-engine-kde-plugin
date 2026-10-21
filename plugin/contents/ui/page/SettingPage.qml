@@ -25,6 +25,8 @@ Flickable {
     property alias cfg_MpvLoadInMemory: ckbox_mpvLoadInMemory.checked
     property alias cfg_VerboseLogging: ckbox_verboseLogging.checked
     property alias cfg_SafeStartAfterCrash: ckbox_safeStartAfterCrash.checked
+    property alias cfg_VramStop: ckbox_vramStop.checked
+    property alias cfg_UnloadAfterPausedMin: spin_unloadAfterPausedMin.value
     property alias cfg_Speed: spin_speed.dValue
     property alias cfg_MuteAudio: ckbox_muteAudio.checked
     property alias cfg_MouseInput: ckbox_mouseInput.checked
@@ -250,6 +252,39 @@ Flickable {
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
                         text: i18nc("@info stop scope help text", "All screens: when one screen stops for a window or the battery, every screen stops with it until that reason ends. A pause from the shortcut or the lock screen never stops.")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Stop when video memory runs out")
+                text_color: Kirigami.Theme.textColor
+                actor: Switch {
+                    id: ckbox_vramStop
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info vram stop help text", "Unloads the wallpaper when the graphics card has too little memory free for 3 seconds (a game or another program took it), so that program gets it; the preview shows meanwhile. It loads again once there is room for it and a margin, waiting longer each time memory runs out again soon after. Needs a Vulkan driver that reports free memory (VK_EXT_memory_budget).")
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            OptionItem {
+                text: i18nc("@label settings option", "Unload after a pause of (minutes)")
+                text_color: Kirigami.Theme.textColor
+                actor: SpinBox {
+                    id: spin_unloadAfterPausedMin
+                    from: 0
+                    to: 1440
+                    stepSize: 5
+                }
+                contentBottom: ColumnLayout {
+                    Text {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: i18nc("@info unload after pause help text", "A wallpaper paused this long (by the shortcut, a window, the battery or the lock screen) is unloaded to free its memory, and loads again when the pause ends. 0: never.")
                         wrapMode: Text.Wrap
                     }
                 }

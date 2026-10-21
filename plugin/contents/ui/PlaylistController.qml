@@ -219,6 +219,24 @@ Item {
         return root.userPaused;
     }
 
+    // Stop on request (we-manager vram patch): WekControl.RequestStop(reason,
+    // screen, seconds) reaches every screen's controller; the screen named
+    // (or every screen for "") hands it to main.qml, which holds the stop.
+    // stopReasons() is what WekControl.StopReasons gathers, as JSON text so
+    // the C++ side needs no JS values; main.qml sets the reader.
+    signal externalStopRequested(string reason, real seconds)
+    property var stopReasonsReader: null
+    function requestStop(reason, screen, seconds) {
+        const want = String(screen || "");
+        if (want !== "" && want !== root.screenName) return false;
+        root.externalStopRequested(String(reason), Number(seconds));
+        return true;
+    }
+    function stopReasons() {
+        const r = typeof root.stopReasonsReader === "function" ? root.stopReasonsReader() : ({});
+        return JSON.stringify(Object.assign({ screen: root.screenName }, r));
+    }
+
     // WekControl.Screenshot(path, screen): only the screen named, or every
     // screen when `screen` is empty, each adding "-<screen>" before the
     // extension so they do not overwrite each other.

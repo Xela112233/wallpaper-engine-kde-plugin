@@ -10,6 +10,10 @@
 #include <QList>
 #include <QMetaObject>
 #include <QVariant>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonValue>
 
 namespace wekde
 {
@@ -46,6 +50,11 @@ std::function<QString()>& audioCaptureStatusReader() {
     return read;
 }
 
+std::function<QString()>& vramStatusReader() {
+    static std::function<QString()> read;
+    return read;
+}
+
 void broadcast(const char* method) {
     for (const QPointer<QObject>& ctrl : controllerRegistry())
         if (ctrl) QMetaObject::invokeMethod(ctrl, method, Qt::QueuedConnection);
@@ -55,6 +64,13 @@ void broadcast(const char* method, const QVariant& a, const QVariant& b) {
     for (const QPointer<QObject>& ctrl : controllerRegistry())
         if (ctrl)
             QMetaObject::invokeMethod(ctrl, method, Qt::QueuedConnection, Q_ARG(QVariant, a), Q_ARG(QVariant, b));
+}
+
+void broadcast(const char* method, const QVariant& a, const QVariant& b, const QVariant& c) {
+    for (const QPointer<QObject>& ctrl : controllerRegistry())
+        if (ctrl)
+            QMetaObject::invokeMethod(
+                ctrl, method, Qt::QueuedConnection, Q_ARG(QVariant, a), Q_ARG(QVariant, b), Q_ARG(QVariant, c));
 }
 
 void broadcast(const char* method, const QString& arg) {
@@ -220,6 +236,42 @@ void WekControl::setAudioConfigReloader(std::function<void()> reload) {
 
 void WekControl::setAudioCaptureStatusReader(std::function<QString()> read) {
     audioCaptureStatusReader() = std::move(read);
+}
+
+void WekControl::setVramStatusReader(std::function<QString()> read) { vramStatusReader() = std::move(read); }
+
+QString WekControl::VramStatus() const {
+    if (! vramStatusReader()) {
+        qWarning("wek-dbus: VramStatus: no video memory reader installed");
+        return {};
+    }
+    return vramStatusReader()();
+}
+
+void WekControl::RequestStop(const QString& reason, const QString& screen, double seconds) {
+    if (reason.trimmed().isEmpty()) {
+        qWarning("wek-dbus: RequestStop: no reason given; nothing stopped");
+        return;
+    }
+    if (! (seconds >= 0)) {           // NaN too
+        qWarning().noquote() << "wek-dbus: RequestStop:" << reason << ": seconds must be 0 or more, not" << seconds;
+        return;
+    }
+    broadcast("requestStop", QVariant(reason.trimmed()), QVariant(screen), QVariant(qMin(seconds, 86400.0)));
+}
+
+QString WekControl::StopReasons() const {
+    QJsonArray out;
+    for (const QPointer<QObject>& ctrl : controllerRegistry()) {
+        if (! ctrl) continue;
+        QVariant v;
+        // The controller answers JSON text (PlaylistController.qml stopReasons).
+        if (! QMetaObject::invokeMethod(ctrl, "stopReasons", Qt::DirectConnection, Q_RETURN_ARG(QVariant, v)))
+            continue;
+        const QJsonDocument doc = QJsonDocument::fromJson(v.toString().toUtf8());
+        if (doc.isObject()) out.append(doc.object());
+    }
+    return QString::fromUtf8(QJsonDocument(out).toJson(QJsonDocument::Compact));
 }
 
 QString WekControl::AudioCaptureStatus() {

@@ -37,6 +37,8 @@ Item {
         "FullscreenAction":    2,
         "PauseAction":         0,        // Pause on battery
         "StopScope":           0,        // This screen
+        "VramStop":            false,    // matches main.xml default (we-manager vram patch)
+        "UnloadAfterPausedMin": 0,       // matches main.xml default (we-manager vram patch)
         "PauseOnBatPower":     false,
         "PauseBatPercent":     0,
         "PauseDebugLogging":   false,

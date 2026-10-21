@@ -28,6 +28,11 @@
 
 #include <functional>
 
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QRegularExpression>
+
 using namespace wekde;
 
 // Stub QObject mimicking the QML PlaylistController. Records the last
@@ -85,6 +90,19 @@ public slots:
         lastArg    = source.toString();
         stops << stopped.toBool();
     }
+    // WekControl.RequestStop (we-manager vram patch): (reason, screen, seconds).
+    void requestStop(const QVariant& reason, const QVariant& screen, const QVariant& seconds) {
+        lastMethod = QStringLiteral("requestStop");
+        lastArg    = reason.toString() + QLatin1Char('|') + screen.toString() + QLatin1Char('|')
+                  + QString::number(seconds.toDouble());
+    }
+    // What PlaylistController.stopReasons answers: JSON text.
+    QVariant stopReasons() const { return reasonsJson; }
+
+public:
+    QString reasonsJson;
+
+public slots:
 
     // Direct-connection getters return a QVariant so the C++ adapter's
     // Q_RETURN_ARG(QVariant) marshalling works without per-type templating.
@@ -176,6 +194,12 @@ private slots:
     // -- StopScope "all screens" -----------------------------------------
     void broadcastStop_reachesEveryOtherControllerButNotItsOwn();
     void broadcastStop_isWithdrawnWhenTheStoppedInstanceGoes();
+
+    // -- Stop on request, the stop reasons and the video memory (vram patch) --
+    void requestStop_reachesEveryControllerWithItsArguments();
+    void requestStop_needsAReasonAndSecondsFromZero();
+    void stopReasons_gathersEveryScreensJson();
+    void vramStatus_isWhatTheReaderSays();
 
     // -- No-controller safety --------------------------------------------
     void allSlots_areNoOpsWhenControllerIsNull();
@@ -533,6 +557,60 @@ void TestWekControl::broadcastStop_reachesEveryOtherControllerButNotItsOwn() {
     controlA->broadcastStop(false);
     QTRY_COMPARE(stubB.stops, (QList<bool> { true, false }));
     QTRY_COMPARE(stubC.stops, (QList<bool> { true, false }));
+}
+
+void TestWekControl::requestStop_reachesEveryControllerWithItsArguments() {
+    PlaylistControllerStub stubA, stubB;
+    auto                   controlA = std::make_unique<WekControl>();
+    auto                   controlB = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlB->setPlaylistController(&stubB);
+    controlB->RequestStop(QStringLiteral(" Factorio is running "), QStringLiteral("DP-2"), 120);
+    // Every screen hears it (the reason trimmed); each one decides by the screen's name.
+    QTRY_COMPARE(stubA.lastArg, QStringLiteral("Factorio is running|DP-2|120"));
+    QTRY_COMPARE(stubB.lastArg, QStringLiteral("Factorio is running|DP-2|120"));
+    controlA->RequestStop(QStringLiteral("x"), QString(), 1e9);         // at most a day
+    QTRY_COMPARE(stubB.lastArg, QStringLiteral("x||86400"));
+}
+
+void TestWekControl::requestStop_needsAReasonAndSecondsFromZero() {
+    PlaylistControllerStub stub;
+    auto                   control = std::make_unique<WekControl>();
+    control->setPlaylistController(&stub);
+    QTest::ignoreMessage(QtWarningMsg, "wek-dbus: RequestStop: no reason given; nothing stopped");
+    control->RequestStop(QStringLiteral("  "), QString(), 10);
+    QTest::ignoreMessage(QtWarningMsg, QRegularExpression("RequestStop: x : seconds must be 0 or more"));
+    control->RequestStop(QStringLiteral("x"), QString(), -1);
+    QTest::qWait(50);
+    QVERIFY(stub.lastMethod.isEmpty());
+    control->RequestStop(QStringLiteral("x"), QString(), 0);             // 0 ends a stop: it goes out
+    QTRY_COMPARE(stub.lastArg, QStringLiteral("x||0"));
+}
+
+void TestWekControl::stopReasons_gathersEveryScreensJson() {
+    PlaylistControllerStub stubA, stubB;
+    stubA.reasonsJson = QStringLiteral(R"({"screen":"DP-1","stopped":true,"reasons":[{"reason":"vram"}]})");
+    stubB.reasonsJson = QStringLiteral(R"({"screen":"DP-2","stopped":false,"reasons":[]})");
+    auto controlA     = std::make_unique<WekControl>();
+    auto controlB     = std::make_unique<WekControl>();
+    controlA->setPlaylistController(&stubA);
+    controlB->setPlaylistController(&stubB);
+    const QJsonArray all = QJsonDocument::fromJson(controlB->StopReasons().toUtf8()).array();
+    QCOMPARE(all.size(), 2);
+    QStringList screens;
+    for (const QJsonValue& v : all) screens << v.toObject().value(QStringLiteral("screen")).toString();
+    screens.sort();
+    QCOMPARE(screens, (QStringList { QStringLiteral("DP-1"), QStringLiteral("DP-2") }));
+}
+
+void TestWekControl::vramStatus_isWhatTheReaderSays() {
+    WekControl control;
+    WekControl::setVramStatusReader({});
+    QTest::ignoreMessage(QtWarningMsg, "wek-dbus: VramStatus: no video memory reader installed");
+    QCOMPARE(control.VramStatus(), QString());
+    WekControl::setVramStatusReader([] { return QStringLiteral(R"({"available":false})"); });
+    QCOMPARE(control.VramStatus(), QStringLiteral(R"({"available":false})"));
+    WekControl::setVramStatusReader({});
 }
 
 void TestWekControl::broadcastStop_isWithdrawnWhenTheStoppedInstanceGoes() {

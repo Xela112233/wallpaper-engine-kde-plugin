@@ -31,6 +31,7 @@
 #include "WekNotifier.hpp"
 #include "WekDiagnostics.hpp"
 #include "ActivityHelper.hpp"
+#include "VramSampler.hpp"
 #include "Audio/AudioBus.h"
 #ifdef WEKDE_HAS_GLOBALACCEL
 #    include "WekShortcuts.hpp"
@@ -140,6 +141,9 @@ public:
         qmlRegisterType<wekde::WekNotifier>(uri, WPVer[0], WPVer[1], "WekNotifier");
         qmlRegisterType<wekde::WekDiagnostics>(uri, WPVer[0], WPVer[1], "WekDiagnostics");
         qmlRegisterType<wekde::ActivityHelper>(uri, WPVer[0], WPVer[1], "ActivityHelper");
+        // we-manager vram patch: made from VramWatch.qml only (Qt.createComponent),
+        // so a main.qml newer than the library still loads.
+        qmlRegisterType<wekde::VramSampler>(uri, WPVer[0], WPVer[1], "VramSampler");
     }
 
     void initializeEngine(QQmlEngine* engine, const char* uri) override {
@@ -182,6 +186,7 @@ private:
                 --audioReloads;
             });
         });
+        wekde::WekControl::setVramStatusReader([] { return wekde::VramSampler::processStatusJson(); });
         wekde::WekControl::setAudioCaptureStatusReader([] {
             if (audioReloads.load() > 0) return QStringLiteral("pending");
             return QString::fromStdString(wallpaper::audio::AudioBus::CaptureStatus());

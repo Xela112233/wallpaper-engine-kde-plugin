@@ -185,6 +185,7 @@ Rectangle {
     property bool   _ignoreRemoteStop: false
     readonly property bool stopNow: _stopDue
                        || (playlistController.stoppedElsewhere && !_ignoreRemoteStop)
+                       || extraStopNow
     // The backend is unloaded.
     property bool   stopped: false
     // Set while the playlist writes the next wallpaper (setWallpaperFromItem):
@@ -247,7 +248,161 @@ Rectangle {
         if (marker && marker === wallpaper.configuration.WallpaperSource) return;
         background._ignoreRemoteStop = playlistController.stoppedElsewhere;
         background._stopDue = false;
+        // The other reasons there now are let be until each of them ends.
+        const ignored = {};
+        for (const k in background._extraStops) ignored[k] = true;
+        background._ignoredStops = ignored;
         if (background.stopRequested) stopGrace.restart();
+    }
+
+    // Stop for other reasons (we-manager vram patch), the same unload as the
+    // window stop above: video memory running out (VramStop, VramWatch.qml),
+    // a long pause (UnloadAfterPausedMin), and requests over D-Bus
+    // (WekControl.RequestStop, as "ext:" and the caller's reason, a lease).
+    // _extraStops maps each reason to a line for the caption; one in
+    // _ignoredStops (a pick by hand while it held) does not count until it
+    // ends.
+    property var    _extraStops: ({})
+    property var    _ignoredStops: ({})
+    readonly property bool extraStopNow: {
+        for (const k in _extraStops)
+            if (!_ignoredStops[k]) return true;
+        return false;
+    }
+    function setStopReason(reason, on, detail) {
+        const had = background._extraStops.hasOwnProperty(reason);
+        if (on === had) return;
+        const stops = Object.assign({}, background._extraStops);
+        const ignored = Object.assign({}, background._ignoredStops);
+        if (on) {
+            stops[reason] = detail || "";
+        } else {
+            delete stops[reason];
+            delete ignored[reason];
+        }
+        background._ignoredStops = ignored;
+        background._extraStops = stops;
+        console.log("[WEK] stop: " + reason + (on ? " starts" : " ends") + (on && detail ? " (" + detail + ")" : "")
+                    + " on " + (background.Screen.name || "this screen"));
+    }
+    // What the stopped screen says above its preview ("" for none).
+    readonly property string stopCaption: {
+        const lines = [];
+        for (const k in _extraStops) {
+            if (_ignoredStops[k] || k === "paused") continue;
+            if (k === "vram")
+                lines.push(i18nc("@info:status stopped for video memory, %1=what is free",
+                                 "Stopped to free video memory (%1). It loads again when there is room.",
+                                 _extraStops[k]));
+            else
+                lines.push(i18nc("@info:status stopped on request, %1=the reason given", "Stopped: %1",
+                                 _extraStops[k]));
+        }
+        return lines.join("\n");
+    }
+
+    // Video memory (VramStop): one VramSampler per screen, all showing the
+    // process's one monitor (src/VramSampler.cpp).  Made from VramWatch.qml
+    // with Qt.createComponent: a plugin library older than this QML has no
+    // VramSampler, and naming the type here would fail this whole file.
+    readonly property bool vramStopOn: wallpaper.configuration.VramStop ?? false
+    property var    vramWatch: null
+    // Two wallpapers at once (the handoff keeps the old one until the new
+    // one draws) only while the video memory has room for both.
+    readonly property bool overlapAllowed: !(vramStopOn && vramWatch !== null && vramWatch.tight)
+    onVramStopOnChanged: {
+        if (vramStopOn && vramWatch === null) makeVramWatch();
+        updateVramStop();
+    }
+    function makeVramWatch() {
+        const comp = Qt.createComponent("VramWatch.qml");
+        if (comp.status !== Component.Ready) {
+            console.warn("[WEK] vram: VramWatch.qml did not load (" + comp.errorString().trim() + "): the plugin "
+                         + "library plasmashell runs has no VramSampler (it is older than this QML; log out and "
+                         + "in again), so VramStop does nothing");
+            return;
+        }
+        background.vramWatch = comp.createObject(background, {
+            enabled: Qt.binding(function() { return background.vramStopOn; })
+        });
+    }
+    function updateVramStop() {
+        const w = background.vramWatch;
+        const want = background.vramStopOn && w !== null && w.stopWanted;
+        if (want && !background._extraStops.hasOwnProperty("vram"))
+            console.log("[WEK] vram: " + backendLoader.liveBackends + " wallpaper(s) loaded on "
+                        + (background.Screen.name || "this screen") + " go");
+        background.setStopReason("vram", want, want ? Math.round(w.freeMiB) + " MiB free on " + w.device : "");
+    }
+    Connections {
+        target: background.vramWatch
+        function onChanged() { background.updateVramStop(); }
+    }
+
+    // A long pause (UnloadAfterPausedMin minutes, 0 off): paused for any of
+    // the pause reasons in `ok` (the shortcut or tray, a window condition set
+    // to pause, the battery, the screen locker), this long, unloads too; the
+    // end of the pause loads it again.
+    readonly property int unloadAfterPausedMin: Math.max(0, wallpaper.configuration.UnloadAfterPausedMin ?? 0)
+    property int    pauseUnloadMs: unloadAfterPausedMin * 60000
+    readonly property bool pausedNow: playlistController.userPaused || windowModel.reqPause || powerSource.reqPause
+                       || (lockMonitor.active && wallpaper.configuration.ScreenSaverPolicy === 1)
+    onPausedNowChanged: if (!pausedNow) setStopReason("paused", false)
+    onUnloadAfterPausedMinChanged: if (unloadAfterPausedMin === 0) setStopReason("paused", false)
+    Timer {
+        id: pauseUnload
+        interval: Math.max(1, background.pauseUnloadMs)
+        repeat: false
+        running: background.unloadAfterPausedMin > 0 && background.pausedNow
+                 && !background._extraStops.hasOwnProperty("paused")
+        onTriggered: background.setStopReason("paused", true,
+                                              "paused for " + background.unloadAfterPausedMin + " min")
+    }
+
+    // Requests over D-Bus (PlaylistController.externalStopRequested): each
+    // holds for its lease, 0 seconds ends it.  The leases are counted down by
+    // a timer, extTickMs at a time, and no clock is read: a wall clock set
+    // back or forward (NTP after a resume) neither stretches nor ends one.
+    property var    _extLeft: ({})        // "ext:" + reason -> ms left
+    property int    extTickMs: 250
+    function requestExternalStop(reason, seconds) {
+        const key = "ext:" + reason;
+        const left = Object.assign({}, background._extLeft);
+        if (seconds > 0) {
+            left[key] = seconds * 1000;
+            background.setStopReason(key, true, reason);
+        } else {
+            delete left[key];
+            background.setStopReason(key, false);
+        }
+        background._extLeft = left;
+    }
+    Timer {
+        id: extExpiry
+        interval: background.extTickMs
+        repeat: true
+        running: Object.keys(background._extLeft).length > 0
+        onTriggered: {
+            const left = Object.assign({}, background._extLeft);
+            for (const k in left) {
+                left[k] -= interval;
+                if (left[k] > 0) continue;
+                delete left[k];
+                background.setStopReason(k, false);
+            }
+            background._extLeft = left;
+        }
+    }
+    // WekControl.StopReasons, through PlaylistController.stopReasons().
+    function stopReasonsReport() {
+        const reasons = [];
+        if (background._stopDue) reasons.push({ reason: "window", detail: "" });
+        if (playlistController.stoppedElsewhere && !background._ignoreRemoteStop)
+            reasons.push({ reason: "remote", detail: "" });
+        for (const k in background._extraStops)
+            reasons.push({ reason: k, detail: background._extraStops[k], ignored: !!background._ignoredStops[k],
+                           leftMs: background._extLeft[k] || 0 });
+        return { stopped: background.stopped, reasons: reasons };
     }
 
     // Safe start after a crash (we-manager load-guard patch).  Before a
@@ -879,6 +1034,8 @@ Rectangle {
         }
         screenName: background.Screen.name
         saveScreenshot: function(path) { return background.saveWallpaperScreenshot(path); }
+        stopReasonsReader: function() { return background.stopReasonsReport(); }
+        onExternalStopRequested: (reason, seconds) => background.requestExternalStop(reason, seconds)
     }
 
     // lauch pause time to avoid freezing
@@ -968,6 +1125,27 @@ Rectangle {
         source: want && tried < names.length ? dir + "/" + names[tried] : ""
         onStatusChanged: if (status === Image.Error) tried += 1
     }
+    // Why a stopped screen is stopped, when it is not a window or a pause
+    // (we-manager vram patch): on a dimmed band at the bottom.
+    Rectangle {
+        id: stopCaptionBand
+        visible: background.stopped && background.stopCaption !== ""
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        height: stopCaptionText.implicitHeight + 24
+        color: "#99000000"
+        Text {
+            id: stopCaptionText
+            anchors.centerIn: parent
+            width: parent.width - 48
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            text: background.stopCaption
+            color: "#eeeeee"
+            font.pixelSize: 16
+        }
+    }
 
     // WekControl.Screenshot: the frame the wallpaper shows, without the icons
     // or windows above it.  A backend with its own writer (Scene.qml: the
@@ -1013,6 +1191,8 @@ Rectangle {
         // background colour and the desktop icons for all of that.  The fade
         // is an instant cut when the desktop has "Reduce animations" enabled.
         property var _outgoing: null
+        // Backends alive now: 2 during a handoff (the vram patch's log names it).
+        readonly property int liveBackends: (item ? 1 : 0) + (_outgoing ? 1 : 0)
 
         signal loaded
 
@@ -1098,6 +1278,11 @@ Rectangle {
                     if (prev.frameShown === false) {
                         // Never reached the screen (rapid switching): nothing
                         // to keep; whatever is on screen stays the outgoing.
+                        this.retire(prev);
+                    } else if (!background.overlapAllowed) {
+                        // Video memory has no room for two (VramStop): a cut.
+                        if (this._outgoing) this.retire(this._outgoing);
+                        this._outgoing = null;
                         this.retire(prev);
                     } else {
                         if (this._outgoing) this.retire(this._outgoing);
@@ -1362,6 +1547,8 @@ Rectangle {
 
         runCacheGc();
 
+        // VramStop on from the start.
+        if (vramStopOn) makeVramWatch();
         // Safe start: a wallpaper that stopped Plasma just now is held back.
         checkSafeStart();
         // load first backend
